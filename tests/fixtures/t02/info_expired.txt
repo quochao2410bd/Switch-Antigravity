@@ -1,0 +1,4 @@
+Account: stale.user@domain.com
+Token expiry: 2026-08-25 10:00:00 (expired)
+
+No quota data recorded in store.

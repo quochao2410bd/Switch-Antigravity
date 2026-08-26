@@ -5,21 +5,20 @@ selection_policy.py
 Deterministic account selection engine for Switch-Antigravity watchdog.
 
 Guarantees & Model-Specific Routing:
-1. Target model group ('gemini-pro', 'gemini-flash', 'claude') is strictly authoritative.
+1. Explicit ModelGroup Enum & Validation (Item 15):
+   - GEMINI_PRO = "gemini-pro"
+   - GEMINI_FLASH = "gemini-flash"
+   - CLAUDE = "claude"
+   - Unknown/typo model groups (e.g. 'gemni-pro', 'foo') fail closed -> TerminalState.FAILED_SAFE.
+2. Target model group is strictly authoritative:
    - For 'gemini-pro': Pro=0, Flash=90 is REJECTED.
-   - For 'gemini-pro': Pro=None, Flash=100 is BLOCKED (never infer Pro from Flash).
+   - For 'gemini-pro': Pro=None, Flash=100 is BLOCKED_QUOTA_UNKNOWN (no cross-model inference).
    - For 'gemini-flash': Pro=0, Flash=90 is ELIGIBLE.
-2. Stale cached quota is NEVER eligible for selection without validated RefreshEvidence.
-3. Never repeatedly choose the same exhausted account.
-4. Never rotate indefinitely (enforces max_rotations -> FAILED_SAFE).
-5. Never choose accounts in active failure penalty / cooldown.
-6. Deterministic, stable tie-breaking: Max Quota -> Min Failures -> Lexicographical ref.
-7. Explicit terminal state classification:
-   - BLOCKED_NO_ACCOUNT
-   - BLOCKED_QUOTA_UNKNOWN
-   - SWITCH_FAILED
-   - VERIFY_FAILED
-   - FAILED_SAFE
+3. Stale cached quota is NEVER eligible without validated RefreshEvidence.
+4. Never repeatedly choose the same exhausted account.
+5. Max rotation limit enforcement (-> FAILED_SAFE).
+6. Cooldown failure penalties.
+7. Deterministic tie-breaking: Max Quota -> Min Failures -> Lexicographical ref.
 """
 
 from __future__ import annotations
@@ -36,6 +35,12 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from inspect_quota import AccountQuotaSummary, FormatSupportState, FreshnessState
 from refresh_quota_safe import is_canonical_email
+
+
+class ModelGroup(str, Enum):
+    GEMINI_PRO = "gemini-pro"
+    GEMINI_FLASH = "gemini-flash"
+    CLAUDE = "claude"
 
 
 class TerminalState(str, Enum):
@@ -59,10 +64,10 @@ class AccountPenaltyState:
 @dataclass
 class SelectionConfig:
     min_quota_pct: int = 20
-    max_quota_age_sec: int = 300
-    cooldown_sec: int = 600
+    max_quota_age_sec: float = 300.0
+    cooldown_sec: float = 600.0
     max_rotation_attempts: int = 3
-    target_model_group: str = "gemini-pro"  # "gemini-pro", "gemini-flash", "claude"
+    target_model_group: str = "gemini-pro"
 
 
 @dataclass
@@ -106,6 +111,18 @@ class AccountSelector:
     ) -> SelectionResult:
         t = now if now is not None else time.time()
 
+        # Item 15: Validate target model group against ModelGroup enum (Fail closed on unknown/typos)
+        try:
+            validated_model = ModelGroup(self.config.target_model_group.lower().strip())
+        except (ValueError, AttributeError):
+            return SelectionResult(
+                selected_account=None,
+                terminal_state=TerminalState.FAILED_SAFE,
+                decision_reason=f"INVALID_MODEL_GROUP: '{self.config.target_model_group}' is not a supported ModelGroup enum",
+                evaluated_candidates=[],
+                rotation_count=self.rotation_attempts
+            )
+
         # Check maximum rotation limit first
         if self.rotation_attempts >= self.config.max_rotation_attempts:
             return SelectionResult(
@@ -136,7 +153,7 @@ class AccountSelector:
             )
 
         evaluated: List[Dict[str, any]] = []
-        eligible_candidates: List[Tuple[AccountQuotaSummary, int, int]] = []  # (account, quota_score, failure_count)
+        eligible_candidates: List[Tuple[AccountQuotaSummary, int, int]] = []
         has_stale_or_unknown_account = False
 
         for acc in accounts:
@@ -145,18 +162,17 @@ class AccountSelector:
             is_current = bool(current_active_ref and ref.lower() == current_active_ref.lower())
             is_in_cooldown = bool(penalty.cooldown_until_epoch > t)
 
-            # Model-Specific Quota Evaluation (Item 11)
-            model_grp = self.config.target_model_group.lower()
-            if "flash" in model_grp:
+            # Model-Specific Quota Evaluation (Item 11 & 15)
+            if validated_model == ModelGroup.GEMINI_FLASH:
                 score = acc.gemini_flash_pct
-            elif "claude" in model_grp:
+            elif validated_model == ModelGroup.CLAUDE:
                 score = acc.claude_pct
-            else:  # Default to pro
+            else:  # GEMINI_PRO
                 score = acc.gemini_pro_pct
 
             eval_entry = {
                 "account_ref": ref,
-                "target_model_group": self.config.target_model_group,
+                "target_model_group": validated_model.value,
                 "is_canonical_email": is_canonical_email(ref),
                 "is_current": is_current,
                 "is_expired": acc.is_token_expired,
@@ -184,9 +200,9 @@ class AccountSelector:
                 eval_entry["reject_reason"] = "Recent quota refresh failed"
             elif acc.freshness_state == FreshnessState.UNKNOWN_UNFETCHED or score is None:
                 has_stale_or_unknown_account = True
-                eval_entry["reject_reason"] = f"Quota score for '{self.config.target_model_group}' is unknown/missing (live refresh required)"
+                eval_entry["reject_reason"] = f"Quota score for '{validated_model.value}' is unknown/missing (live refresh required)"
             elif score < self.config.min_quota_pct:
-                eval_entry["reject_reason"] = f"Quota score ({score}%) for '{self.config.target_model_group}' below threshold ({self.config.min_quota_pct}%)"
+                eval_entry["reject_reason"] = f"Quota score ({score}%) for '{validated_model.value}' below threshold ({self.config.min_quota_pct}%)"
             elif acc.refresh_confirmed_at_epoch and (t - acc.refresh_confirmed_at_epoch) > self.config.max_quota_age_sec:
                 has_stale_or_unknown_account = True
                 eval_entry["reject_reason"] = f"Refresh evidence expired ({t - acc.refresh_confirmed_at_epoch:.0f}s > max {self.config.max_quota_age_sec}s)"
@@ -201,14 +217,14 @@ class AccountSelector:
                 return SelectionResult(
                     selected_account=None,
                     terminal_state=TerminalState.BLOCKED_QUOTA_UNKNOWN,
-                    decision_reason=f"All potential candidate accounts have stale/unknown quota for model group '{self.config.target_model_group}'; live refresh required",
+                    decision_reason=f"All potential candidate accounts have stale/unknown quota for model group '{validated_model.value}'; live refresh required",
                     evaluated_candidates=evaluated,
                     rotation_count=self.rotation_attempts
                 )
             return SelectionResult(
                 selected_account=None,
                 terminal_state=TerminalState.BLOCKED_NO_ACCOUNT,
-                decision_reason=f"No eligible accounts remaining with sufficient quota (>= {self.config.min_quota_pct}%) for '{self.config.target_model_group}'",
+                decision_reason=f"No eligible accounts remaining with sufficient quota (>= {self.config.min_quota_pct}%) for '{validated_model.value}'",
                 evaluated_candidates=evaluated,
                 rotation_count=self.rotation_attempts
             )
@@ -225,7 +241,7 @@ class AccountSelector:
         return SelectionResult(
             selected_account=winner,
             terminal_state=TerminalState.NONE,
-            decision_reason=f"Selected {winner} with {winner_score}% quota for model group '{self.config.target_model_group}'",
+            decision_reason=f"Selected {winner} with {winner_score}% quota for model group '{validated_model.value}'",
             evaluated_candidates=evaluated,
             rotation_count=self.rotation_attempts
         )

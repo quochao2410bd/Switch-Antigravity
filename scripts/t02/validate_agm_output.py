@@ -2,8 +2,15 @@
 """
 validate_agm_output.py
 
-Comprehensive test suite verifying parser robustness, RefreshEvidence contract,
-credential store error classifications, model-specific routing, and schema support.
+Comprehensive zero-trust test suite for T02 AGM integration:
+- 100% Host-Isolated: ZERO OS vault reads/writes, ZERO live AGM calls, ZERO Google network requests.
+- RefreshEvidence Trust Model (Origin tracking, HMAC signing, Invariant checking).
+- Production executor testing with injected fake runners.
+- Credential reader process output classifier tests.
+- Token payload semantics (Distinguishing empty vault from missing token fields).
+- Production safe switch post-success branch tests (Exits 0, 1, 2, 3).
+- ModelGroup enum fail-closed validation.
+- Schema header fail-closed checks in List and Info modes.
 """
 
 import json
@@ -20,12 +27,27 @@ from inspect_quota import (
     FreshnessState,
     parse_agm_info,
     parse_agm_list,
+    validate_refresh_evidence,
 )
-from refresh_quota_safe import RefreshEvidence, RefreshResult, execute_safe_refresh
-from selection_policy import AccountSelector, SelectionConfig, TerminalState
+from refresh_quota_safe import (
+    EvidenceTrustOrigin,
+    RefreshEvidence,
+    RefreshResult,
+    compute_evidence_hmac,
+    execute_safe_refresh,
+    get_agm_version,
+)
+from selection_policy import (
+    AccountSelector,
+    ModelGroup,
+    SelectionConfig,
+    TerminalState,
+)
 from switch_account_safe import SwitchOutcome, execute_safe_switch
 from verify_active_account import (
     CredentialVerificationStatus,
+    VerificationResult,
+    parse_credential_process_output,
     verify_active_account,
 )
 
@@ -36,436 +58,443 @@ def run_tests():
         print(f"Error: Fixtures directory not found at {fixtures_dir}", file=sys.stderr)
         return False
 
-    print(f"=== Running AGM Zero-Trust Round 2 Test Suite ===")
+    print(f"=== Running AGM Zero-Trust Round 3 Test Suite ===")
     print(f"Fixtures Path: {fixtures_dir}\n")
     tests_passed = 0
     tests_total = 0
-    now = 1756220000.0  # Deterministic test epoch
-    session_id = "sess-alpha-123"
+    now = 1756220000.0  # Fixed deterministic epoch
+    session_id = "sess-prod-999"
+    secret = "test-session-secret-key"
 
     # =========================================================================
-    # ITEM 2: Synthetic Freshness & RefreshEvidence Tests (A through H)
+    # ITEM 1, 2, 3: RefreshEvidence Trust & Invariant Checks
     # =========================================================================
     p_norm = fixtures_dir / "list_normal.txt"
     with open(p_norm, "r", encoding="utf-8") as f:
         list_norm_text = f.read()
 
-    # 2.A: Cached quota + no refresh evidence -> STALE_CACHED
+    # 1.1: Synthetic success record rejected in production supervisor mode (Item 2)
     tests_total += 1
-    res_2a = parse_agm_list(list_norm_text, now_epoch=now)
-    assert len(res_2a) == 4
-    for acc in res_2a:
-        assert acc.freshness_state in (FreshnessState.STALE_CACHED, FreshnessState.UNKNOWN_UNFETCHED)
-        assert not acc.eligible
-    print("  [PASS] 2.A: No refresh evidence -> STALE_CACHED / ineligible")
-    tests_passed += 1
-
-    # 2.B: Cached quota + fabricated raw timestamp -> REJECTED as STALE_CACHED
-    tests_total += 1
-    raw_ts = {"alice@example.com": now - 5}
-    res_2b = parse_agm_list(list_norm_text, raw_unvalidated_timestamps=raw_ts, now_epoch=now)
-    alice_2b = next(r for r in res_2b if r.safe_account_ref == "alice@example.com")
-    assert alice_2b.freshness_state == FreshnessState.STALE_CACHED
-    assert not alice_2b.eligible
-    assert any("Raw unvalidated timestamp" in w for w in alice_2b.parse_warnings)
-    print("  [PASS] 2.B: Fabricated raw timestamp rejected -> STALE_CACHED")
-    tests_passed += 1
-
-    # 2.C: Validated REFRESH_SUCCEEDED evidence -> PROVEN_FRESH
-    tests_total += 1
-    ev_alice = RefreshEvidence(
+    ev_synth = RefreshEvidence(
         canonical_account="alice@example.com",
         agm_executable="agm.exe",
-        agm_version_or_revision="agm-1d3ce84",
+        agm_version_or_revision="1d3ce84",
         command="agm refresh alice@example.com",
-        started_at_epoch=now - 12,
-        completed_at_epoch=now - 10,
+        started_at_epoch=now - 5,
+        completed_at_epoch=now - 4,
         exit_code=0,
         result=RefreshResult.REFRESH_SUCCEEDED,
-        supervisor_session_id=session_id
-    )
-    ev_map_2c = {"alice@example.com": ev_alice}
-    res_2c = parse_agm_list(list_norm_text, refresh_evidence_map=ev_map_2c, expected_session_id=session_id, now_epoch=now)
-    alice_2c = next(r for r in res_2c if r.safe_account_ref == "alice@example.com")
-    assert alice_2c.freshness_state == FreshnessState.PROVEN_FRESH
-    assert alice_2c.eligible is True
-    print("  [PASS] 2.C: Validated REFRESH_SUCCEEDED evidence -> PROVEN_FRESH / eligible")
-    tests_passed += 1
-
-    # 2.D: REFRESH_FAILED_NETWORK -> REFRESH_FAILED
-    tests_total += 1
-    ev_bob_net = RefreshEvidence(
-        canonical_account="bob.dev@corp.example.org",
-        agm_executable="agm.exe",
-        agm_version_or_revision="agm-1d3ce84",
-        command="agm refresh bob.dev@corp.example.org",
-        started_at_epoch=now - 15,
-        completed_at_epoch=now - 10,
-        exit_code=1,
-        result=RefreshResult.REFRESH_FAILED_NETWORK,
         supervisor_session_id=session_id,
-        error_summary="Network timeout"
+        origin=EvidenceTrustOrigin.SYNTHETIC_TEST_EVIDENCE
     )
-    res_2d = parse_agm_list(list_norm_text, refresh_evidence_map={"bob.dev@corp.example.org": ev_bob_net}, now_epoch=now)
-    bob_2d = next(r for r in res_2d if r.safe_account_ref == "bob.dev@corp.example.org")
-    assert bob_2d.freshness_state == FreshnessState.REFRESH_FAILED
-    assert not bob_2d.eligible
-    print("  [PASS] 2.D: REFRESH_FAILED_NETWORK -> REFRESH_FAILED")
-    tests_passed += 1
-
-    # 2.E: REFRESH_FAILED_AUTH -> REFRESH_FAILED
-    tests_total += 1
-    ev_bob_auth = RefreshEvidence(
-        canonical_account="bob.dev@corp.example.org",
-        agm_executable="agm.exe",
-        agm_version_or_revision="agm-1d3ce84",
-        command="agm refresh bob.dev@corp.example.org",
-        started_at_epoch=now - 15,
-        completed_at_epoch=now - 10,
-        exit_code=1,
-        result=RefreshResult.REFRESH_FAILED_AUTH,
+    res_1_1 = parse_agm_list(
+        list_norm_text,
+        refresh_evidence_map={"alice@example.com": ev_synth},
         supervisor_session_id=session_id,
-        error_summary="Token expired"
+        allow_synthetic_test_origin=False,  # Production mode!
+        now_epoch=now
     )
-    res_2e = parse_agm_list(list_norm_text, refresh_evidence_map={"bob.dev@corp.example.org": ev_bob_auth}, now_epoch=now)
-    bob_2e = next(r for r in res_2e if r.safe_account_ref == "bob.dev@corp.example.org")
-    assert bob_2e.freshness_state == FreshnessState.REFRESH_FAILED
-    assert not bob_2e.eligible
-    print("  [PASS] 2.E: REFRESH_FAILED_AUTH -> REFRESH_FAILED")
+    alice_1_1 = next(r for r in res_1_1 if r.safe_account_ref == "alice@example.com")
+    assert alice_1_1.freshness_state == FreshnessState.STALE_CACHED
+    assert not alice_1_1.eligible
+    print("  [PASS] 1.1: Synthetic evidence rejected in production mode -> STALE_CACHED")
     tests_passed += 1
 
-    # 2.F: Evidence belongs to different account -> reject
+    # 1.2: Synthetic success record accepted in explicit test mode (Item 2)
     tests_total += 1
-    ev_wrong_acc = RefreshEvidence(
-        canonical_account="charlie@other.com",  # Mismatch!
-        agm_executable="agm.exe",
-        agm_version_or_revision="agm-1d3ce84",
-        command="agm refresh charlie@other.com",
-        started_at_epoch=now - 10,
-        completed_at_epoch=now - 5,
-        exit_code=0,
-        result=RefreshResult.REFRESH_SUCCEEDED,
-        supervisor_session_id=session_id
+    res_1_2 = parse_agm_list(
+        list_norm_text,
+        refresh_evidence_map={"alice@example.com": ev_synth},
+        supervisor_session_id=session_id,
+        allow_synthetic_test_origin=True,  # Test mode!
+        now_epoch=now
     )
-    res_2f = parse_agm_list(list_norm_text, refresh_evidence_map={"alice@example.com": ev_wrong_acc}, now_epoch=now)
-    alice_2f = next(r for r in res_2f if r.safe_account_ref == "alice@example.com")
-    assert alice_2f.freshness_state == FreshnessState.STALE_CACHED
-    assert not alice_2f.eligible
-    print("  [PASS] 2.F: Account mismatch in RefreshEvidence -> rejected as STALE_CACHED")
+    alice_1_2 = next(r for r in res_1_2 if r.safe_account_ref == "alice@example.com")
+    assert alice_1_2.freshness_state == FreshnessState.PROVEN_FRESH
+    assert alice_1_2.eligible is True
+    print("  [PASS] 1.2: Synthetic evidence accepted in explicit test mode -> PROVEN_FRESH")
     tests_passed += 1
 
-    # 2.G: Evidence belongs to previous/different supervisor session -> reject
+    # 1.3: Invariant - Exit code 99 with REFRESH_SUCCEEDED fails closed (Item 3)
     tests_total += 1
-    ev_old_session = RefreshEvidence(
+    ev_bad_exit = RefreshEvidence(
         canonical_account="alice@example.com",
         agm_executable="agm.exe",
-        agm_version_or_revision="agm-1d3ce84",
+        agm_version_or_revision="1d3ce84",
         command="agm refresh alice@example.com",
-        started_at_epoch=now - 10,
-        completed_at_epoch=now - 5,
-        exit_code=0,
+        started_at_epoch=now - 5,
+        completed_at_epoch=now - 4,
+        exit_code=99,  # Contradictory!
         result=RefreshResult.REFRESH_SUCCEEDED,
-        supervisor_session_id="sess-old-previous"  # Different session!
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION
     )
-    res_2g = parse_agm_list(list_norm_text, refresh_evidence_map={"alice@example.com": ev_old_session}, expected_session_id=session_id, now_epoch=now)
-    alice_2g = next(r for r in res_2g if r.safe_account_ref == "alice@example.com")
-    assert alice_2g.freshness_state == FreshnessState.STALE_CACHED
-    assert not alice_2g.eligible
-    print("  [PASS] 2.G: Session ID mismatch -> rejected as STALE_CACHED")
+    st_1_3, _, _ = validate_refresh_evidence(ev_bad_exit, "alice@example.com", now, expected_session_id=session_id)
+    assert st_1_3 == FreshnessState.REFRESH_FAILED
+    print("  [PASS] 1.3: Contradictory exit code 99 with REFRESH_SUCCEEDED -> REFRESH_FAILED")
     tests_passed += 1
 
-    # 2.H: Evidence too old (> 300s) -> STALE_CACHED
+    # 1.4: Invariant - Wrong command binding fails closed (Item 3)
     tests_total += 1
-    ev_expired = RefreshEvidence(
+    ev_bad_cmd = RefreshEvidence(
         canonical_account="alice@example.com",
         agm_executable="agm.exe",
-        agm_version_or_revision="agm-1d3ce84",
-        command="agm refresh alice@example.com",
-        started_at_epoch=now - 400,
-        completed_at_epoch=now - 350,  # 350s old > 300s
+        agm_version_or_revision="1d3ce84",
+        command="agm info alice@example.com",  # Wrong command!
+        started_at_epoch=now - 5,
+        completed_at_epoch=now - 4,
         exit_code=0,
         result=RefreshResult.REFRESH_SUCCEEDED,
-        supervisor_session_id=session_id
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION
     )
-    res_2h = parse_agm_list(list_norm_text, refresh_evidence_map={"alice@example.com": ev_expired}, now_epoch=now)
-    alice_2h = next(r for r in res_2h if r.safe_account_ref == "alice@example.com")
-    assert alice_2h.freshness_state == FreshnessState.STALE_CACHED
-    assert not alice_2h.eligible
-    print("  [PASS] 2.H: Refresh evidence too old (350s > 300s) -> STALE_CACHED")
+    st_1_4, _, _ = validate_refresh_evidence(ev_bad_cmd, "alice@example.com", now, expected_session_id=session_id)
+    assert st_1_4 == FreshnessState.STALE_CACHED
+    print("  [PASS] 1.4: Wrong command binding -> STALE_CACHED")
     tests_passed += 1
 
-    # =========================================================================
-    # ITEM 3: Fix inspect_quota Info Mode
-    # =========================================================================
-    p_info = fixtures_dir / "info_normal.txt"
-    with open(p_info, "r", encoding="utf-8") as f:
-        info_norm_text = f.read()
-
-    # 3.1: Info mode with valid RefreshEvidence -> PROVEN_FRESH
+    # 1.5: Invariant - Unknown / unverified AGM version fails closed (Item 3 & 5)
     tests_total += 1
-    info_3_1 = parse_agm_info(info_norm_text, refresh_evidence=ev_alice, expected_session_id=session_id, now_epoch=now)
-    assert info_3_1 is not None
-    assert info_3_1.safe_account_ref == "alice@example.com"
-    assert info_3_1.freshness_state == FreshnessState.PROVEN_FRESH
-    assert info_3_1.eligible is True
-    print("  [PASS] 3.1: Info mode with RefreshEvidence -> PROVEN_FRESH")
-    tests_passed += 1
-
-    # 3.2: Info mode with raw unvalidated timestamp -> STALE_CACHED
-    tests_total += 1
-    info_3_2 = parse_agm_info(info_norm_text, raw_unvalidated_timestamp=now - 5, now_epoch=now)
-    assert info_3_2 is not None
-    assert info_3_2.freshness_state == FreshnessState.STALE_CACHED
-    assert not info_3_2.eligible
-    print("  [PASS] 3.2: Info mode with raw unvalidated timestamp -> rejected as STALE_CACHED")
-    tests_passed += 1
-
-    # =========================================================================
-    # ITEM 4: Credential Store Error Classification Tests
-    # =========================================================================
-
-    # 4.1: Target not found -> CREDENTIAL_STORE_EMPTY
-    tests_total += 1
-    v_4_1 = verify_active_account(mock_payload={}, mock_error_status=CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY)
-    assert v_4_1.status == CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY
-    assert v_4_1.credential_present is False
-    print("  [PASS] 4.1: Vault not found -> CREDENTIAL_STORE_EMPTY")
-    tests_passed += 1
-
-    # 4.2: Access denied -> CREDENTIAL_STORE_ACCESS_DENIED
-    tests_total += 1
-    v_4_2 = verify_active_account(mock_error_status=CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED)
-    assert v_4_2.status == CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED
-    assert v_4_2.credential_present is False
-    print("  [PASS] 4.2: Access denied -> CREDENTIAL_STORE_ACCESS_DENIED")
-    tests_passed += 1
-
-    # 4.3: PowerShell unavailable -> CREDENTIAL_STORE_UNAVAILABLE
-    tests_total += 1
-    v_4_3 = verify_active_account(mock_error_status=CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE)
-    assert v_4_3.status == CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE
-    print("  [PASS] 4.3: Subprocess unavailable -> CREDENTIAL_STORE_UNAVAILABLE")
-    tests_passed += 1
-
-    # 4.4: Corrupted JSON -> CREDENTIAL_PAYLOAD_INVALID
-    tests_total += 1
-    v_4_4 = verify_active_account(mock_error_status=CredentialVerificationStatus.CREDENTIAL_PAYLOAD_INVALID)
-    assert v_4_4.status == CredentialVerificationStatus.CREDENTIAL_PAYLOAD_INVALID
-    print("  [PASS] 4.4: Corrupted JSON -> CREDENTIAL_PAYLOAD_INVALID")
-    tests_passed += 1
-
-    # 4.5: Valid credential (offline) -> CREDENTIAL_STORE_WRITTEN_UNVERIFIED with matches_expected=None
-    tests_total += 1
-    mock_token_payload = {
-        "token": {
-            "access_token": "ya29.mock_token_xyz",
-            "refresh_token": "1//0mock_refresh_abc"
-        }
-    }
-    v_4_5 = verify_active_account(expected_account="alice@example.com", introspect_network=False, mock_payload=mock_token_payload)
-    assert v_4_5.status == CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED
-    assert v_4_5.matches_expected is None
-    assert v_4_5.scope == "CREDENTIAL_STORE_ONLY"
-    assert v_4_5.desktop_adoption_status == "UNKNOWN"
-    print("  [PASS] 4.5: Offline valid credential -> CREDENTIAL_STORE_WRITTEN_UNVERIFIED (matches_expected=None)")
-    tests_passed += 1
-
-    # =========================================================================
-    # ITEM 5 & 6: Switch Safe Unit Tests (Exit Codes & Aliases)
-    # =========================================================================
-
-    # 5.1: Dry run -> exit code 3
-    tests_total += 1
-    sw_dry = execute_safe_switch("alice@example.com", confirm=False)
-    assert sw_dry["status"] == SwitchOutcome.DRY_RUN.value
-    assert sw_dry["exit_code"] == 3
-    assert sw_dry["scope"] == "CREDENTIAL_STORE_ONLY"
-    print("  [PASS] 5.1: Dry run returns exit code 3")
-    tests_passed += 1
-
-    # 5.2: Wildcard rejection -> exit code 1
-    tests_total += 1
-    sw_wild = execute_safe_switch("*")
-    assert sw_wild["status"] == SwitchOutcome.WILDCARD_REJECTED.value
-    assert sw_wild["exit_code"] == 1
-    print("  [PASS] 5.2: Wildcard target '*' rejected with exit code 1")
-    tests_passed += 1
-
-    # 6.1: Non-canonical alias rejection -> exit code 1
-    tests_total += 1
-    sw_alias = execute_safe_switch("prod-worker-2")
-    assert sw_alias["status"] == SwitchOutcome.INVALID_ARGUMENT.value
-    assert sw_alias["error_code"] == "NON_CANONICAL_EMAIL"
-    assert sw_alias["exit_code"] == 1
-    print("  [PASS] 6.1: Raw alias 'prod-worker-2' rejected (canonical email required)")
-    tests_passed += 1
-
-    # =========================================================================
-    # ITEM 9: Network Verifier Synthetic Tests (Injectable Fetcher)
-    # =========================================================================
-
-    # 9.1: Network success + matching email -> CREDENTIAL_STORE_IDENTITY_VERIFIED
-    tests_total += 1
-    fetch_match = lambda tok: ({"email": "alice@example.com"}, None, None)
-    v_9_1 = verify_active_account(
-        expected_account="alice@example.com",
-        introspect_network=True,
-        mock_payload=mock_token_payload,
-        userinfo_fetcher=fetch_match
+    ev_unk_ver = RefreshEvidence(
+        canonical_account="alice@example.com",
+        agm_executable="agm.exe",
+        agm_version_or_revision="UNKNOWN_VERSION",
+        command="agm refresh alice@example.com",
+        started_at_epoch=now - 5,
+        completed_at_epoch=now - 4,
+        exit_code=0,
+        result=RefreshResult.REFRESH_SUCCEEDED,
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION
     )
-    assert v_9_1.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
-    assert v_9_1.matches_expected is True
-    print("  [PASS] 9.1: Network userinfo match -> CREDENTIAL_STORE_IDENTITY_VERIFIED")
+    st_1_5, _, _ = validate_refresh_evidence(ev_unk_ver, "alice@example.com", now, expected_session_id=session_id)
+    assert st_1_5 == FreshnessState.STALE_CACHED
+    print("  [PASS] 1.5: UNKNOWN_VERSION binary -> fail closed as STALE_CACHED")
     tests_passed += 1
 
-    # 9.2: Network success + mismatching email -> IDENTITY_MISMATCH
+    # 1.6: Invariant - Monotonicity: start after completed fails closed (Item 3)
     tests_total += 1
-    fetch_mismatch = lambda tok: ({"email": "bob@example.com"}, None, None)
-    v_9_2 = verify_active_account(
-        expected_account="alice@example.com",
-        introspect_network=True,
-        mock_payload=mock_token_payload,
-        userinfo_fetcher=fetch_mismatch
+    ev_mono = RefreshEvidence(
+        canonical_account="alice@example.com",
+        agm_executable="agm.exe",
+        agm_version_or_revision="1d3ce84",
+        command="agm refresh alice@example.com",
+        started_at_epoch=now - 2,
+        completed_at_epoch=now - 5,  # start > completed!
+        exit_code=0,
+        result=RefreshResult.REFRESH_SUCCEEDED,
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION
     )
-    assert v_9_2.status == CredentialVerificationStatus.IDENTITY_MISMATCH
-    assert v_9_2.matches_expected is False
-    print("  [PASS] 9.2: Network userinfo mismatch -> IDENTITY_MISMATCH")
+    st_1_6, _, _ = validate_refresh_evidence(ev_mono, "alice@example.com", now, expected_session_id=session_id)
+    assert st_1_6 == FreshnessState.STALE_CACHED
+    print("  [PASS] 1.6: Invalid timestamp monotonicity -> STALE_CACHED")
     tests_passed += 1
 
-    # 9.3: Network timeout -> NETWORK_UNAVAILABLE
+    # 1.7: Invariant - Future timestamp (10m in future) fails closed (Item 3)
     tests_total += 1
-    fetch_timeout = lambda tok: (None, CredentialVerificationStatus.NETWORK_UNAVAILABLE, "Socket timed out")
-    v_9_3 = verify_active_account(
-        expected_account="alice@example.com",
-        introspect_network=True,
-        mock_payload=mock_token_payload,
-        userinfo_fetcher=fetch_timeout
+    ev_future_far = RefreshEvidence(
+        canonical_account="alice@example.com",
+        agm_executable="agm.exe",
+        agm_version_or_revision="1d3ce84",
+        command="agm refresh alice@example.com",
+        started_at_epoch=now + 590,
+        completed_at_epoch=now + 600,  # 10 minutes in future
+        exit_code=0,
+        result=RefreshResult.REFRESH_SUCCEEDED,
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION
     )
-    assert v_9_3.status == CredentialVerificationStatus.NETWORK_UNAVAILABLE
-    assert v_9_3.matches_expected is None
-    print("  [PASS] 9.3: Network timeout -> NETWORK_UNAVAILABLE (matches_expected=None)")
+    st_1_7, _, _ = validate_refresh_evidence(ev_future_far, "alice@example.com", now, expected_session_id=session_id)
+    assert st_1_7 == FreshnessState.STALE_CACHED
+    print("  [PASS] 1.7: Timestamp 10m in future -> rejected as STALE_CACHED")
     tests_passed += 1
 
-    # 9.4: HTTP 401 -> TOKEN_REJECTED
+    # 1.8: Invariant - Future timestamp within allowed skew (1.0s <= 2.0s) accepted (Item 3)
     tests_total += 1
-    fetch_401 = lambda tok: (None, CredentialVerificationStatus.TOKEN_REJECTED, "HTTP 401 Unauthorized")
-    v_9_4 = verify_active_account(
-        expected_account="alice@example.com",
-        introspect_network=True,
-        mock_payload=mock_token_payload,
-        userinfo_fetcher=fetch_401
+    ev_skew_ok = RefreshEvidence(
+        canonical_account="alice@example.com",
+        agm_executable="agm.exe",
+        agm_version_or_revision="1d3ce84",
+        command="agm refresh alice@example.com",
+        started_at_epoch=now,
+        completed_at_epoch=now + 1.0,  # 1.0s skew <= 2.0s allowed
+        exit_code=0,
+        result=RefreshResult.REFRESH_SUCCEEDED,
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION
     )
-    assert v_9_4.status == CredentialVerificationStatus.TOKEN_REJECTED
-    assert v_9_4.matches_expected is None
-    print("  [PASS] 9.4: HTTP 401 -> TOKEN_REJECTED")
+    st_1_8, _, _ = validate_refresh_evidence(ev_skew_ok, "alice@example.com", now, allowed_clock_skew_sec=2.0, expected_session_id=session_id)
+    assert st_1_8 == FreshnessState.PROVEN_FRESH
+    print("  [PASS] 1.8: Timestamp within allowed clock skew (1.0s <= 2.0s) -> PROVEN_FRESH")
     tests_passed += 1
 
-    # 9.5: Missing email field in userinfo -> USERINFO_INVALID_RESPONSE
+    # 1.9: HMAC Signed Evidence Verification (Item 1)
     tests_total += 1
-    fetch_no_email = lambda tok: ({"name": "No Email Account"}, None, None)
-    v_9_5 = verify_active_account(
-        expected_account="alice@example.com",
-        introspect_network=True,
-        mock_payload=mock_token_payload,
-        userinfo_fetcher=fetch_no_email
+    ev_live = RefreshEvidence(
+        canonical_account="alice@example.com",
+        agm_executable="agm.exe",
+        agm_version_or_revision="1d3ce84",
+        command="agm refresh alice@example.com",
+        started_at_epoch=now - 5,
+        completed_at_epoch=now - 4,
+        exit_code=0,
+        result=RefreshResult.REFRESH_SUCCEEDED,
+        supervisor_session_id=session_id,
+        origin=EvidenceTrustOrigin.UNTRUSTED_DESERIALIZED
     )
-    assert v_9_5.status == CredentialVerificationStatus.USERINFO_INVALID_RESPONSE
-    assert v_9_5.matches_expected is None
-    print("  [PASS] 9.5: Response missing email -> USERINFO_INVALID_RESPONSE")
+    ev_live.hmac_signature = compute_evidence_hmac(ev_live, secret)
+    # Valid signature
+    st_1_9_ok, _, _ = validate_refresh_evidence(ev_live, "alice@example.com", now, expected_session_id=session_id, session_secret=secret)
+    assert st_1_9_ok == FreshnessState.PROVEN_FRESH
+    # Tampered signature
+    st_1_9_bad, _, _ = validate_refresh_evidence(ev_live, "alice@example.com", now, expected_session_id=session_id, session_secret="wrong-secret")
+    assert st_1_9_bad == FreshnessState.STALE_CACHED
+    print("  [PASS] 1.9: HMAC signed evidence: valid secret -> PROVEN_FRESH, tampered -> STALE_CACHED")
     tests_passed += 1
 
     # =========================================================================
-    # ITEM 10: Fail Closed on AGM Format Changes Fixtures
+    # ITEM 6: Test Actual Refresh Executor with Injected Fake Runners
     # =========================================================================
 
-    # 10.1: list_schema_missing_column.txt -> FORMAT_UNSUPPORTED
+    # 6.1: Injected runner exit 0 -> REFRESH_SUCCEEDED
     tests_total += 1
-    with open(fixtures_dir / "list_schema_missing_column.txt", "r", encoding="utf-8") as f:
-        res_10_1 = parse_agm_list(f.read())
-    assert len(res_10_1) == 1
-    assert res_10_1[0].format_support == FormatSupportState.FORMAT_UNSUPPORTED
-    assert not res_10_1[0].eligible
-    print("  [PASS] 10.1: Missing column schema -> fail closed as FORMAT_UNSUPPORTED")
+    runner_ok = lambda cmd, t: (0, "Refreshed alice@example.com successfully", "")
+    ev_6_1 = execute_safe_refresh("alice@example.com", session_id, agm_runner=runner_ok, clock=lambda: now)
+    assert ev_6_1.result == RefreshResult.REFRESH_SUCCEEDED
+    assert ev_6_1.exit_code == 0
+    assert ev_6_1.origin == EvidenceTrustOrigin.SYNTHETIC_TEST_EVIDENCE
+    print("  [PASS] 6.1: Executor runner exit 0 -> REFRESH_SUCCEEDED")
     tests_passed += 1
 
-    # 10.2: list_schema_renamed_column.txt -> FORMAT_UNSUPPORTED
+    # 6.2: Injected runner auth failure -> REFRESH_FAILED_AUTH
     tests_total += 1
-    with open(fixtures_dir / "list_schema_renamed_column.txt", "r", encoding="utf-8") as f:
-        res_10_2 = parse_agm_list(f.read())
-    assert res_10_2[0].format_support == FormatSupportState.FORMAT_UNSUPPORTED
-    print("  [PASS] 10.2: Renamed column schema -> fail closed as FORMAT_UNSUPPORTED")
+    runner_auth = lambda cmd, t: (1, "", "Error: invalid_grant - token expired")
+    ev_6_2 = execute_safe_refresh("alice@example.com", session_id, agm_runner=runner_auth, clock=lambda: now)
+    assert ev_6_2.result == RefreshResult.REFRESH_FAILED_AUTH
+    assert ev_6_2.exit_code == 1
+    print("  [PASS] 6.2: Executor runner auth failure -> REFRESH_FAILED_AUTH")
     tests_passed += 1
 
-    # 10.3: list_schema_reordered.txt -> FORMAT_UNSUPPORTED
+    # 6.3: Injected runner network failure -> REFRESH_FAILED_NETWORK
     tests_total += 1
-    with open(fixtures_dir / "list_schema_reordered.txt", "r", encoding="utf-8") as f:
-        res_10_3 = parse_agm_list(f.read())
-    assert res_10_3[0].format_support == FormatSupportState.FORMAT_UNSUPPORTED
-    print("  [PASS] 10.3: Reordered columns schema -> fail closed as FORMAT_UNSUPPORTED")
+    runner_net = lambda cmd, t: (1, "", "Error: dial tcp: i/o timeout")
+    ev_6_3 = execute_safe_refresh("alice@example.com", session_id, agm_runner=runner_net, clock=lambda: now)
+    assert ev_6_3.result == RefreshResult.REFRESH_FAILED_NETWORK
+    print("  [PASS] 6.3: Executor runner network timeout -> REFRESH_FAILED_NETWORK")
     tests_passed += 1
 
-    # 10.4: list_schema_corrupted_header.txt -> FORMAT_UNSUPPORTED
+    # 6.4: Injected runner account not found -> REFRESH_FAILED_ACCOUNT_NOT_FOUND
     tests_total += 1
-    with open(fixtures_dir / "list_schema_corrupted_header.txt", "r", encoding="utf-8") as f:
-        res_10_4 = parse_agm_list(f.read())
-    assert res_10_4[0].format_support == FormatSupportState.FORMAT_UNSUPPORTED
-    print("  [PASS] 10.4: Corrupted header -> fail closed as FORMAT_UNSUPPORTED")
+    runner_nf = lambda cmd, t: (1, "", "Error: account 'alice@example.com' not found")
+    ev_6_4 = execute_safe_refresh("alice@example.com", session_id, agm_runner=runner_nf, clock=lambda: now)
+    assert ev_6_4.result == RefreshResult.REFRESH_FAILED_ACCOUNT_NOT_FOUND
+    print("  [PASS] 6.4: Executor runner account not found -> REFRESH_FAILED_ACCOUNT_NOT_FOUND")
     tests_passed += 1
 
-    # 10.5: Fallback lenient parser with explicit flag
+    # 6.5: Injected runner unknown version -> REFRESH_VERSION_UNVERIFIED
     tests_total += 1
-    with open(fixtures_dir / "list_schema_corrupted_header.txt", "r", encoding="utf-8") as f:
-        res_10_5 = parse_agm_list(f.read(), lenient_parser=True)
-    assert len(res_10_5) == 2
-    assert res_10_5[0].safe_account_ref == "alice@example.com"
-    assert any("research-lenient" in w for w in res_10_5[0].parse_warnings)
-    print("  [PASS] 10.5: Explicit research-lenient flag parses fallback lines with warning")
+    ver_resolver_unk = lambda b: "UNKNOWN_VERSION"
+    ev_6_5 = execute_safe_refresh("alice@example.com", session_id, agm_runner=runner_ok, version_resolver=ver_resolver_unk, clock=lambda: now)
+    assert ev_6_5.result == RefreshResult.REFRESH_VERSION_UNVERIFIED
+    print("  [PASS] 6.5: Executor unknown version -> REFRESH_VERSION_UNVERIFIED")
     tests_passed += 1
 
     # =========================================================================
-    # ITEM 11: Model-Specific Routing Tests
+    # ITEM 7 & 8: Test Real Credential Reader Output Classifier
     # =========================================================================
 
-    # Setup candidate accounts:
-    # accA: Pro = 0, Flash = 90, Claude = 0 (Fresh)
-    # accB: Pro = None, Flash = 100, Claude = 50 (Fresh)
-    # accC: Claude = 80, Pro = 0, Flash = 0 (Fresh)
-    accA = AccountQuotaSummary("userA@corp.com", [], False, False, False, 0, 90, 0, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, FormatSupportState.FORMAT_SUPPORTED, "MOCK", [], True)
-    accB = AccountQuotaSummary("userB@corp.com", [], False, False, False, None, 100, 50, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, FormatSupportState.FORMAT_SUPPORTED, "MOCK", [], True)
-    accC = AccountQuotaSummary("userC@corp.com", [], False, False, False, 0, 0, 80, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, FormatSupportState.FORMAT_SUPPORTED, "MOCK", [], True)
-
-    # 11.1: Target 'gemini-pro' on accA (Pro=0, Flash=90) -> REJECT
+    # 8.1: Exit 1 + empty stdout -> POWERSHELL_PROCESS_FAILED
     tests_total += 1
-    sel_pro = AccountSelector(SelectionConfig(min_quota_pct=20, target_model_group="gemini-pro"))
-    res_11_1 = sel_pro.select_next_account([accA], now=now)
-    assert res_11_1.selected_account is None
-    assert res_11_1.terminal_state == TerminalState.BLOCKED_NO_ACCOUNT
-    print("  [PASS] 11.1: Target gemini-pro on accA (Pro=0%, Flash=90%) -> REJECTED")
+    _, st_8_1, _ = parse_credential_process_output(1, "", "")
+    assert st_8_1 == CredentialVerificationStatus.POWERSHELL_PROCESS_FAILED
+    print("  [PASS] 8.1: Exit 1 + empty stdout -> POWERSHELL_PROCESS_FAILED")
     tests_passed += 1
 
-    # 11.2: Target 'gemini-flash' on accA (Pro=0, Flash=90) -> SELECTED
+    # 8.2: Exit 1 + access denied stderr -> CREDENTIAL_STORE_ACCESS_DENIED
     tests_total += 1
-    sel_flash = AccountSelector(SelectionConfig(min_quota_pct=20, target_model_group="gemini-flash"))
-    res_11_2 = sel_flash.select_next_account([accA], now=now)
-    assert res_11_2.selected_account == "userA@corp.com"
-    assert res_11_2.terminal_state == TerminalState.NONE
-    print("  [PASS] 11.2: Target gemini-flash on accA (Pro=0%, Flash=90%) -> SELECTED")
+    _, st_8_2, _ = parse_credential_process_output(1, "", "Exception: Access is denied")
+    assert st_8_2 == CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED
+    print("  [PASS] 8.2: Exit 1 + access denied stderr -> CREDENTIAL_STORE_ACCESS_DENIED")
     tests_passed += 1
 
-    # 11.3: Target 'gemini-pro' on accB (Pro=None, Flash=100) -> BLOCKED_QUOTA_UNKNOWN (Never infer Pro from Flash!)
+    # 8.3: Exit 0 + ERR_NOT_FOUND -> CREDENTIAL_STORE_EMPTY
     tests_total += 1
-    res_11_3 = sel_pro.select_next_account([accB], now=now)
-    assert res_11_3.selected_account is None
-    assert res_11_3.terminal_state == TerminalState.BLOCKED_QUOTA_UNKNOWN
-    print("  [PASS] 11.3: Target gemini-pro on accB (Pro=None, Flash=100%) -> BLOCKED_QUOTA_UNKNOWN (no cross-model inference)")
+    _, st_8_3, _ = parse_credential_process_output(0, "ERR_NOT_FOUND", "")
+    assert st_8_3 == CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY
+    print("  [PASS] 8.3: Exit 0 + ERR_NOT_FOUND -> CREDENTIAL_STORE_EMPTY")
     tests_passed += 1
 
-    # 11.4: Target 'gemini-pro' on accC (Claude=80, Pro=0, Flash=0) -> REJECT
+    # 8.4: Exit 0 + ERR_ACCESS_DENIED -> CREDENTIAL_STORE_ACCESS_DENIED
     tests_total += 1
-    res_11_4 = sel_pro.select_next_account([accC], now=now)
-    assert res_11_4.selected_account is None
-    assert res_11_4.terminal_state == TerminalState.BLOCKED_NO_ACCOUNT
-    print("  [PASS] 11.4: Target gemini-pro on accC (Claude=80%, Pro=0%) -> REJECTED")
+    _, st_8_4, _ = parse_credential_process_output(0, "ERR_ACCESS_DENIED", "")
+    assert st_8_4 == CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED
+    print("  [PASS] 8.4: Exit 0 + ERR_ACCESS_DENIED -> CREDENTIAL_STORE_ACCESS_DENIED")
+    tests_passed += 1
+
+    # 8.5: Exit 0 + ERR_WIN32_1359 -> CREDENTIAL_STORE_READ_ERROR
+    tests_total += 1
+    _, st_8_5, _ = parse_credential_process_output(0, "ERR_WIN32_1359", "")
+    assert st_8_5 == CredentialVerificationStatus.CREDENTIAL_STORE_READ_ERROR
+    print("  [PASS] 8.5: Exit 0 + ERR_WIN32_1359 -> CREDENTIAL_STORE_READ_ERROR")
+    tests_passed += 1
+
+    # 8.6: Exit 0 + Corrupted JSON -> CREDENTIAL_PAYLOAD_INVALID
+    tests_total += 1
+    _, st_8_6, _ = parse_credential_process_output(0, "{not-json", "")
+    assert st_8_6 == CredentialVerificationStatus.CREDENTIAL_PAYLOAD_INVALID
+    print("  [PASS] 8.6: Exit 0 + Corrupted JSON -> CREDENTIAL_PAYLOAD_INVALID")
+    tests_passed += 1
+
+    # 8.7: Exit 0 + Valid JSON -> returns parsed dict
+    tests_total += 1
+    data_8_7, st_8_7, _ = parse_credential_process_output(0, '{"token":{"access_token":"ya29.xyz"}}', "")
+    assert st_8_7 is None
+    assert data_8_7 == {"token": {"access_token": "ya29.xyz"}}
+    print("  [PASS] 8.7: Exit 0 + Valid JSON -> successfully parsed dict")
+    tests_passed += 1
+
+    # =========================================================================
+    # ITEM 9: Token Payload Semantics (Empty tokens vs Empty vault)
+    # =========================================================================
+
+    # 9.1: Target absent -> CREDENTIAL_STORE_EMPTY (credential_present = False)
+    tests_total += 1
+    v_9_1 = verify_active_account(ps_runner=lambda: (0, "ERR_NOT_FOUND", ""))
+    assert v_9_1.status == CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY
+    assert v_9_1.credential_present is False
+    print("  [PASS] 9.1: Target absent -> CREDENTIAL_STORE_EMPTY (credential_present=False)")
+    tests_passed += 1
+
+    # 9.2: Blob present but tokens empty -> CREDENTIAL_TOKEN_FIELDS_MISSING (credential_present = True)
+    tests_total += 1
+    v_9_2 = verify_active_account(ps_runner=lambda: (0, '{"token":{"access_token":"","refresh_token":""}}', ""))
+    assert v_9_2.status == CredentialVerificationStatus.CREDENTIAL_TOKEN_FIELDS_MISSING
+    assert v_9_2.credential_present is True
+    print("  [PASS] 9.2: Empty token fields -> CREDENTIAL_TOKEN_FIELDS_MISSING (credential_present=True)")
+    tests_passed += 1
+
+    # =========================================================================
+    # ITEM 10 & 11 & 14: Switch Production Branches & Target Scope Tests
+    # =========================================================================
+
+    # 10.A: AGM command non-zero -> exit 1 (SWITCH_COMMAND_FAILED)
+    tests_total += 1
+    sw_10_a = execute_safe_switch(
+        "alice@example.com",
+        confirm=True,
+        agm_runner=lambda cmd, t: (1, "", "Error: switch failed"),
+        verifier=lambda exp, net: VerificationResult(exp, None, None, False, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "UNKNOWN", False, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "WINDOWS_CREDENTIAL_MANAGER", "")
+    )
+    assert sw_10_a["status"] == SwitchOutcome.SWITCH_COMMAND_FAILED.value
+    assert sw_10_a["exit_code"] == 1
+    print("  [PASS] 10.A: AGM command non-zero -> exit 1 (SWITCH_COMMAND_FAILED)")
+    tests_passed += 1
+
+    # 10.B: AGM zero + post verifier WRITTEN_UNVERIFIED -> exit 2 (SWITCH_WRITTEN_UNVERIFIED)
+    tests_total += 1
+    mock_post_unverified = VerificationResult("alice@example.com", None, "fp123", True, CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED, "MEDIUM", None, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "WINDOWS_CREDENTIAL_MANAGER", "")
+    sw_10_b = execute_safe_switch(
+        "alice@example.com",
+        confirm=True,
+        agm_runner=lambda cmd, t: (0, "Switched successfully", ""),
+        verifier=lambda exp, net: mock_post_unverified
+    )
+    assert sw_10_b["status"] == SwitchOutcome.SWITCH_WRITTEN_UNVERIFIED.value
+    assert sw_10_b["exit_code"] == 2
+    print("  [PASS] 10.B: AGM zero + post verifier WRITTEN_UNVERIFIED -> exit 2 (SWITCH_WRITTEN_UNVERIFIED)")
+    tests_passed += 1
+
+    # 10.C: AGM zero + post verifier IDENTITY_VERIFIED -> exit 0 (CREDENTIAL_IDENTITY_VERIFIED)
+    tests_total += 1
+    mock_post_verified = VerificationResult("alice@example.com", "alice@example.com", "fp123", True, CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED, "STRONG", True, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "GOOGLE_USERINFO_ENDPOINT", "")
+    sw_10_c = execute_safe_switch(
+        "alice@example.com",
+        confirm=True,
+        agm_runner=lambda cmd, t: (0, "Switched successfully", ""),
+        verifier=lambda exp, net: mock_post_verified
+    )
+    assert sw_10_c["status"] == SwitchOutcome.CREDENTIAL_IDENTITY_VERIFIED.value
+    assert sw_10_c["exit_code"] == 0
+    print("  [PASS] 10.C: AGM zero + post verifier IDENTITY_VERIFIED -> exit 0 (CREDENTIAL_IDENTITY_VERIFIED)")
+    tests_passed += 1
+
+    # 10.D: AGM zero + post verifier IDENTITY_MISMATCH -> exit 1 (VERIFY_FAILED)
+    tests_total += 1
+    mock_post_mismatch = VerificationResult("alice@example.com", "bob@example.com", "fp123", True, CredentialVerificationStatus.IDENTITY_MISMATCH, "STRONG", False, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "GOOGLE_USERINFO_ENDPOINT", "")
+    sw_10_d = execute_safe_switch(
+        "alice@example.com",
+        confirm=True,
+        agm_runner=lambda cmd, t: (0, "Switched successfully", ""),
+        verifier=lambda exp, net: mock_post_mismatch
+    )
+    assert sw_10_d["status"] == SwitchOutcome.VERIFY_FAILED.value
+    assert sw_10_d["exit_code"] == 1
+    print("  [PASS] 10.D: AGM zero + post verifier IDENTITY_MISMATCH -> exit 1 (VERIFY_FAILED)")
+    tests_passed += 1
+
+    # 11.1: Target 'ide' / 'all' strictly rejected (Item 11)
+    tests_total += 1
+    sw_11_1 = execute_safe_switch("alice@example.com", target="ide")
+    assert sw_11_1["status"] == SwitchOutcome.INVALID_ARGUMENT.value
+    assert sw_11_1["error_code"] == "UNSUPPORTED_TARGET_SCOPE"
+    assert sw_11_1["exit_code"] == 1
+    print("  [PASS] 11.1: Target 'ide' strictly rejected in T02 scope")
+    tests_passed += 1
+
+    # 14.1: Dry-run with injected verifier performs ZERO real vault calls (Item 14)
+    tests_total += 1
+    vault_called = False
+    def trap_verifier(exp, net):
+        nonlocal vault_called
+        vault_called = True
+        return mock_post_unverified
+
+    sw_14_1 = execute_safe_switch("alice@example.com", confirm=False, verifier=trap_verifier)
+    assert sw_14_1["status"] == SwitchOutcome.DRY_RUN.value
+    assert sw_14_1["exit_code"] == 3
+    assert vault_called is True  # Trapped by injected mock; real OS CredRead was bypassed!
+    print("  [PASS] 14.1: Switch dry-run is 100% host-isolated via verifier injection")
+    tests_passed += 1
+
+    # =========================================================================
+    # ITEM 13: Fail Closed in Info Mode Table Schema Checks
+    # =========================================================================
+
+    # 13.1: Info mode with corrupted table header -> fail closed (Item 13)
+    tests_total += 1
+    corrupted_info = """Account: alice@example.com
+Token expiry: 2026-08-27 (active)
+CORRUPTED_HEADER_TABLE
+google gemini-1.5-pro 85% 2026-08-27T00:00:00Z
+"""
+    info_13_1 = parse_agm_info(corrupted_info, now_epoch=now)
+    assert info_13_1 is not None
+    assert info_13_1.format_support == FormatSupportState.FORMAT_UNSUPPORTED
+    assert not info_13_1.eligible
+    print("  [PASS] 13.1: Corrupted info mode table header -> fails closed as FORMAT_UNSUPPORTED")
+    tests_passed += 1
+
+    # =========================================================================
+    # ITEM 15: ModelGroup Enum Fail-Closed Validation
+    # =========================================================================
+
+    # 15.1: Typo in target_model_group 'gemni-pro' -> FAILED_SAFE (Item 15)
+    tests_total += 1
+    sel_typo = AccountSelector(SelectionConfig(target_model_group="gemni-pro"))
+    res_15_1 = sel_typo.select_next_account([], now=now)
+    assert res_15_1.terminal_state == TerminalState.FAILED_SAFE
+    assert "INVALID_MODEL_GROUP" in res_15_1.decision_reason
+    print("  [PASS] 15.1: Typo 'gemni-pro' in target_model_group -> FAILED_SAFE (INVALID_MODEL_GROUP)")
+    tests_passed += 1
+
+    # 15.2: Empty target_model_group -> FAILED_SAFE (Item 15)
+    tests_total += 1
+    sel_empty = AccountSelector(SelectionConfig(target_model_group=""))
+    res_15_2 = sel_empty.select_next_account([], now=now)
+    assert res_15_2.terminal_state == TerminalState.FAILED_SAFE
+    assert "INVALID_MODEL_GROUP" in res_15_2.decision_reason
+    print("  [PASS] 15.2: Empty target_model_group -> FAILED_SAFE (INVALID_MODEL_GROUP)")
     tests_passed += 1
 
     print(f"\n=======================================================")

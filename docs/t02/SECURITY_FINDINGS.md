@@ -1,53 +1,28 @@
-# T02 Security Audit and Findings: AGM Integration (Zero-Trust Round 2 Revision)
+# T02 Security Audit and Findings: AGM Integration (Zero-Trust Round 3 Revision)
 
-## 1. Credential Storage Architecture & Sandboxing Gap
+## 1. Threat Model & Provenance Trust Model
 
-### 1.1 Host OS Credential Manager (`gemini:antigravity`)
-- **Target Name:** `gemini:antigravity`
-- **Account / User:** `antigravity`
-- **Persistence:** `CRED_PERSIST_LOCAL_MACHINE` (Type 2 Generic).
-- **Blob Payload:** Plaintext JSON containing Google OAuth `access_token` (`ya29...`) and `refresh_token` (`1//0...`).
-- **Sandboxing Gap:** `$env:AGM_DATA_DIR` isolates the SQLite database (`cloud_accounts.db`) and `.mk`, but **DOES NOT** isolate the Windows Credential Manager.
-- **Rule for Test Suites:** Unit tests must use mock payloads (`mock_payload`) and dependency-injected fetchers. Synthetic tests must never invoke `agm switch --target agy` on the host OS.
+### 1.1 RefreshEvidence Trust Model
+- **Process-Local Typed Origin:** Supervisor accepts `RefreshEvidence` instances directly returned from `execute_safe_refresh()` with `origin == EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION`.
+- **HMAC Session Signing:** Serialized evidence across process boundaries requires HMAC-SHA256 signature verification with an ephemeral session secret. Unsigned or mismatched records are classified `UNTRUSTED_DESERIALIZED` / `RESEARCH_ONLY` and rejected.
+- **Synthetic Isolation:** `SYNTHETIC_TEST_EVIDENCE` records are rejected by default in supervisor mode, preventing test artifacts from leaking into production decision paths.
 
-### 1.2 Master Key (`.mk`) & SQLite Store
-- **Master Key Location:** `~/.antigravity-agent/.mk` (Plaintext 64-char hex 256-bit AES key).
-- **SQLite Database:** `~/.antigravity-agent/cloud_accounts.db` (AES-256-GCM encrypted tokens).
-- **Risk:** Directory compromise exposes `.mk` and all encrypted tokens.
+### 1.2 Credential Store Scope & Isolation
+- **Target Restriction:** T02 safe wrapper strictly restricts target to `"agy"`, operating solely against Windows Credential Manager `gemini:antigravity`.
+- **Non-Interference:** T02 does not touch IDE SQLite databases or kill Desktop processes.
+- **Host Test Isolation:** All unit and synthetic test suites utilize dependency-injected mock runners and verifiers, ensuring 100% host vault isolation (zero reads, zero writes).
 
 ---
 
-## 2. Host Credential Incident Post-Mortem (Item 8)
+## 2. Production Log Exposure & Output Redaction (Item 16)
 
-1. **Incident Description:** Synthetic switch testing (`agm switch mock.worker1 --target agy`) bypassed data directory isolation and mutated the host user's live Windows Credential Manager target `gemini:antigravity`.
-2. **Impact Analysis:** Running Electron instances remained unaffected due to in-memory session tokens, but new CLI / cold-start processes read the mock token.
-3. **Restoration & Verification:**
-   - Active credential target restored.
-   - Restoration status: **`HOST_CREDENTIAL_RESTORATION = UNKNOWN`** (cannot cryptographically verify exact prior byte payload without historical secret exposure).
-4. **Remediation Implemented:** Complete decoupling of test runners from OS vault via `mock_payload` injection in `scripts/t02/verify_active_account.py`.
+- **Default Output:** Emits only sanitized metadata: `account_ref`, `status`, `target_product`, `scope`, `desktop_adoption_status`, `exit_code`.
+- **Diagnostic Mode:** Raw subprocess stderr/stdout and token fingerprint prefixes are sequestered behind explicit `--diagnostic-mode` flags.
+- **Zero Raw Secret Exposure:** Raw OAuth tokens (`access_token`, `refresh_token`) are NEVER logged, printed, or persisted.
 
 ---
 
-## 3. Dangerous Commands Prohibited from Automation
+## 3. Incident Post-Mortem Status
 
-| Command | Danger / Reason |
-|---------|-----------------|
-| `agm login` / `agm add` | Launches interactive browser OAuth, binds ports 8888-8892, blocks execution for up to 5 minutes. |
-| `agm remove` / `agm rm` | Permanently deletes accounts; interactive `[y/N]` prompt. |
-| `agm unalias` | Deletes user aliases. |
-| `agm export` | Writes sensitive unencrypted token JSON to filesystem. |
-| `agm import-backup` | Overwrites local account store from arbitrary JSON. |
-| `agm watch` | Infinite blocking loop with ANSI escapes. |
-| `agm auto-switch` | Interactive prompt; non-deterministic logic bypassing supervisor terminal state guarantees. |
-
----
-
-## 4. Prohibited Commits and Secret Leakage Prevention
-
-The following files and patterns must **NEVER** be committed to Git:
-1. `**/.antigravity-agent/**`
-2. `**/.mk` or any 64-character hex master key strings.
-3. `**/cloud_accounts.db` and SQLite database backups (`*.db`, `*.db-wal`, `*.db-shm`).
-4. `**/accounts_backup*.json` or exported account files.
-5. Raw Google OAuth tokens (`ya29.*`, `1//0.*`, `eyJ.*`).
-6. Decrypted credential blobs from Windows Credential Manager.
+- **Status:** `HOST_CREDENTIAL_RESTORATION = UNKNOWN`.
+- Active credential target is restored; mock test decoupling via dependency injection permanently prevents test-runner mutation of host OS credentials.

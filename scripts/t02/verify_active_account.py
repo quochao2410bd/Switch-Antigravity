@@ -9,10 +9,12 @@ Explicit State Model & Error Classification:
   contains a valid token whose Google OAuth userinfo matches the expected canonical email.
 - CREDENTIAL_STORE_WRITTEN_UNVERIFIED: Token present in vault, but network userinfo
   introspection was not performed or offline.
-- CREDENTIAL_STORE_EMPTY: No 'gemini:antigravity' target found (Win32 1168).
+- CREDENTIAL_STORE_EMPTY: Target 'gemini:antigravity' not found in vault (Win32 1168).
+- CREDENTIAL_TOKEN_FIELDS_MISSING: Credential blob exists but token fields are absent/empty.
 - CREDENTIAL_STORE_ACCESS_DENIED: Access denied reading OS vault (Win32 5).
-- CREDENTIAL_STORE_READ_ERROR: OS-level read error from CredRead.
-- CREDENTIAL_STORE_UNAVAILABLE: PowerShell or Credential Manager API unavailable.
+- CREDENTIAL_STORE_READ_ERROR: OS-level read error from CredRead (Win32 != 0).
+- POWERSHELL_PROCESS_FAILED: Subprocess exited with non-zero exit code or error output.
+- CREDENTIAL_STORE_UNAVAILABLE: PowerShell or Credential Manager API timed out or unavailable.
 - CREDENTIAL_PAYLOAD_INVALID: Malformed JSON or corrupted blob structure.
 - IDENTITY_MISMATCH: Introspected OAuth identity does not match expected account.
 - TOKEN_REJECTED: Google OAuth returned HTTP 401 / expired token.
@@ -40,8 +42,10 @@ class CredentialVerificationStatus(str, Enum):
     CREDENTIAL_STORE_IDENTITY_VERIFIED = "CREDENTIAL_STORE_IDENTITY_VERIFIED"
     CREDENTIAL_STORE_WRITTEN_UNVERIFIED = "CREDENTIAL_STORE_WRITTEN_UNVERIFIED"
     CREDENTIAL_STORE_EMPTY = "CREDENTIAL_STORE_EMPTY"
+    CREDENTIAL_TOKEN_FIELDS_MISSING = "CREDENTIAL_TOKEN_FIELDS_MISSING"
     CREDENTIAL_STORE_ACCESS_DENIED = "CREDENTIAL_STORE_ACCESS_DENIED"
     CREDENTIAL_STORE_READ_ERROR = "CREDENTIAL_STORE_READ_ERROR"
+    POWERSHELL_PROCESS_FAILED = "POWERSHELL_PROCESS_FAILED"
     CREDENTIAL_STORE_UNAVAILABLE = "CREDENTIAL_STORE_UNAVAILABLE"
     CREDENTIAL_PAYLOAD_INVALID = "CREDENTIAL_PAYLOAD_INVALID"
     IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
@@ -55,7 +59,7 @@ class CredentialVerificationStatus(str, Enum):
 class VerificationResult:
     expected_account: Optional[str]
     detected_active_email: Optional[str]
-    token_fingerprint: Optional[str]  # Non-secret SHA-256 prefix
+    token_fingerprint: Optional[str]  # Redacted non-secret SHA-256 prefix
     credential_present: bool
     status: CredentialVerificationStatus
     evidence_rank: str  # "STRONG", "MEDIUM", "WEAK", "UNKNOWN"
@@ -66,11 +70,52 @@ class VerificationResult:
     details: str
 
 
-def read_windows_credential_payload() -> Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]:
+def parse_credential_process_output(
+    returncode: int,
+    stdout: str,
+    stderr: str
+) -> Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]:
     """
-    Safely reads 'gemini:antigravity' from Windows Credential Manager via PowerShell.
+    Parses PowerShell CredRead process output with strict returncode checking (Item 7 & 8).
     Returns (parsed_dict, error_status, error_details).
     """
+    if returncode != 0:
+        err_msg = stderr.strip() or stdout.strip() or f"Process exited with code {returncode}"
+        if "access is denied" in err_msg.lower() or "unauthorized" in err_msg.lower():
+            return None, CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED, f"Access denied: {err_msg}"
+        return None, CredentialVerificationStatus.POWERSHELL_PROCESS_FAILED, f"PowerShell query failed: {err_msg}"
+
+    raw = stdout.strip()
+    if not raw:
+        return None, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "Empty output from credential reader"
+    if raw == "ERR_NOT_FOUND":
+        return None, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "Target 'gemini:antigravity' not found in vault (Win32 1168)"
+    if raw == "ERR_ACCESS_DENIED":
+        return None, CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED, "Access denied reading 'gemini:antigravity' (Win32 5)"
+    if raw.startswith("ERR_WIN32_"):
+        return None, CredentialVerificationStatus.CREDENTIAL_STORE_READ_ERROR, f"Win32 error reading vault: {raw}"
+
+    try:
+        data = json.loads(raw)
+        return data, None, None
+    except json.JSONDecodeError as e:
+        return None, CredentialVerificationStatus.CREDENTIAL_PAYLOAD_INVALID, f"Corrupted JSON in credential blob: {e}"
+
+
+def read_windows_credential_payload(
+    runner: Optional[Callable[[], Tuple[int, str, str]]] = None
+) -> Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]:
+    """
+    Reads 'gemini:antigravity' from Windows Credential Manager via PowerShell.
+    Supports dependency-injected runner for full test isolation.
+    """
+    if runner:
+        try:
+            ret, out, err = runner()
+            return parse_credential_process_output(ret, out, err)
+        except Exception as e:
+            return None, CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE, f"Injected runner error: {e}"
+
     ps_script = r'''
 $ErrorActionPreference = 'Stop'
 $code = @'
@@ -118,22 +163,9 @@ Write-Output $blob
             text=True,
             timeout=10
         )
-        raw = proc.stdout.strip()
-        if not raw:
-            return None, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "Empty output from credential reader"
-        if raw == "ERR_NOT_FOUND":
-            return None, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "Target 'gemini:antigravity' not found in vault (Win32 1168)"
-        if raw == "ERR_ACCESS_DENIED":
-            return None, CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED, "Access denied reading 'gemini:antigravity' (Win32 5)"
-        if raw.startswith("ERR_WIN32_"):
-            return None, CredentialVerificationStatus.CREDENTIAL_STORE_READ_ERROR, f"Win32 error reading vault: {raw}"
-
-        data = json.loads(raw)
-        return data, None, None
+        return parse_credential_process_output(proc.returncode, proc.stdout, proc.stderr)
     except subprocess.TimeoutExpired:
         return None, CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE, "PowerShell credential query timed out"
-    except json.JSONDecodeError as e:
-        return None, CredentialVerificationStatus.CREDENTIAL_PAYLOAD_INVALID, f"Corrupted JSON in credential blob: {e}"
     except Exception as e:
         return None, CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE, f"Subprocess / PowerShell unavailable: {e}"
 
@@ -166,34 +198,19 @@ def verify_active_account(
     expected_account: Optional[str] = None,
     introspect_network: bool = False,
     mock_payload: Optional[dict] = None,
-    mock_error_status: Optional[CredentialVerificationStatus] = None,
+    ps_runner: Optional[Callable[[], Tuple[int, str, str]]] = None,
     userinfo_fetcher: Optional[Callable[[str], Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]]] = None
 ) -> VerificationResult:
     """
     Verifies the active token in the Windows credential store.
-    Dependency injection for mock_payload and userinfo_fetcher enables thorough unit testing without OS/network side-effects.
+    Uses dependency injection for runner and userinfo fetcher to ensure 100% test isolation.
     """
-    if mock_error_status is not None:
-        return VerificationResult(
-            expected_account=expected_account,
-            detected_active_email=None,
-            token_fingerprint=None,
-            credential_present=False,
-            status=mock_error_status,
-            evidence_rank="UNKNOWN",
-            matches_expected=False if expected_account else None,
-            scope="CREDENTIAL_STORE_ONLY",
-            desktop_adoption_status="UNKNOWN",
-            verification_source="WINDOWS_CREDENTIAL_MANAGER",
-            details=f"Credential store error: {mock_error_status.value}"
-        )
-
     if mock_payload is not None:
         payload = mock_payload if mock_payload else None
         read_err_status = CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY if not mock_payload else None
         read_err_details = "Mock empty vault" if not mock_payload else None
     else:
-        payload, read_err_status, read_err_details = read_windows_credential_payload()
+        payload, read_err_status, read_err_details = read_windows_credential_payload(runner=ps_runner)
 
     if read_err_status:
         return VerificationResult(
@@ -214,19 +231,20 @@ def verify_active_account(
     access_token = token_dict.get("access_token", "")
     refresh_token = token_dict.get("refresh_token", "")
 
+    # Item 9: Distinguish empty token fields from target-not-found
     if not access_token and not refresh_token:
         return VerificationResult(
             expected_account=expected_account,
             detected_active_email=None,
             token_fingerprint=None,
             credential_present=True,
-            status=CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY,
+            status=CredentialVerificationStatus.CREDENTIAL_TOKEN_FIELDS_MISSING,
             evidence_rank="UNKNOWN",
             matches_expected=False if expected_account else None,
             scope="CREDENTIAL_STORE_ONLY",
             desktop_adoption_status="UNKNOWN",
             verification_source="WINDOWS_CREDENTIAL_MANAGER",
-            details="Credential payload exists but contains empty access/refresh tokens"
+            details="Credential payload exists but access_token and refresh_token fields are missing/empty"
         )
 
     fingerprint = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16] if access_token else None
