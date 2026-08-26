@@ -5,15 +5,16 @@ Persistent Recovery Journal for Antigravity Resume Adapter (T03 Prototype)
 Manages crash-recovery state for conversation resume attempts.
 Stores strictly non-sensitive metadata (UUIDs, state, prompt SHA-256, timestamps).
 
-Review Round 4 Implementation:
-- Strict schema validation (versioned, type-checked, semantic state validation).
-- FAILED + unknown failure_stage strictly fails closed (MANUAL_RECONCILIATION_REQUIRED).
-- Cross-process file locking (single-writer concurrency protection for critical regions).
-- Durability barrier: fsync failure raises JournalDurabilityError (never swallowed).
-- Forward attempt reconciliation: advances unconfirmed attempts to MESSAGE_OBSERVED / TURN_STARTED.
+Review Round 5 Hardening:
+- Final send decision and forward reconciliation strictly executed INSIDE the exclusive lock.
+- Cross-process advisory lock with process liveness metadata and safe stale lock recovery.
+- Re-read from disk and re-validate schema immediately after acquiring lock.
+- Post-dispatch state transitions are protected by the same mutation lock to eliminate races.
+- Strict schema validation and durability barriers (fsync failure raises JournalDurabilityError).
 """
 
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -79,6 +80,25 @@ class JournalSchemaError(ValueError):
     """Raised when the journal content violates strict semantic schema rules."""
     pass
 
+def is_pid_alive(pid):
+    """Check if process ID is currently running on the system."""
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle == 0:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
 def validate_uuid(convo_uuid):
     if not convo_uuid or not isinstance(convo_uuid, str) or not UUID_REGEX.match(convo_uuid.strip()):
         raise ValueError(f"Invalid UUID format: {convo_uuid}")
@@ -105,10 +125,6 @@ def hash_prompt(prompt_text):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 def validate_journal_schema(data):
-    """
-    Strict semantic validator for recovery journal data.
-    Validates version, structure, UUIDs, states, hashes, timestamps, and history records.
-    """
     if not isinstance(data, dict):
         raise JournalSchemaError("Journal root must be a JSON object")
 
@@ -172,7 +188,7 @@ def validate_journal_schema(data):
 
 def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, journal_status="OK", is_first_attempt=False):
     """
-    Deterministic evaluation of recovery permission.
+    Authoritative evaluation of recovery permission.
     Returns (decision_code, explanation).
     """
     if journal_status == "SCHEMA_UNSUPPORTED":
@@ -182,6 +198,9 @@ def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, jou
 
     if not live_dom_state or not isinstance(live_dom_state, dict):
         return DECISION_RECOVERY_STATE_UNKNOWN, "Live DOM state could not be inspected."
+
+    if live_dom_state.get("error"):
+        return DECISION_RECOVERY_STATE_UNKNOWN, f"Live DOM inspection error: {live_dom_state.get('error')}"
 
     if live_dom_state.get("isMainTurnActive"):
         return DECISION_TURN_ALREADY_ACTIVE, "Target conversation has an active turn executing (Stop button present)."
@@ -218,7 +237,6 @@ def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, jou
             failure_stage = latest_record.get("failure_stage")
             if failure_stage == "PRE_IRREVERSIBLE" and dom_duplicate_status == "RESUME_NOT_PRESENT":
                 return DECISION_NEW_ATTEMPT_ALLOWED, "Previous failure was confirmed pre-irreversible and target is clean."
-            # Any unknown/missing/invalid/post-irreversible stage must fail closed
             return DECISION_MANUAL_RECONCILIATION_REQUIRED, (
                 f"Previous attempt is FAILED with unconfirmed failure stage '{failure_stage}'. "
                 "Manual reconciliation required; blind resend forbidden."
@@ -237,6 +255,7 @@ def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, jou
 def reconcile_existing_attempt(journal, conversation_uuid, latest_record, live_dom_state, prompt_hash):
     """
     Safely reconciles an existing unconfirmed attempt forward without mutating backward.
+    Must be called inside the journal exclusive lock when performing state mutations.
     """
     if not latest_record or not live_dom_state:
         return latest_record, False
@@ -272,22 +291,56 @@ class RecoveryJournal:
         self.lock_path = f"{self.journal_path}.lock"
         self._is_corrupted = False
         self._schema_unsupported = False
+        self._lock_depth = 0
 
     @contextlib.contextmanager
-    def exclusive_lock(self, timeout=5.0):
+    def exclusive_lock(self, timeout=5.0, conversation_uuid=None):
         """
         Cross-process advisory file lock for the recovery journal.
-        Guarantees single-writer execution across the critical region.
+        Writes metadata (owner_pid, timestamp, uuid).
+        Safely detects and reclaims stale locks from dead processes.
+        Supports reentrant locking within the same Python thread/process.
         """
-        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        if self._lock_depth > 0:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+
+        target_dir = os.path.dirname(os.path.abspath(self.lock_path))
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
         start_time = time.time()
         lock_fd = None
 
         while time.time() - start_time < timeout:
             try:
                 lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                meta = {
+                    "owner_pid": os.getpid(),
+                    "created_at": time.time(),
+                    "conversation_uuid": conversation_uuid
+                }
+                os.write(lock_fd, json.dumps(meta).encode("utf-8"))
+                self._lock_depth = 1
                 break
             except OSError:
+                # Lock file exists; check if owner PID is alive
+                try:
+                    if os.path.exists(self.lock_path):
+                        with open(self.lock_path, "r", encoding="utf-8") as f:
+                            lock_meta = json.load(f)
+                        owner_pid = lock_meta.get("owner_pid")
+                        if owner_pid and not is_pid_alive(owner_pid):
+                            try:
+                                os.remove(self.lock_path)
+                                continue
+                            except OSError:
+                                pass
+                except Exception:
+                    pass
                 time.sleep(0.05)
 
         if lock_fd is None:
@@ -296,6 +349,7 @@ class RecoveryJournal:
         try:
             yield
         finally:
+            self._lock_depth = 0
             try:
                 os.close(lock_fd)
                 if os.path.exists(self.lock_path):
@@ -346,8 +400,9 @@ class RecoveryJournal:
         Fsync failures raise JournalDurabilityError and abort before send.
         """
         validate_journal_schema(data)
-        target_dir = os.path.dirname(self.journal_path)
-        os.makedirs(target_dir, exist_ok=True)
+        target_dir = os.path.dirname(os.path.abspath(self.journal_path))
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
 
         temp_fd, temp_path = tempfile.mkstemp(dir=target_dir, prefix="t03_journal_", suffix=".tmp")
         try:
@@ -415,37 +470,38 @@ class RecoveryJournal:
         if failure_stage is not None and failure_stage not in VALID_FAILURE_STAGES:
             raise ValueError(f"Invalid failure stage: {failure_stage}")
 
-        data, status = self._read_raw()
-        if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
-            raise RuntimeError(f"Cannot transition state: journal is in invalid state '{status}'.")
+        with self.exclusive_lock(conversation_uuid=val_uuid):
+            data, status = self._read_raw()
+            if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
+                raise RuntimeError(f"Cannot transition state: journal is in invalid state '{status}'.")
 
-        records = data.get("records", {}).get(val_uuid, [])
-        target_record = None
-        for r in reversed(records):
-            if r.get("attempt_id") == attempt_id:
-                target_record = r
-                break
+            records = data.get("records", {}).get(val_uuid, [])
+            target_record = None
+            for r in reversed(records):
+                if r.get("attempt_id") == attempt_id:
+                    target_record = r
+                    break
 
-        if not target_record:
-            raise KeyError(f"Recovery attempt {attempt_id} not found for {val_uuid}")
+            if not target_record:
+                raise KeyError(f"Recovery attempt {attempt_id} not found for {val_uuid}")
 
-        current_state = target_record["state"]
-        allowed = ALLOWED_TRANSITIONS.get(current_state, set())
-        if new_state not in allowed:
-            raise ValueError(
-                f"Illegal state transition from '{current_state}' to '{new_state}'. "
-                f"Allowed transitions: {list(allowed)}"
-            )
+            current_state = target_record["state"]
+            allowed = ALLOWED_TRANSITIONS.get(current_state, set())
+            if new_state not in allowed:
+                raise ValueError(
+                    f"Illegal state transition from '{current_state}' to '{new_state}'. "
+                    f"Allowed transitions: {list(allowed)}"
+                )
 
-        now = time.time()
-        target_record["state"] = new_state
-        target_record["updated_at_utc"] = now
-        if failure_stage:
-            target_record["failure_stage"] = failure_stage
-        hist_entry = {"state": new_state, "timestamp": now}
-        if detail:
-            hist_entry["detail"] = detail
-        target_record["history"].append(hist_entry)
+            now = time.time()
+            target_record["state"] = new_state
+            target_record["updated_at_utc"] = now
+            if failure_stage:
+                target_record["failure_stage"] = failure_stage
+            hist_entry = {"state": new_state, "timestamp": now}
+            if detail:
+                hist_entry["detail"] = detail
+            target_record["history"].append(hist_entry)
 
-        self._write_atomic(data)
-        return target_record
+            self._write_atomic(data)
+            return target_record

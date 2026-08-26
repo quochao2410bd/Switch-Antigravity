@@ -1,4 +1,4 @@
-# Adversarial Self-Review (T03 - Revision 5)
+# Adversarial Self-Review (T03 - Revision 6 Final)
 
 ## Objective
 
@@ -44,8 +44,8 @@ Actively challenge and stress-test the proposed desktop conversation restore and
 ---
 
 ### 7. Could prompt be sent twice?
-- **Duplicate Prevention Policy**: Before attempting insertion:
-  1. `evaluate_recovery_permission()` consults latest journal state and live DOM.
+- **In-Lock Decision Policy**: Authoritative evaluation occurs strictly inside `exclusive_lock()`.
+  1. Re-reads latest journal state from disk.
   2. Inspects scoped main pane for `isMainTurnActive` (Stop button present).
   3. Inspects user message hash (`lastUserMessageHash == prompt_hash`).
 - **Verdict**: Restarted watchdog after `SUBMISSION_ATTEMPTED` or `MESSAGE_OBSERVED` **NEVER** blindly resends. Evaluates to `PREVIOUS_SUBMISSION_UNCONFIRMED` or `RESUME_ALREADY_OBSERVED`.
