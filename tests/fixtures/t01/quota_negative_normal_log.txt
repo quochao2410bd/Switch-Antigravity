@@ -1,0 +1,3 @@
+ERROR: logging before google.Init: I0826 16:27:33.749312       1 server.go:1478] Starting language server process with pid 7520
+ERROR: logging before google.Init: I0826 16:27:33.766902       1 server.go:590] Language server listening on random port at 58861 for HTTPS (gRPC)
+ERROR: logging before google.Init: I0826 16:27:35.721529       1 http_helpers.go:246] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x1554b1e4b060bde2

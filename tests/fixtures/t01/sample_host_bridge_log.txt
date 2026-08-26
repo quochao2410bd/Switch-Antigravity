@@ -1,0 +1,4 @@
+[2026-08-26 16:27:33.565] [info] Starting app (v2.10.0) with dynamic port.
+[2026-08-26 16:27:33.585] [info] Host bridge server listening on http://127.0.0.1:58860
+[2026-08-26 16:27:33.587] [info] Spawning: C:\Users\<USER>\AppData\Local\Programs\antigravity\resources\bin\language_server.exe --standalone --override_ide_name antigravity --subclient_type hub --override_ide_version 2.10.0 --override_user_agent_name antigravity --https_server_port 0 --csrf_token <REDACTED_CSRF> --app_data_dir antigravity --api_server_url https://generativelanguage.googleapis.com --cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com --enable_sidecars --host_bridge_url=http://127.0.0.1:58860 --host_bridge_token=<REDACTED_TOKEN>
+[2026-08-26 16:27:33.767] [info] [Auto-Restart] Port changed! Reloading all windows with URL: https://127.0.0.1:58861/

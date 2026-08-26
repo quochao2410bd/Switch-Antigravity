@@ -1,14 +1,14 @@
-# Antigravity Desktop State and Conversation Forensics (T01 Research Report)
+# Antigravity Desktop State and Conversation Forensics (T01 Amended Research Report)
 
 ## Executive Summary
 
-This research establishes the exact runtime architecture, process tree, local filesystem storage schema, conversation identity system, and quota failure observability mechanisms for **Antigravity Desktop 2.10.0** on Windows 10/11.
+This research establishes the exact runtime architecture, process tree, local filesystem storage schema, conversation identity system, and quota failure observability mechanisms for **Antigravity Desktop 2.10.0** on Windows. All findings have been updated with rigorous evidence classifications, tightened deterministic quota detection, multi-source conversation correlation, and downgraded claims where controlled multi-session experiments were not directly executed.
 
 ---
 
 ## 1. Process Forensics (Task A)
 
-### Classification: `VERIFIED_RUNTIME`
+### Classification: `VERIFIED_RUNTIME` (within single running session)
 - **Main Executable**: `Antigravity.exe`
 - **Installation Path**: `C:\Users\<USER>\AppData\Local\Programs\antigravity\Antigravity.exe`
 - **App Data Directory**: `C:\Users\<USER>\AppData\Roaming\Antigravity`
@@ -28,25 +28,27 @@ Antigravity.exe (Main Browser Process, PID: 14472)
         |-- conhost.exe
         \-- pwsh.exe / cmd.exe [Tool execution workers]
 ```
+*(Sanitized fixture: `tests/fixtures/t01/sample_process_tree.json`)*
 
-### Localhost Services & Ports
+### Localhost Services & Ports (`VERIFIED_RUNTIME`)
 1. **Chrome DevTools Protocol (CDP)**:
    - Port dynamically assigned and recorded in `%APPDATA%\Antigravity\DevToolsActivePort` (e.g. `58859`).
    - Endpoint: `ws://127.0.0.1:<port>/devtools/browser/<uuid>`
    - HTTP Target Discovery: `http://127.0.0.1:<port>/json/list` and `/json/version`
    - Active Target URL format: `https://127.0.0.1:<ls_port>/c/<cascade_id>?section=<project_id>`
+   *(Sanitized fixture: `tests/fixtures/t01/sample_cdp_targets.json`)*
 2. **Host Bridge Server**:
-   - Hosted by Electron main process on `http://127.0.0.1:58860` (controlled via `--host_bridge_token`).
+   - Hosted by Electron main process on `http://127.0.0.1:58860` (spawn arg: `--host_bridge_url=http://127.0.0.1:58860`).
+   *(Sanitized fixture: `tests/fixtures/t01/sample_host_bridge_log.txt`)*
 3. **Language Server gRPC / HTTPS Service**:
    - Hosted by `language_server.exe` on dynamic port (e.g. `https://127.0.0.1:58861/`).
 4. **Language Server HTTP Service**:
    - Hosted on secondary dynamic port (e.g. `http://127.0.0.1:58862`).
 
-### Idle vs. Active Generation States
+### Idle vs. Active Generation States (`OBSERVED`)
 - **Active Generation**:
-  - `language_server.exe` establishes outbound HTTPS/2 SSE connections to `daily-cloudcode-pa.googleapis.com` or `generativelanguage.googleapis.com` calling `:streamGenerateContent?alt=sse`.
-  - Child processes (`pwsh.exe`, `conhost.exe`) spawned under `language_server.exe` for tool calls.
-  - Active write locks and writes on `%USERPROFILE%\.gemini\antigravity\conversations\<cascade_id>.db-wal` and `%USERPROFILE%\.gemini\antigravity\brain\<cascade_id>\.system_generated\logs\transcript.jsonl`.
+  - `language_server.exe` establishes outbound HTTPS/2 SSE connections to `daily-cloudcode-pa.googleapis.com` calling `:streamGenerateContent?alt=sse` *(Sanitized fixture: `tests/fixtures/t01/sample_sse_stream_log.txt`)*.
+  - Active write locks and writes on `%USERPROFILE%\.gemini\antigravity\conversations\<cascade_id>.db-wal` and `transcript.jsonl`.
 - **Idle State**:
   - Outbound SSE streams closed.
   - Child processes terminate.
@@ -79,105 +81,137 @@ Each conversation is backed by a standalone SQLite database containing:
   - `source` (INTEGER)
 - `steps`:
   - `idx` (INTEGER) - Primary Key step counter
-  - `step_type` (INTEGER)
-  - `status` (INTEGER)
-  - `has_subtrajectory` (NUMERIC)
-  - `metadata` (BLOB)
-  - `error_details` (BLOB)
-  - `permissions` (BLOB)
-  - `task_details` (BLOB)
-  - `render_info` (BLOB)
-  - `step_payload` (BLOB)
-  - `step_format` (INTEGER)
+  - `step_type` (INTEGER), `status` (INTEGER), `has_subtrajectory` (NUMERIC), `metadata` (BLOB), `error_details` (BLOB), `permissions` (BLOB), `task_details` (BLOB), `render_info` (BLOB), `step_payload` (BLOB), `step_format` (INTEGER).
 - `trajectory_metadata_blob`:
-  - `id` (TEXT DEFAULT 'main')
-  - `data` (BLOB) - Serialized protobuf containing workspace URI, git branch name, and project UUID.
-- `gen_metadata`, `executor_metadata`, `parent_references`, `battle_mode_infos`.
+  - `id` (TEXT DEFAULT 'main'), `data` (BLOB - Serialized protobuf containing workspace URI, git branch name, and project UUID).
+*(Sanitized fixture: `tests/fixtures/t01/sample_trajectory_meta.json`)*
 
 ---
 
-## 3. Conversation Identity Analysis (Task C)
+## 3. Conversation Identity Analysis & 5-Source Correlation (Task C)
 
 ### Candidate Comparison Matrix
 
 | Candidate Identifier | Source / Location | Stability Across Restart | Stability Across Close/Open | Collision Risk | Confidence | Recommendation |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`cascade_id` (Conversation UUID)** | `<id>.db`, `brain/<id>`, proto index, URL `/c/<id>` | **YES (Durable)** | **YES (Durable)** | None (UUID v4) | `VERIFIED_RUNTIME` | **PRIMARY CANONICAL ID** |
-| **`trajectory_id`** | `trajectory_meta` DB table, proto field 4 | **YES (Durable)** | **YES (Durable)** | None (UUID v4) | `VERIFIED_RUNTIME` | Secondary / Verification |
-| **`project_id` / Section UUID** | `agyhub_summaries_proto.pb`, `app_storage.json` | **YES (Durable)** | **YES (Durable)** | Low | `VERIFIED_RUNTIME` | Scope Container |
-| **Conversation Title** | Proto field 1, DOM `<title>` | YES (Durable) | YES (Durable) | **HIGH (Mutable)** | `VERIFIED_RUNTIME` | Non-Unique Display Only |
-| **Workspace URI / Git Branch** | `trajectory_metadata_blob`, proto field 17 | YES (Durable) | YES (Durable) | Medium (multiple convos per repo) | `VERIFIED_RUNTIME` | Context Filter |
-| **CDP Target ID** | `/json/list` `id` field | NO (Ephemeral) | NO (Ephemeral) | High across restarts | `VERIFIED_RUNTIME` | Session-only handle |
+| **`cascade_id` (Conversation UUID)** | `<id>.db`, `brain/<id>`, proto index, URL `/c/<id>` | **Durable (Disk)** | **Durable (Disk)** | **Negligible / Very Low** (RFC 4122 v4 UUID format) | `VERIFIED_RUNTIME` | **PRIMARY CANONICAL ID** |
+| **`trajectory_id`** | `trajectory_meta` DB table, proto field 4 | **Durable (Disk)** | **Durable (Disk)** | Negligible / Very Low (UUID) | `VERIFIED_RUNTIME` | Secondary / Verification |
+| **`project_id` / Section UUID** | `agyhub_summaries_proto.pb`, `app_storage.json` | Durable (Disk) | Durable (Disk) | Low | `VERIFIED_RUNTIME` | Scope Container |
+| **Conversation Title** | Proto field 1, DOM `<title>` | Durable (Disk) | Durable (Disk) | **HIGH (Mutable/Duplicate)** | `VERIFIED_RUNTIME` | Non-Unique Display Only |
+| **Workspace URI / Git Branch** | `trajectory_metadata_blob`, proto field 17 | Durable (Disk) | Durable (Disk) | Medium (multiple convos per repo) | `VERIFIED_RUNTIME` | Context Filter |
+| **CDP Target ID** | `/json/list` `id` field | Ephemeral (Session) | Ephemeral (Session) | High across restarts | `VERIFIED_RUNTIME` | Session-only handle |
 
-**Decision**: The canonical conversation identifier is `cascade_id` (UUID format `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+### 5-Way Cross-Source Correlation Matrix (`VERIFIED_RUNTIME`)
+Validated across all 9 local conversation databases using `scripts/t01/correlate_cascade_id.py`:
+1. **DB Filename**: `%USERPROFILE%\.gemini\antigravity\conversations\<cascade_id>.db`
+2. **SQLite Table**: `SELECT cascade_id FROM trajectory_meta` matches DB filename exactly (9/9 matches).
+3. **Brain Path**: `%USERPROFILE%\.gemini\antigravity\brain\<cascade_id>\` directory exists (9/9 matches).
+4. **Protobuf Index**: Field 17 Subfield 6 of `%USERPROFILE%\.gemini\antigravity\agyhub_summaries_proto.pb` matches `cascade_id` (9/9 matches).
+5. **Active CDP Target URL**: Active Electron renderer page URL path is `https://127.0.0.1:<port>/c/<cascade_id>?section=<project_id>`.
+*(Sanitized fixture: `tests/fixtures/t01/sample_cross_correlation.json`)*
 
 ---
 
 ## 4. Restart & Persistence Dynamics (Task D)
 
-### Classification: `VERIFIED_RUNTIME`
-- Antigravity Desktop persists conversation state continuously into two locations:
-  1. `<cascade_id>.db` + WAL in `%USERPROFILE%\.gemini\antigravity\conversations/`
-  2. `transcript.jsonl` in `%USERPROFILE%\.gemini\antigravity\brain/<cascade_id>/.system_generated/logs/`
-- Across app restarts:
-  - The SQLite databases remain on disk and are not purged.
-  - `agyhub_summaries_proto.pb` persists the list and ordering of conversations.
-  - The UI restores the last active conversation based on `app_storage.json` (`new-convo-last-selected-project` and active window route).
-  - DevTools port is regenerated on each launch and written to `DevToolsActivePort`.
+### Classification: `OBSERVED` / `INFERENCE`
+- **Observed Historical Persistence**:
+  - Inspected historical database timestamps across restarts logged in `main.log` (08:21 AM, 16:03 PM, 16:27 PM).
+  - SQLite databases created earlier in the day (e.g. `ea7f4ce1...db` from 08:21 AM and `44027a60...db` from 16:04 PM) remained intact and resumed active modifications during subsequent sessions.
+  - `agyhub_summaries_proto.pb` preserved the list of conversation summaries across app restarts.
+- **Limitation Note**: Controlled multi-cycle forced termination and restart experiments were NOT performed during this turn to preserve active subagent execution. Direct runtime verification of controlled restart is deferred to future integration testing.
 
 ---
 
 ## 5. Account-Switch Survival (Task E)
 
-### Classification: `VERIFIED_RUNTIME` / `INFERENCE`
-- **Distinction**:
-  - `LOCAL_DATA_EXISTS`: All `<cascade_id>.db` files and `brain/<cascade_id>` folders exist independently on the local Windows disk and remain physically intact across account operations.
-  - `UI_CAN_OPEN_CONVERSATION`: The Electron UI lists conversations mapped in `agyhub_summaries_proto.pb`. When an account is switched, the UI may refresh project sessions, but because conversation SQLite databases are stored in local `%USERPROFILE%\.gemini\antigravity\`, local data is preserved.
-  - Note: T02 owns the live account rotation mechanics and authentication token replacement.
+### Classification:
+- `LOCAL_DATA_PRESENT_IN_CURRENT_PROFILE`: **`VERIFIED_RUNTIME`** (All 9 `.db` databases and `brain/` folders exist locally in user-level directory `%USERPROFILE%\.gemini\antigravity\`).
+- `PERSISTS_ACROSS_ACCOUNT_SWITCH`: **`UNKNOWN`** (Inferred to persist, but live credential swap was not executed).
+- `UI_CAN_OPEN_CONVERSATION`: **`UNKNOWN`** (Pending T02 live account rotation test).
 
 ---
 
-## 6. Quota Failure Observability (Task F & G)
+## 6. Quota Failure Observability & Deterministic Detector (Task F & G)
 
-### Concrete Runtime Quota Failure Log Evidence
-Directly captured from `%APPDATA%\Antigravity\logs\language_server.log`:
+### Exact Quota Exhaustion Signature (`VERIFIED_RUNTIME`)
+Captured directly from `%APPDATA%\Antigravity\logs\language_server.log`:
 ```text
-Line 4134: ERROR: logging before google.Init: I0826 17:40:05.441110  181166 run.go:367] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h24m54s.), retrying in 1s
-Line 4135: ERROR: logging before google.Init: I0826 17:40:08.537815  181166 run.go:367] Run: attempt 2 failed (RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h24m51s.), retrying in 1.85516771s
-Line 4137: ERROR: logging before google.Init: E0826 17:40:12.155991  181166 errorreport.go:223] agent executor error: calling model: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h24m48s.
-Line 4138: ERROR: logging before google.Init: E0826 17:40:12.178117  181166 errorreport.go:223] calling model: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h24m48s.
+ERROR: logging before google.Init: E0826 17:40:12.155991  181166 errorreport.go:223] agent executor error: calling model: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h24m48s.
 ```
 
-### Signal Classification & Observability Matrix
+### Deterministic Quota Detector (`scripts/t01/quota_detector.py`)
+- **Matcher**: Strict regex matching `RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in (?P<resets_in>[^.)]+)`
+- **Exit Codes**:
+  - `0`: Confirmed Individual Quota Exhaustion.
+  - `1`: No quota error detected (clean / normal log).
+  - `2`: Error opening or reading target log file.
+- **Machine-Readable JSON Output**:
+  ```json
+  {
+    "quota_exhausted": true,
+    "confidence": 1.0,
+    "error_code": 429,
+    "error_type": "RESOURCE_EXHAUSTED_INDIVIDUAL_QUOTA",
+    "error_message": "Individual quota reached. Please upgrade your subscription to increase your limits.",
+    "resets_in": "3h24m48s",
+    "latest_timestamp": "0826 17:42:18.690066",
+    "total_matches": 20
+  }
+  ```
+- **Test Suite (`scripts/t01/test_quota_detector.py`)**:
+  - `PASS`: Test 1 - Positive Quota Fixture (`tests/fixtures/t01/quota_positive.txt`)
+  - `PASS`: Test 2 - Negative Generic RESOURCE_EXHAUSTED (`tests/fixtures/t01/quota_negative_generic_resource_exhausted.txt`)
+  - `PASS`: Test 3 - Negative Other 429 (`tests/fixtures/t01/quota_negative_429_other.txt`)
+  - `PASS`: Test 4 - Negative Normal Log (`tests/fixtures/t01/quota_negative_normal_log.txt`)
+  - `PASS`: Test 5 - Live `language_server.log` (20 historical events detected)
+
+### False Positive Disambiguation Matrix
 | Signal | Source | Strength | False Positive Risk | Disambiguation Rule |
 | :--- | :--- | :--- | :--- | :--- |
-| **`RESOURCE_EXHAUSTED (code 429)` log event** | `%APPDATA%\Antigravity\logs\language_server.log` | **STRONG** | Low | Tail log for `RESOURCE_EXHAUSTED` and `Individual quota reached`. |
-| **UI Quota Toast / Error Card** | Electron DOM / CDP evaluation | **STRONG** | Low | Check for text "Individual quota reached" or "quota" in DOM. |
-| **Active Turn Termination without Complete Status** | SQLite `steps` table status / transcript | **MEDIUM** | Medium | Can occur on crash or user cancel. Verify log to confirm quota. |
-| **Absence of Child Process Activity** | Win32 Process Tree | **WEAK** | High | Occurs during normal thinking, user pause, idle. Never use alone. |
-| **Inactivity / Unchanged Workspace** | Filesystem MTime | **WEAK** | Extreme | Normal behavior between prompts. Must NEVER trigger rotation. |
-
-### False Positive Disambiguation
-- **Normal Idle**: Process alive, no log error, step status is clean `DONE`.
-- **User Pause / Waiting for Input**: UI waiting for user feedback; no `RESOURCE_EXHAUSTED` log; step status indicates waiting.
-- **Model Thinking**: Active outbound network connections, no error in log.
-- **Network Loss**: Error logs report connection reset or DNS failure, NOT `RESOURCE_EXHAUSTED (code 429)`.
-- **App Crash**: Process dies, DevTools port becomes unreachable.
+| `RESOURCE_EXHAUSTED (code 429): Individual quota reached...` | `language_server.log` | **STRONG** | Zero observed | Match full specific individual quota signature |
+| UI Quota Card / Toast | Electron DOM / CDP | **STRONG** | Low | Check DOM for quota message |
+| Generic `RESOURCE_EXHAUSTED` (Backend error) | `language_server.log` | Non-Quota | High | Excluded by regex (lacks "Individual quota reached") |
+| HTTP 429 Rate Limit (Concurrency/RPM) | `language_server.log` | Non-Quota | High | Excluded by regex (lacks "Individual quota reached") |
+| Inactivity / Idle Process | Process / Disk Activity | **WEAK** | Extreme | **NEVER trigger rotation on inactivity alone** |
 
 ---
 
-## 7. Proposed Watchdog Supervisor Adapter Contract (Task H)
+## 7. Protobuf Wire Structure & Field Validation (Task B & C)
+
+### Classification: `OBSERVED` / `INFERENCE`
+In the absence of an official `.proto` schema file, field semantics in `%USERPROFILE%\.gemini\antigravity\agyhub_summaries_proto.pb` were decoded via generic tag-length-value parsing (`scripts/t01/parse_summaries_full.py`) and validated by cross-referencing against independent sources:
+- **Field 1**: Display Title (matches DOM `<title>` and UI project tree).
+- **Field 2**: Message / Step count (matches row count in `steps` SQLite table).
+- **Field 3 / 7 / 10**: Timestamps (Unix epoch seconds/nanos matching filesystem MTime).
+- **Field 4**: `trajectory_id` (matches `trajectory_meta.trajectory_id`).
+- **Field 17 Subfield 6**: `cascade_id` (matches SQLite filename and `trajectory_meta.cascade_id`).
+- **Field 17 Subfield 7**: Workspace URI (matches project folder path).
+- **Field 17 Subfield 18**: `project_id` (matches `new-convo-last-selected-project` in `app_storage.json`).
+
+---
+
+## 8. Five Most Important Claims: CLAIM -> EVIDENCE -> REPRO COMMAND
+
+| Claim | Claim Details & Class | Sanitized Evidence File | Independent Reproduction Command |
+| :--- | :--- | :--- | :--- |
+| **Claim 1: Process Architecture & Ports** | Antigravity runs as an Electron app spawning `language_server.exe` with dynamic DevTools port (`VERIFIED_RUNTIME`). | `tests/fixtures/t01/sample_process_tree.json`<br>`tests/fixtures/t01/sample_host_bridge_log.txt` | `Get-CimInstance Win32_Process \| Where-Object { $_.Name -match 'Antigravity\|language_server' } \| Select-Object ProcessId, ParentProcessId, Name, CommandLine`<br>`Get-Content "$env:APPDATA\Antigravity\DevToolsActivePort"` |
+| **Claim 2: Deterministic Quota Error Detection** | Runtime quota exhaustion emits a specific signature `RESOURCE_EXHAUSTED (code 429): Individual quota reached...` with `Resets in <duration>` (`VERIFIED_RUNTIME`). | `tests/fixtures/t01/sample_quota_error_log.txt`<br>`tests/fixtures/t01/quota_positive.txt` | `python scripts/t01/quota_detector.py`<br>`python scripts/t01/test_quota_detector.py` |
+| **Claim 3: Canonical Identity & 5-Source Correlation** | `cascade_id` (UUID v4) correlates identically across DB filename, SQLite `trajectory_meta`, `brain/` directory, proto index, and CDP URL (`VERIFIED_RUNTIME`). | `tests/fixtures/t01/sample_cross_correlation.json`<br>`tests/fixtures/t01/sample_trajectory_meta.json` | `python scripts/t01/correlate_cascade_id.py` |
+| **Claim 4: Local Database Schema** | Each conversation is stored in a separate SQLite DB with `trajectory_meta`, `steps`, and `trajectory_metadata_blob` (`VERIFIED_RUNTIME`). | `tests/fixtures/t01/sample_trajectory_meta.json` | `python scripts/t01/inspect_conversation_db.py` |
+| **Claim 5: CDP Endpoint & Active URL Mapping** | DevTools port allows CDP querying of active page target URL format `/c/<cascade_id>?section=<project_id>` (`VERIFIED_RUNTIME`). | `tests/fixtures/t01/sample_cdp_targets.json` | `python scripts/t01/inspect_cdp.py` |
+
+---
+
+## 9. Proposed Future Supervisor Adapter Contract (Task H)
 
 ```python
-# Proposed Read-Only Adapter Contract for Desktop Forensics & Quota Detection
-
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
 class QuotaState(Enum):
     NORMAL = "NORMAL"
-    SUSPECTED = "SUSPECTED"
     CONFIRMED = "CONFIRMED"
 
 @dataclass
@@ -190,63 +224,16 @@ class ConversationRef:
     git_branch: Optional[str]           # Active branch
     db_path: str                         # Path to local SQLite .db file
     transcript_path: str                 # Path to transcript.jsonl
-    last_modified_epoch: float
-
-@dataclass
-class DesktopSnapshot:
-    is_running: bool
-    main_pid: Optional[int]
-    language_server_pid: Optional[int]
-    devtools_port: Optional[int]
-    cdp_ws_url: Optional[str]
-    active_conversation_id: Optional[str]
-    active_page_title: Optional[str]
-    conversations: List[ConversationRef]
 
 @dataclass
 class QuotaEvidence:
-    state: QuotaState
-    confidence: float                    # 0.0 to 1.0 (1.0 = confirmed log/DOM error)
-    error_message: Optional[str]         # Raw error text (e.g. "RESOURCE_EXHAUSTED (code 429)...")
-    resets_in_str: Optional[str]         # e.g. "3h24m48s"
-    log_timestamp: Optional[str]
-    source: str                          # "language_server.log", "cdp_dom", etc.
-    retryable: bool
-
-class AntigravityDesktopAdapter:
-    def inspect_desktop(self) -> DesktopSnapshot:
-        """Collects process tree, listening ports, CDP status, and active conversation."""
-        ...
-
-    def locate_conversation(self, cascade_id: str) -> Optional[ConversationRef]:
-        """Locates conversation metadata from SQLite DB and summaries protobuf."""
-        ...
-
-    def find_conversations_by_workspace(self, workspace_path: str) -> List[ConversationRef]:
-        """Finds all conversation IDs matching a repository/workspace root."""
-        ...
-
-    def detect_quota_failure(self, timeout_ms: int = 1000) -> QuotaEvidence:
-        """Inspects language_server.log and CDP DOM for strong quota exhaustion signals."""
-        ...
+    quota_exhausted: bool
+    confidence: float                    # 1.0 if confirmed, 0.0 otherwise
+    error_code: Optional[int]            # 429
+    error_type: Optional[str]            # "RESOURCE_EXHAUSTED_INDIVIDUAL_QUOTA"
+    error_message: Optional[str]
+    resets_in: Optional[str]             # e.g. "3h24m48s"
+    latest_timestamp: Optional[str]
+    total_matches: int
+    source_log: str
 ```
-
----
-
-## 8. Summary of Findings by Verification Class
-
-- **`VERIFIED_RUNTIME`**:
-  - Electron main + language_server.exe architecture and dynamic port bindings.
-  - `DevToolsActivePort` remote debugging port and `/json/list` target extraction.
-  - SQLite database schema (`trajectory_meta`, `steps`, `trajectory_metadata_blob`).
-  - `agyhub_summaries_proto.pb` binary structure and field mappings.
-  - Exact `RESOURCE_EXHAUSTED (code 429)` error log format and retry pattern in `language_server.log`.
-  - Canonical identity `cascade_id` in URL `/c/<id>`, filename `<id>.db`, and proto summaries.
-- **`VERIFIED_SOURCE` / `VERIFIED_DOC`**:
-  - Built-in guide `antigravity-guide` surface and CLI/Desktop specifications.
-- **`OBSERVED`**:
-  - Automatic reopening behavior of last active project upon launch.
-- **`INFERENCE`**:
-  - Account switching by T02 does not delete local SQLite database files on disk because they reside in user-scoped `%USERPROFILE%\.gemini\antigravity\conversations\`.
-- **`UNKNOWN`**:
-  - Live UI behavior when an account is switched while a conversation is mid-turn with pending uncommitted step (owned by T02/T03 integration).
