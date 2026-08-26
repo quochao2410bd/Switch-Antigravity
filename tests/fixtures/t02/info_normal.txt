@@ -1,0 +1,9 @@
+Account: alice@example.com
+Token expiry: 2026-08-26T22:30:00+07:00
+
+PROVIDER     MODEL                                             SCORE  RESET
+------------------------------------------------------------------------------------------
+GOOGLE       gemini-1.5-pro                                      85%  2026-08-27T00:00:00Z
+GOOGLE       gemini-1.5-flash                                    90%  2026-08-27T00:00:00Z
+ANTHROPIC    claude-3-5-sonnet                                   75%  2026-08-27T00:00:00Z
+OTHER        experimental-code-preview                           50%  2026-08-27T00:00:00Z

@@ -1,0 +1,7 @@
+Account: corrupted@example.com
+Token expiry: unknown (expired)
+
+PROVIDER     MODEL                                             SCORE  RESET
+------------------------------------------------------------------------------------------
+GOOGLE       gemini-pro-1                                        NaN%  invalid-date
+UNKNOWN      broken-model                                        ???%  -

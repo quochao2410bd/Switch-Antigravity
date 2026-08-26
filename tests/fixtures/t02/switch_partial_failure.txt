@@ -1,0 +1,3 @@
+Switching alice@example.com → all targets
+  ✓ Antigravity CLI (agy)
+  ✗ Antigravity IDE: Antigravity state.vscdb not found for ide (install/run the app once)

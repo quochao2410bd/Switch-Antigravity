@@ -1,0 +1,2 @@
+Switching alice@example.com → Antigravity CLI (agy)
+  ✓ Antigravity CLI (agy)

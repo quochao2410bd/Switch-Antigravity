@@ -1,0 +1,3 @@
+Active Account: alice@example.com
+Gemini Pro: 85%
+Claude:     75%

@@ -1,0 +1,2 @@
+Switching invalid@example.com → Antigravity CLI (agy)
+  ✗ Antigravity CLI (agy): credential store: CredWrite: (Access is denied.)

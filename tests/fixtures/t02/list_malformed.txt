@@ -1,0 +1,6 @@
+EMAIL                                STATUS         GEM-PRO  GEM-FLASH     CLAUDE
+------------------------------------------------------------------------------------
+broken_row_no_columns
+corrupted@domain.com                 cli,ide            NaN%       invalid%   -999%
+weird@domain.com                     unknown_status     ???        !!!        N/A
+   leading_spaces_only

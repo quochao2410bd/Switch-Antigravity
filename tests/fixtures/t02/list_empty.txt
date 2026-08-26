@@ -1,0 +1,3 @@
+No accounts yet.
+  agm login        — browser OAuth
+  agm import-ide   — pull from signed-in Antigravity IDE

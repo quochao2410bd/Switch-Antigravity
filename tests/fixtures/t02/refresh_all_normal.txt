@@ -1,0 +1,8 @@
+Starting bulk refresh for 2 accounts...
+
+→ alice@example.com
+  ✓ ok
+→ bob@example.com
+  ✓ ok
+
+Completed: 2 successful
