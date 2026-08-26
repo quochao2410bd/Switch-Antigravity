@@ -1,26 +1,27 @@
-# Adversarial Self-Review (T01 Amended)
+# Adversarial Self-Review (T01 Round 2)
 
-## Critical Review & Honest Evidence Gap Analysis
+## Critical Review & Honest Gap Analysis
 
-### 1. Evidence Gaps and Limitations
-- **No Live Controlled Restart Cycles**: A forced multi-cycle kill and cold restart experiment was NOT performed in this session to preserve the subagent's execution environment. Persistence claims rely on observed historical timestamps across logged restarts in `main.log` and are properly classified as `OBSERVED` / `INFERENCE`.
-- **No Live Account Switch Executed**: T01 did not perform a live Google credential swap. `LOCAL_DATA_PRESENT_IN_CURRENT_PROFILE` is verified, but whether the active UI conversation survives an account token rotation remains `UNKNOWN` pending T02 integration tests.
-- **Protobuf Wire Schema Lack Official Definitions**: The mappings in `agyhub_summaries_proto.pb` were reverse-engineered by generic wire tag parsing and cross-referenced with SQLite data. They are classified as `OBSERVED` / `INFERENCE` rather than authoritative source.
+### 1. Incremental vs Historical Quota Detection
+- **Initial Flaw**: The original detector parsed historical logs globally, which caused any historical quota event to indicate quota exhaustion in active sessions.
+- **Correction**: Implemented byte-offset baselines (`create_baseline`, `poll_new_events`). Verified that stale historical quota errors before baseline return `NO_NEW_EVENT`, while newly appended quota errors return `NEW_CONFIRMED_QUOTA_EVENT` exactly once.
 
-### 2. Single-Session vs Multi-Session Observations
-- The 3 process snapshots in `scripts/t01/inspect_process_forensics.py` were captured 2 seconds apart within a single running instance. They establish runtime consistency within an active session, but do NOT constitute independent multi-session reproductions.
+### 2. Correlation Scope Precision
+- **Initial Flaw**: Claimed 9/9 5-way correlation including CDP. In reality, CDP only reflects the single active foreground conversation.
+- **Correction**: Re-scoped to 9/9 Local Four-Way Correlation (DB filename + `trajectory_meta` + brain dir + proto index) and 1/1 Active Foreground CDP URL cross-check.
 
-### 3. False Positive Vulnerabilities
-- **Quota Error vs Generic Errors**: Matching generic `RESOURCE_EXHAUSTED` or `429` causes severe false positives (backend capacity issues, per-minute rate limits). Quota detection has been tightened to require the full substring `Individual quota reached. Please upgrade your subscription to increase your limits. Resets in <duration>`.
-- **Inactivity Signal**: Lack of process or disk activity is a WEAK signal and must never be used alone to infer quota exhaustion.
+### 3. Strict Code 429 Contract Enforcement
+- **Initial Flaw**: Regex accepted any numeric error code.
+- **Correction**: Enforced exact `(code 429)` in regex and added a negative test verifying rejection of `(code 503)`.
 
-### 4. Identity & Collision Risk Realism
-- Collision risk for `cascade_id` cannot mathematically be claimed as "zero". It is more accurately characterized as "negligible / very low", supported by the standard 128-bit RFC 4122 v4 UUID structure observed across all 9 local conversation databases.
+### 4. UUID Encoding Observation
+- **Precision**: Validated that all 9 observed cascade IDs conform to UUID version 4 RFC 4122 encoding (`9/9 valid UUIDs, 9/9 version 4, 9/9 RFC 4122 variant`). This is an empirical runtime observation, not source proof of generation algorithm.
 
-### 5. Summary of Downgraded Claims
-| Original Claim | Downgraded Classification | Rationale |
-| :--- | :--- | :--- |
-| Restart persistence is VERIFIED_RUNTIME | `OBSERVED` / `INFERENCE` | Inferred from historical restart logs and file timestamps; no forced kill executed. |
-| Account switch persistence is VERIFIED_RUNTIME | `UNKNOWN` (`PERSISTS_ACROSS_ACCOUNT_SWITCH`) | No live account switch performed by T01. |
-| Protobuf semantic fields are VERIFIED_RUNTIME | `OBSERVED` / `INFERENCE` | Heuristic reverse-engineering without published `.proto` schema. |
-| Collision risk is None | Negligible / Very Low | RFC 4122 v4 UUID format observed, but zero is an absolute claim. |
+### 5. Summary of Claims & Boundaries
+| Area | Evidence Class | Verified Scope | UNKNOWN / Untested Boundary |
+| :--- | :--- | :--- | :--- |
+| Process Forensics | `VERIFIED_RUNTIME` | Electron main, GPU, network utility, renderer, and language_server process tree. | Long-term port stability across days. |
+| Incremental Quota Detector | `VERIFIED_RUNTIME` | Offset-based new event detection, truncation detection, strict code 429 matching. | Unobserved non-standard quota strings. |
+| Local Identity Correlation | `VERIFIED_RUNTIME` | 9/9 DB filename, table, brain path, and proto index matching. | UI visibility after multi-account swap (`UNKNOWN`). |
+| App Restart Persistence | `OBSERVED` / `INFERENCE` | Inferred from historical restart timestamps in `main.log`. | Controlled multi-cycle forced process kill. |
+| Account-Switch Survival | `UNKNOWN` | Local files exist in current user profile. | Live account rotation not executed by T01. |
