@@ -79,39 +79,75 @@ def create_baseline(
 def validate_baseline_schema(
     baseline: Any,
     current_log_path: str,
-    current_ls_pid: Optional[int] = None
+    current_ls_pid: Optional[int] = None,
+    current_session_id: Optional[str] = None
 ) -> Tuple[bool, str]:
-    if not isinstance(baseline, dict):
-        return False, "Baseline must be a valid JSON dictionary"
+    if not isinstance(baseline, dict) or not baseline:
+        return False, "Baseline must be a non-empty JSON dictionary"
 
     if baseline.get("schema_version") != SCHEMA_VERSION:
         return False, f"Unsupported or missing schema_version: expected {SCHEMA_VERSION}, got {baseline.get('schema_version')}"
 
     canonical_current = os.path.abspath(current_log_path)
     baseline_path = baseline.get("canonical_log_path")
-    if not baseline_path or os.path.abspath(baseline_path) != canonical_current:
+    if not isinstance(baseline_path, str) or not baseline_path or os.path.abspath(baseline_path) != canonical_current:
         return False, f"Log path mismatch: baseline is for {baseline_path}, current target is {canonical_current}"
 
     offset = baseline.get("committed_byte_offset")
-    if offset is None or not isinstance(offset, int) or offset < 0:
-        return False, f"Invalid committed_byte_offset: {offset}"
+    if offset is None or type(offset) is not int or offset < 0:
+        return False, f"Invalid committed_byte_offset (must be non-negative integer): {offset}"
+
+    file_size = baseline.get("file_size")
+    if file_size is not None and (type(file_size) is not int or file_size < 0):
+        return False, f"Invalid file_size (must be non-negative integer): {file_size}"
 
     identity = baseline.get("file_identity")
-    if not isinstance(identity, dict) or "dev" not in identity or "ino" not in identity or "ctime_ns" not in identity:
-        return False, "Missing or malformed file_identity in baseline"
+    if not isinstance(identity, dict):
+        return False, "Missing or malformed file_identity in baseline (must be a dictionary)"
 
-    if current_ls_pid is not None and baseline.get("language_server_process_id") is not None:
-        if baseline["language_server_process_id"] != current_ls_pid:
-            return False, f"Language server process changed from PID {baseline['language_server_process_id']} to {current_ls_pid}"
+    for k in ["dev", "ino", "ctime_ns", "size_at_creation"]:
+        val = identity.get(k)
+        if val is None or type(val) is not int or val < 0:
+            return False, f"Invalid or missing file_identity field '{k}': {val}"
+
+    bound_pid = baseline.get("language_server_process_id")
+    if bound_pid is not None:
+        if type(bound_pid) is not int or bound_pid <= 0:
+            return False, f"Invalid bound language_server_process_id in baseline: {bound_pid}"
+        if current_ls_pid is None:
+            return False, f"Baseline is bound to LS PID {bound_pid}, but current_ls_pid was omitted by caller"
+        if type(current_ls_pid) is not int or current_ls_pid != bound_pid:
+            return False, f"Language server process changed (bound: {bound_pid}, current: {current_ls_pid})"
+
+    bound_session = baseline.get("supervisor_session_id")
+    if bound_session is not None:
+        if not isinstance(bound_session, str) or not bound_session.strip():
+            return False, f"Invalid bound supervisor_session_id in baseline: {bound_session}"
+        if current_session_id is None:
+            return False, f"Baseline is bound to supervisor session '{bound_session}', but current_session_id was omitted by caller"
+        if not isinstance(current_session_id, str) or current_session_id != bound_session:
+            return False, f"Supervisor session changed (bound: '{bound_session}', current: '{current_session_id}')"
 
     return True, "VALID"
 
 def poll_new_events(
-    baseline: Dict[str, Any],
+    baseline: Any,
     log_path: Optional[str] = None,
     current_ls_pid: Optional[int] = None,
+    current_session_id: Optional[str] = None,
     include_raw_log: bool = False
 ) -> Tuple[Dict[str, Any], int]:
+    if not isinstance(baseline, dict) or not baseline:
+        return {
+            "status": "BASELINE_REQUIRED",
+            "event_poll_status": "BASELINE_REQUIRED",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "error": "Valid baseline dictionary is required for incremental polling",
+            "cursor": 0
+        }, 5
+
     target_path = log_path or baseline.get("canonical_log_path")
     if not target_path or not os.path.exists(target_path):
         return {
@@ -124,7 +160,7 @@ def poll_new_events(
             "cursor": baseline.get("committed_byte_offset", 0) if isinstance(baseline, dict) else 0
         }, 3
 
-    valid, reason = validate_baseline_schema(baseline, target_path, current_ls_pid)
+    valid, reason = validate_baseline_schema(baseline, target_path, current_ls_pid, current_session_id)
     if not valid:
         return {
             "status": "BASELINE_INVALID",
@@ -243,13 +279,13 @@ def poll_new_events(
             log_thread_id = m.group("log_thread_id").strip() if m.group("log_thread_id") else None
             source_location = m.group("source_location").strip() if m.group("source_location") else None
 
-            canonical_sig = f"{current_identity['ino']}:{line_start}:{line_end}:429:{resets_in}"
-            event_hash = hashlib.sha256(canonical_sig.encode("utf-8")).hexdigest()
-            event_id = f"evt_{current_identity['ino']}_{line_start}_{line_end}_{event_hash[:16]}"
+            record_sha256 = hashlib.sha256(line_bytes).hexdigest()
+            event_id = f"evt_{current_identity['ino']}_{line_start}_{line_end}_{record_sha256[:16]}"
 
             event_obj = {
                 "event_id": event_id,
-                "event_sha256": event_hash,
+                "event_sha256": record_sha256,
+                "event_record_sha256": record_sha256,
                 "code": 429,
                 "resets_in": resets_in,
                 "log_timestamp": timestamp,
@@ -332,13 +368,13 @@ def detect_historical_events(
             log_thread_id = m.group("log_thread_id").strip() if m.group("log_thread_id") else None
             source_location = m.group("source_location").strip() if m.group("source_location") else None
 
-            canonical_sig = f"{identity['ino']}:{line_start}:{line_end}:429:{resets_in}"
-            event_hash = hashlib.sha256(canonical_sig.encode("utf-8")).hexdigest()
-            event_id = f"evt_{identity['ino']}_{line_start}_{line_end}_{event_hash[:16]}"
+            record_sha256 = hashlib.sha256(line_bytes).hexdigest()
+            event_id = f"evt_{identity['ino']}_{line_start}_{line_end}_{record_sha256[:16]}"
 
             event_obj = {
                 "event_id": event_id,
-                "event_sha256": event_hash,
+                "event_sha256": record_sha256,
+                "event_record_sha256": record_sha256,
                 "line_number": idx,
                 "code": 429,
                 "resets_in": resets_in,
@@ -384,7 +420,7 @@ def main():
     parser.add_argument("--baseline", help="JSON string or path to baseline JSON file", default=None)
     parser.add_argument("--init-baseline", action="store_true", help="Initialize and output a fresh baseline at EOF")
     parser.add_argument("--ls-pid", type=int, help="Language server process PID to bind/enforce", default=None)
-    parser.add_argument("--session-id", help="Supervisor session identifier", default=None)
+    parser.add_argument("--session-id", help="Supervisor session identifier to bind/enforce", default=None)
     parser.add_argument("--include-raw-log", action="store_true", help="Include raw log lines in diagnostic output")
     args = parser.parse_args()
 
@@ -432,6 +468,7 @@ def main():
         baseline=base_dict,
         log_path=log_path,
         current_ls_pid=args.ls_pid,
+        current_session_id=args.session_id,
         include_raw_log=args.include_raw_log
     )
     print(json.dumps(res, indent=2))

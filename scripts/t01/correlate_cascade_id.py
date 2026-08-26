@@ -1,8 +1,10 @@
 import os
+import re
 import glob
 import sqlite3
 import json
 import urllib.request
+import urllib.parse
 
 def parse_proto_simple(data):
     idx = 0
@@ -58,7 +60,7 @@ def parse_proto_simple(data):
     return fields
 
 def extract_proto_cascade_ids():
-    pb_path = os.path.expandvars(r"%USERPROFILE%\.gemini\antigravity\agyhub_summaries_proto.pb")
+    pb_path = os.path.join(os.environ.get("USERPROFILE", ""), ".gemini", "antigravity", "agyhub_summaries_proto.pb")
     if not os.path.exists(pb_path):
         return {}
     with open(pb_path, "rb") as f:
@@ -87,39 +89,57 @@ def extract_proto_cascade_ids():
         }
     return summaries
 
-def extract_cdp_active_urls():
-    dt_path = os.path.expandvars(r"%APPDATA%\Antigravity\DevToolsActivePort")
-    if not os.path.exists(dt_path):
-        return []
-    with open(dt_path, "r", encoding="utf-8") as f:
-        port = f.readline().strip()
-    try:
-        url = f"http://127.0.0.1:{port}/json/list"
-        with urllib.request.urlopen(url, timeout=2) as resp:
-            targets = json.loads(resp.read().decode())
-            return [t.get("url", "") for t in targets if "url" in t]
-    except Exception as e:
-        return []
+CONVERSATION_ROUTE_EXACT_PATTERN = re.compile(r"^/c/([0-9a-fA-F-]{36})$")
+
+def extract_cdp_conversation_targets(raw_targets=None):
+    if raw_targets is None:
+        dt_path = os.path.join(os.environ.get("APPDATA", ""), "Antigravity", "DevToolsActivePort")
+        if not os.path.exists(dt_path):
+            return []
+        with open(dt_path, "r", encoding="utf-8") as f:
+            port = f.readline().strip()
+        try:
+            url = f"http://127.0.0.1:{port}/json/list"
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                raw_targets = json.loads(resp.read().decode())
+        except Exception:
+            return []
+
+    eligible_pages = []
+    for t in raw_targets:
+        if t.get("type") == "page":
+            raw_url = t.get("url", "")
+            parsed = urllib.parse.urlparse(raw_url)
+            m = CONVERSATION_ROUTE_EXACT_PATTERN.match(parsed.path)
+            if m:
+                eligible_pages.append({
+                    "target_id": t.get("id"),
+                    "cascade_id": m.group(1).lower(),
+                    "raw_url": raw_url,
+                    "title": t.get("title", "")
+                })
+    return eligible_pages
 
 def correlate_all():
-    convos_dir = os.path.expandvars(r"%USERPROFILE%\.gemini\antigravity\conversations")
-    brain_dir = os.path.expandvars(r"%USERPROFILE%\.gemini\antigravity\brain")
+    user_prof = os.environ.get("USERPROFILE", "")
+    convos_dir = os.path.join(user_prof, ".gemini", "antigravity", "conversations")
+    brain_dir = os.path.join(user_prof, ".gemini", "antigravity", "brain")
     
     db_files = glob.glob(os.path.join(convos_dir, "*.db"))
     proto_summaries = extract_proto_cascade_ids()
-    cdp_urls = extract_cdp_active_urls()
+    cdp_conversation_targets = extract_cdp_conversation_targets()
     
     print("=== Conversation Identifier Correlation Analysis ===")
     print(f"Total SQLite DBs found: {len(db_files)}")
     print(f"Total Proto Summaries entries: {len(proto_summaries)}")
-    print(f"Total Active CDP Page Targets: {len(cdp_urls)}\n")
+    print(f"Total Eligible CDP Conversation Page Targets: {len(cdp_conversation_targets)}\n")
 
     local_four_way_matches = 0
     active_cdp_matches = 0
     
     for db_path in sorted(db_files):
         filename = os.path.basename(db_path)
-        cid = os.path.splitext(filename)[0]
+        cid = os.path.splitext(filename)[0].lower()
         
         cid_from_meta = None
         tid_from_meta = None
@@ -129,7 +149,7 @@ def correlate_all():
             c.execute("SELECT cascade_id, trajectory_id FROM trajectory_meta")
             row = c.fetchone()
             if row:
-                cid_from_meta = row[0]
+                cid_from_meta = row[0].lower() if row[0] else None
                 tid_from_meta = row[1]
             conn.close()
         except Exception as e:
@@ -137,8 +157,8 @@ def correlate_all():
 
         brain_exists = os.path.isdir(os.path.join(brain_dir, cid))
         proto_entry = proto_summaries.get(cid)
-        proto_matched = (proto_entry is not None and proto_entry.get("cascade_id_in_sub17") == cid)
-        cdp_matched = any(f"/c/{cid}" in u for u in cdp_urls)
+        proto_matched = (proto_entry is not None and (proto_entry.get("cascade_id_in_sub17") or "").lower() == cid)
+        cdp_matched = any(t["cascade_id"] == cid for t in cdp_conversation_targets)
 
         local_4way = (cid == cid_from_meta and brain_exists and proto_matched)
         if local_4way:
@@ -147,7 +167,7 @@ def correlate_all():
             active_cdp_matches += 1
             
         status = "[LOCAL-4WAY-PASS]" if local_4way else "[LOCAL-MISMATCH]"
-        cdp_status = "ACTIVE_IN_CDP_RENDERER" if cdp_matched else "background_or_closed"
+        cdp_status = "ACTIVE_FOREGROUND_PAGE" if cdp_matched else "background_or_closed"
         print(f"{status} Cascade ID: {cid}")
         print(f"  - DB Filename: {filename}")
         print(f"  - trajectory_meta: cascade_id={cid_from_meta}, trajectory_id={tid_from_meta}")
@@ -158,7 +178,7 @@ def correlate_all():
 
     print("--- Correlation Summary ---")
     print(f"1. LOCAL FOUR-WAY CORRELATION (DB filename + trajectory_meta + brain dir + proto index): {local_four_way_matches}/{len(db_files)}")
-    print(f"2. ACTIVE FOREGROUND CDP CORRELATION (Active Renderer URL vs Cascade ID): {active_cdp_matches}/{len(cdp_urls)} active target(s)")
+    print(f"2. ACTIVE FOREGROUND CDP CORRELATION (Exact Conversation Page Target UUID vs Cascade ID): {active_cdp_matches}/{len(cdp_conversation_targets)} eligible target(s)")
 
 if __name__ == "__main__":
     correlate_all()
