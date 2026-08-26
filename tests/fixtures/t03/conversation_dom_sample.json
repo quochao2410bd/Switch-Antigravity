@@ -1,37 +1,19 @@
 {
-  "sidebar_structure": [
+  "target_uuid": "00000000-0000-4000-8000-000000000001",
+  "pathname": "/c/00000000-0000-4000-8000-000000000001",
+  "articles": [
     {
-      "index": 0,
-      "title": "T03",
-      "href": "/c/54fa3d23-64f3-4fb4-b790-02cdd1e92d75",
-      "uuid": "54fa3d23-64f3-4fb4-b790-02cdd1e92d75",
-      "isActive": true,
-      "isExecuting": true,
-      "buttons": [
-        { "label": "More options", "testid": "conversation-kebab" },
-        { "label": "Pin conversation", "testid": "conversation-pin-button" },
-        { "label": "Stop execution", "testid": null }
-      ]
+      "author": "user",
+      "text": "Initial task request",
+      "hash": "c807b5e0a6d2c418659178bb04b3cf61cf94e9f3b5ad829ad20a0684a86cecf3"
     },
     {
-      "index": 1,
-      "title": "T01",
-      "href": "/c/4674ef3b-d559-4a90-87e2-c30b11f03250",
-      "uuid": "4674ef3b-d559-4a90-87e2-c30b11f03250",
-      "isActive": false,
-      "isExecuting": false,
-      "buttons": [
-        { "label": "More options", "testid": "conversation-kebab" },
-        { "label": "Pin conversation", "testid": "conversation-pin-button" }
-      ]
+      "author": "assistant",
+      "text": "Task progress report and execution steps",
+      "hash": "b2f6dc4b5f9a6566b6cb6f7b159fef15bbcf5940026a79811562d9fb488f72c0"
     }
   ],
-  "composer": {
-    "selector": "[data-lexical-editor=\"true\"]",
-    "tag": "DIV",
-    "role": "combobox",
-    "aria_label": "Message input",
-    "send_button_selector": "button[data-testid=\"send-button\"]",
-    "stop_button_selector": "button[aria-label*=\"Stop\"], button[data-testid*=\"stop\"]"
-  }
+  "isMainTurnActive": false,
+  "mainStopButtonCount": 0,
+  "sidebarExecutingConversationsCount": 0
 }

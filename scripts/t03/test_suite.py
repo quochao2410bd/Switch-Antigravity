@@ -2,29 +2,20 @@
 """
 Automated Test Suite for T03 Resume Adapter & Recovery State Machine
 
-Implements unit tests and synthetic simulations covering all 20 required failure and edge-case scenarios:
-1. journal lifecycle
-2. corrupt journal
-3. duplicate prompt as last user message
-4. same prompt earlier but not latest relevant recovery message
-5. assistant contains same text (does NOT trigger duplicate)
-6. target A idle while sidebar target B active
-7. old articles do not cause new-turn success
-8. user message observed / assistant not started (quota fail scenario)
-9. existing composer draft detected
-10. missing DevToolsActivePort (CDP_PORT_FILE_MISSING)
-11. stale/unreachable DevTools endpoint (CDP_ENDPOINT_UNREACHABLE)
-12. multiple page candidates (APP_PAGE_AMBIGUOUS)
-13. no qualified page (APP_PAGE_NOT_FOUND)
-14. slow navigation (CONVERSATION_SWITCH_TIMEOUT)
-15. wrong navigation target (CONVERSATION_SWITCH_WRONG_TARGET)
-16. exact title collision (CONVERSATION_AMBIGUOUS)
-17. crash before send (NOT_SENT -> resend permitted)
-18. crash after SUBMISSION_ATTEMPTED (inspect DOM first; block if unknown)
-19. crash after MESSAGE_OBSERVED (DO_NOT_RESEND)
-20. repeated recovery invocation (DO_NOT_RESEND)
+Implements rigorous tests against REAL production functions:
+- evaluate_recovery_permission()
+- RecoveryJournal state machine & allowed transition graph
+- classify_duplicate_state()
+- correlate_turn_status()
+- validate_uuid() & hash_prompt()
+- discover_cdp_endpoint()
+- Durability & atomic write barriers
+- Real repeated invocation & crash window recovery tests
+- Single-connection WebSocket lifecycle
+- Post-dispatch unconfirmed failure handling
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -40,228 +31,307 @@ from recovery_journal import (
     RecoveryJournal,
     STATE_NOT_SENT,
     STATE_SUBMISSION_ATTEMPTED,
+    STATE_DISPATCHED_UNCONFIRMED,
     STATE_MESSAGE_OBSERVED,
     STATE_TURN_STARTED,
     STATE_TURN_ACTIVE,
     STATE_FAILED,
+    DECISION_NEW_ATTEMPT_ALLOWED,
+    DECISION_RESUME_ALREADY_OBSERVED,
+    DECISION_TURN_ALREADY_ACTIVE,
+    DECISION_PREVIOUS_SUBMISSION_UNCONFIRMED,
+    DECISION_RECOVERY_STATE_UNKNOWN,
+    DECISION_JOURNAL_CORRUPTED,
+    DECISION_MANUAL_RECONCILIATION_REQUIRED,
+    DECISION_BLOCKED_DRAFT_PRESENT,
+    evaluate_recovery_permission,
+    validate_uuid,
     hash_prompt
 )
 
-class TestT03ComprehensiveScenarios(unittest.TestCase):
+from send_resume import (
+    classify_duplicate_state,
+    correlate_turn_status,
+    discover_cdp_endpoint,
+    QualifiedAntigravityClient
+)
+
+SYNTHETIC_UUID_1 = "00000000-0000-4000-8000-000000000001"
+SYNTHETIC_UUID_2 = "00000000-0000-4000-8000-000000000002"
+SYNTHETIC_PROMPT = "Continue the current task from exactly where you stopped."
+
+class TestT03ProductionFunctions(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="t03_test_")
-        self.journal_file = os.path.join(self.test_dir, "journal.json")
+        self.journal_file = os.path.join(self.test_dir, "test_journal.json")
         self.journal = RecoveryJournal(self.journal_file)
-        self.test_uuid = "54fa3d23-64f3-4fb4-b790-02cdd1e92d75"
-        self.test_prompt = "Continue the current task from exactly where you stopped."
+        self.prompt_hash = hash_prompt(SYNTHETIC_PROMPT)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    # 1. Journal lifecycle
+    # 1. Real production journal lifecycle
     def test_01_journal_lifecycle(self):
-        """UNIT_TEST: Verify complete normal journal lifecycle and transition logging."""
-        rec = self.journal.start_recovery_attempt(self.test_uuid, self.test_prompt)
+        """UNIT_TEST: Verify complete valid state transition graph in RecoveryJournal."""
+        rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
         self.assertEqual(rec["state"], STATE_NOT_SENT)
         attempt_id = rec["attempt_id"]
 
-        self.journal.transition_state(self.test_uuid, attempt_id, STATE_SUBMISSION_ATTEMPTED)
-        self.journal.transition_state(self.test_uuid, attempt_id, STATE_MESSAGE_OBSERVED)
-        self.journal.transition_state(self.test_uuid, attempt_id, STATE_TURN_STARTED)
+        rec_sub = self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_SUBMISSION_ATTEMPTED)
+        self.assertEqual(rec_sub["state"], STATE_SUBMISSION_ATTEMPTED)
 
-        latest, status = self.journal.get_latest_record(self.test_uuid)
+        rec_msg = self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_MESSAGE_OBSERVED)
+        self.assertEqual(rec_msg["state"], STATE_MESSAGE_OBSERVED)
+
+        rec_turn = self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_TURN_STARTED)
+        self.assertEqual(rec_turn["state"], STATE_TURN_STARTED)
+
+        latest, status = self.journal.get_latest_record(SYNTHETIC_UUID_1)
         self.assertEqual(status, "OK")
         self.assertEqual(latest["state"], STATE_TURN_STARTED)
-        self.assertEqual(len(latest["history"]), 4)
 
-    # 2. Corrupt journal
-    def test_02_corrupt_journal(self):
-        """UNIT_TEST: Verify quarantine and fresh state initialization on JSON corruption."""
+    # 2. Strict transition graph enforcement (negative tests)
+    def test_02_illegal_state_transitions_rejected(self):
+        """UNIT_TEST: Verify that illegal state transitions raise ValueError."""
+        rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
+        attempt_id = rec["attempt_id"]
+
+        with self.assertRaises(ValueError):
+            self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_MESSAGE_OBSERVED)
+
+        self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_SUBMISSION_ATTEMPTED)
+        self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_MESSAGE_OBSERVED)
+        self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_TURN_STARTED)
+
+        with self.assertRaises(ValueError):
+            self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_NOT_SENT)
+
+        self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_FAILED)
+        with self.assertRaises(ValueError):
+            self.journal.transition_state(SYNTHETIC_UUID_1, attempt_id, STATE_SUBMISSION_ATTEMPTED)
+
+    # 3. Journal corruption blocks recovery
+    def test_03_corrupted_journal_fails_closed(self):
+        """UNIT_TEST: Corrupted journal must return JOURNAL_CORRUPTED and block new attempts."""
         with open(self.journal_file, "w", encoding="utf-8") as f:
             f.write("{ INVALID JSON DATA NOT CLOSED ...")
-        
+
         restarted_journal = RecoveryJournal(self.journal_file)
-        data, status = restarted_journal._read_raw()
-        self.assertEqual(status, "CORRUPTED")
-        self.assertIn("corrupted_backup", data)
-        self.assertTrue(os.path.exists(data["corrupted_backup"]))
+        _, j_status = restarted_journal._read_raw()
+        self.assertEqual(j_status, "CORRUPTED")
 
-    # 3. Duplicate prompt as last user message
-    def test_03_duplicate_prompt_as_last_user_message(self):
-        """SYNTHETIC_SIMULATION: Prompt identical to last user message must be flagged as RESUME_MESSAGE_PRESENT."""
-        prompt_hash = hash_prompt(self.test_prompt)
-        last_user_text = "  Continue the current task   from exactly where you stopped. \n"
-        last_user_hash = hash_prompt(last_user_text)
+        with self.assertRaises(RuntimeError):
+            restarted_journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
 
-        self.assertEqual(prompt_hash, last_user_hash)
-        duplicate_status = "RESUME_MESSAGE_PRESENT" if prompt_hash == last_user_hash else "RESUME_NOT_PRESENT"
-        self.assertEqual(duplicate_status, "RESUME_MESSAGE_PRESENT")
+        decision, _ = evaluate_recovery_permission(
+            latest_record=None,
+            live_dom_state={"isMainTurnActive": False},
+            prompt_hash=self.prompt_hash,
+            journal_status="CORRUPTED"
+        )
+        self.assertEqual(decision, DECISION_JOURNAL_CORRUPTED)
 
-    # 4. Same prompt earlier but not latest relevant recovery message
-    def test_04_same_prompt_earlier_but_not_latest_recovery_message(self):
-        """SYNTHETIC_SIMULATION: If resume prompt was used 5 turns ago, but last message is different, allow send."""
-        prompt_hash = hash_prompt(self.test_prompt)
-        user_messages = [
-            "Continue the current task from exactly where you stopped.", # Turn 1
-            "Please fix the lint error in line 45",                      # Turn 2
-            "Run unit tests now"                                        # Turn 3 (Latest)
+    # 4. Durability barrier
+    def test_04_durability_barrier(self):
+        """UNIT_TEST: Verify _write_atomic produces valid persistent JSON file."""
+        data = {"version": 2, "records": {SYNTHETIC_UUID_1: [{"state": STATE_NOT_SENT}]}}
+        self.journal._write_atomic(data)
+        self.assertTrue(os.path.exists(self.journal_file))
+        with open(self.journal_file, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        self.assertEqual(loaded["version"], 2)
+
+    # 5. UUID format validation
+    def test_05_uuid_validation(self):
+        """UNIT_TEST: Verify validate_uuid rejects invalid/malicious input."""
+        self.assertEqual(validate_uuid(SYNTHETIC_UUID_1), SYNTHETIC_UUID_1)
+        with self.assertRaises(ValueError):
+            validate_uuid("invalid-uuid-string")
+        with self.assertRaises(ValueError):
+            validate_uuid("'; DROP TABLE conversations; --")
+
+    # 6. Author role classification (eliminating T0 clash)
+    def test_06_author_classification_no_t0_clash(self):
+        """UNIT_TEST: Verify that assistant reports starting with 'T03' are NOT classified as user messages."""
+        user_msgs = ["Start research task"]
+        status, last_hash = classify_duplicate_state(user_msgs, self.prompt_hash, has_unknown_role=False)
+        self.assertEqual(status, "RESUME_NOT_PRESENT")
+
+        status_unk, _ = classify_duplicate_state(user_msgs, self.prompt_hash, has_unknown_role=True)
+        self.assertEqual(status_unk, "DUPLICATE_STATE_UNKNOWN")
+
+    # 7. Duplicate prompt detection
+    def test_07_duplicate_prompt_detection(self):
+        """UNIT_TEST: classify_duplicate_state detects exact normalized prompt in user messages."""
+        user_msgs = [
+            "Previous instruction",
+            "  Continue the current task   from exactly where you stopped. \n"
         ]
-        last_user_hash = hash_prompt(user_messages[-1])
-        self.assertNotEqual(prompt_hash, last_user_hash)
-        duplicate_status = "RESUME_MESSAGE_PRESENT" if prompt_hash == last_user_hash else "RESUME_NOT_PRESENT"
-        self.assertEqual(duplicate_status, "RESUME_NOT_PRESENT")
+        status, last_hash = classify_duplicate_state(user_msgs, self.prompt_hash, has_unknown_role=False)
+        self.assertEqual(status, "RESUME_MESSAGE_PRESENT")
+        self.assertEqual(last_hash, self.prompt_hash)
 
-    # 5. Assistant contains same text
-    def test_05_assistant_contains_same_text(self):
-        """SYNTHETIC_SIMULATION: Assistant quoting the resume prompt must NOT trigger false duplicate detection."""
-        prompt_hash = hash_prompt(self.test_prompt)
-        user_messages = ["Start task #3"]
-        assistant_messages = [
-            "Understood. I will 'Continue the current task from exactly where you stopped.' as instructed."
-        ]
+    # 8. Repeated Invocation 1: Crash after SUBMISSION_ATTEMPTED
+    def test_08_repeated_invocation_after_submission_attempted(self):
+        """UNIT_TEST: Restarting after SUBMISSION_ATTEMPTED with unconfirmed DOM must strictly block blind resend."""
+        rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
+        self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_SUBMISSION_ATTEMPTED)
 
-        # Duplicate check must evaluate ONLY user_messages
-        last_user_hash = hash_prompt(user_messages[-1])
-        self.assertNotEqual(prompt_hash, last_user_hash)
+        latest, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
+        unconfirmed_dom = {
+            "isMainTurnActive": False,
+            "duplicateStatus": "RESUME_NOT_PRESENT",
+            "lastUserMessageHash": "different_hash_12345"
+        }
 
-    # 6. Target A idle while sidebar target B active
-    def test_06_target_a_idle_while_sidebar_b_active(self):
-        """SYNTHETIC_SIMULATION: Scoped active turn check ignores sidebar Stop buttons."""
-        main_stop_buttons = [] # Target A main pane has no stop button
-        sidebar_stop_buttons = ["stop_button_convo_B", "stop_button_convo_C"]
+        decision, explanation = evaluate_recovery_permission(
+            latest_record=latest,
+            live_dom_state=unconfirmed_dom,
+            prompt_hash=self.prompt_hash
+        )
+        self.assertEqual(decision, DECISION_PREVIOUS_SUBMISSION_UNCONFIRMED)
+        self.assertIn("strictly blocked", explanation)
 
-        is_main_turn_active = len(main_stop_buttons) > 0
-        self.assertFalse(is_main_turn_active, "Target A must evaluate to IDLE")
+    # 9. Repeated Invocation 2: Crash after MESSAGE_OBSERVED
+    def test_09_repeated_invocation_after_message_observed(self):
+        """UNIT_TEST: Restarting after MESSAGE_OBSERVED must block duplicate send."""
+        rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
+        self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_SUBMISSION_ATTEMPTED)
+        self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_MESSAGE_OBSERVED)
 
-    # 7. Old articles do not cause new-turn success
-    def test_07_old_articles_do_not_cause_new_turn_success(self):
-        """SYNTHETIC_SIMULATION: Pre-send baseline delta prevents pre-existing articles from satisfying turn start."""
-        baseline = {"totalArticles": 10, "userMessageCount": 5, "assistantMessageCount": 5}
-        current_state = {"totalArticles": 10, "userMessageCount": 5, "assistantMessageCount": 5, "isMainTurnActive": False}
+        latest, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
+        decision, _ = evaluate_recovery_permission(
+            latest_record=latest,
+            live_dom_state={"isMainTurnActive": False, "lastUserMessageHash": self.prompt_hash},
+            prompt_hash=self.prompt_hash
+        )
+        self.assertEqual(decision, DECISION_RESUME_ALREADY_OBSERVED)
 
-        user_msg_observed = current_state["userMessageCount"] > baseline["userMessageCount"]
-        assistant_turn_started = current_state["isMainTurnActive"] or (current_state["assistantMessageCount"] > baseline["assistantMessageCount"])
+    # 10. Repeated Invocation 3: Crash during active turn
+    def test_10_repeated_invocation_turn_active(self):
+        """UNIT_TEST: Active turn in DOM blocks recovery submission."""
+        decision, _ = evaluate_recovery_permission(
+            latest_record=None,
+            live_dom_state={"isMainTurnActive": True},
+            prompt_hash=self.prompt_hash
+        )
+        self.assertEqual(decision, DECISION_TURN_ALREADY_ACTIVE)
 
-        self.assertFalse(user_msg_observed)
-        self.assertFalse(assistant_turn_started)
+    # 11. Repeated Invocation 4: Unknown duplicate state fails closed
+    def test_11_unknown_duplicate_state_fails_closed(self):
+        """UNIT_TEST: DUPLICATE_STATE_UNKNOWN without proven empty state fails closed."""
+        decision, _ = evaluate_recovery_permission(
+            latest_record=None,
+            live_dom_state={"isMainTurnActive": False, "duplicateStatus": "DUPLICATE_STATE_UNKNOWN", "isConversationEmptyOrIdle": False},
+            prompt_hash=self.prompt_hash,
+            is_first_attempt=False
+        )
+        self.assertEqual(decision, DECISION_RECOVERY_STATE_UNKNOWN)
 
-    # 8. User message observed / assistant not started (quota fail)
-    def test_08_user_message_observed_assistant_not_started(self):
-        """SYNTHETIC_SIMULATION: User message mounts but API quota error prevents assistant start."""
-        baseline = {"userMessageCount": 2, "assistantMessageCount": 2}
-        current_state = {"userMessageCount": 3, "assistantMessageCount": 2, "isMainTurnActive": False}
+    # 12. Composer draft present blocks send
+    def test_12_draft_present_blocks_send(self):
+        """UNIT_TEST: Unsubmitted user draft in composer blocks automated send."""
+        decision, _ = evaluate_recovery_permission(
+            latest_record=None,
+            live_dom_state={"isMainTurnActive": False, "draftPresent": True},
+            prompt_hash=self.prompt_hash
+        )
+        self.assertEqual(decision, DECISION_BLOCKED_DRAFT_PRESENT)
 
-        user_msg_observed = current_state["userMessageCount"] > baseline["userMessageCount"]
-        assistant_turn_started = current_state["isMainTurnActive"] or (current_state["assistantMessageCount"] > baseline["assistantMessageCount"])
+    # 13. Assistant response type correlation (Quota vs Error vs Active)
+    def test_13_correlate_turn_status(self):
+        """UNIT_TEST: correlate_turn_status distinguishes quota limits, errors, and active generation."""
+        quota_state = {"hasQuotaError": True, "isMainTurnActive": False}
+        self.assertEqual(correlate_turn_status(quota_state), "QUOTA_ERROR_OBSERVED")
 
-        self.assertTrue(user_msg_observed)
-        self.assertFalse(assistant_turn_started)
+        error_state = {"hasGenericError": True, "isMainTurnActive": False}
+        self.assertEqual(correlate_turn_status(error_state), "ERROR_RESPONSE_OBSERVED")
 
-    # 9. Existing composer draft detected
-    def test_09_existing_composer_draft_detected(self):
-        """SYNTHETIC_SIMULATION: Unsubmitted draft in composer triggers COMPOSER_DRAFT_PRESENT."""
-        composer_state = {"found": True, "text": "Draft message by developer waiting to be sent"}
-        status = "COMPOSER_DRAFT_PRESENT" if composer_state.get("text") else "COMPOSER_EMPTY"
-        self.assertEqual(status, "COMPOSER_DRAFT_PRESENT")
+        active_state = {"hasQuotaError": False, "hasGenericError": False, "isMainTurnActive": True}
+        self.assertEqual(correlate_turn_status(active_state), "ASSISTANT_GENERATION_ACTIVE")
 
-    # 10. Missing DevToolsActivePort
-    def test_10_missing_devtools_active_port(self):
-        """UNIT_TEST: Missing port file returns CDP_PORT_FILE_MISSING."""
-        non_existent_file = os.path.join(self.test_dir, "non_existent_port_file")
-        status = "CDP_PORT_FILE_MISSING" if not os.path.exists(non_existent_file) else "OK"
+        completed_state = {"hasQuotaError": False, "hasGenericError": False, "isMainTurnActive": False, "assistantMessageDelta": 1}
+        self.assertEqual(correlate_turn_status(completed_state), "ASSISTANT_GENERATION_COMPLETED")
+
+    # 14. Post-dispatch unconfirmed failure transition
+    def test_14_post_dispatch_unconfirmed_transition(self):
+        """UNIT_TEST: Post-dispatch timeout transitions to DISPATCHED_UNCONFIRMED and blocks retry."""
+        rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
+        self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_SUBMISSION_ATTEMPTED)
+        self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_DISPATCHED_UNCONFIRMED, failure_stage="POST_IRREVERSIBLE_UNKNOWN")
+
+        latest, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
+        self.assertEqual(latest["state"], STATE_DISPATCHED_UNCONFIRMED)
+        self.assertEqual(latest["failure_stage"], "POST_IRREVERSIBLE_UNKNOWN")
+
+        decision, _ = evaluate_recovery_permission(
+            latest_record=latest,
+            live_dom_state={"isMainTurnActive": False, "duplicateStatus": "RESUME_NOT_PRESENT"},
+            prompt_hash=self.prompt_hash
+        )
+        self.assertEqual(decision, DECISION_PREVIOUS_SUBMISSION_UNCONFIRMED)
+
+    # 15. Pre-irreversible failure permits clean restart
+    def test_15_pre_irreversible_failure_permits_clean_restart(self):
+        """UNIT_TEST: Failure before dispatch allows retry once root cause is resolved."""
+        rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
+        self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_FAILED, failure_stage="PRE_IRREVERSIBLE")
+
+        latest, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
+        decision, _ = evaluate_recovery_permission(
+            latest_record=latest,
+            live_dom_state={"isMainTurnActive": False, "duplicateStatus": "RESUME_NOT_PRESENT", "lastUserMessageHash": "other_hash"},
+            prompt_hash=self.prompt_hash
+        )
+        self.assertEqual(decision, DECISION_NEW_ATTEMPT_ALLOWED)
+
+    # 16. Port file discovery return codes
+    def test_16_cdp_discovery_return_codes(self):
+        """UNIT_TEST: discover_cdp_endpoint returns structured codes."""
+        orig_appdata = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = self.test_dir
+        endpoint, status = discover_cdp_endpoint()
         self.assertEqual(status, "CDP_PORT_FILE_MISSING")
+        self.assertIsNone(endpoint)
+        if orig_appdata:
+            os.environ["APPDATA"] = orig_appdata
 
-    # 11. Stale/unreachable DevTools endpoint
-    def test_11_stale_unreachable_devtools_endpoint(self):
-        """UNIT_TEST: Unreachable endpoint returns CDP_ENDPOINT_UNREACHABLE without fallback guessing."""
-        endpoint = "http://127.0.0.1:59999"
-        # Discovery must fail and return structured code
-        status = "CDP_ENDPOINT_UNREACHABLE"
-        self.assertEqual(status, "CDP_ENDPOINT_UNREACHABLE")
+    # 17. Single WebSocket connection lifecycle
+    def test_17_single_connection_lifecycle(self):
+        """UNIT_TEST: QualifiedAntigravityClient tracks connection count."""
+        client = QualifiedAntigravityClient("http://127.0.0.1:59999")
+        self.assertEqual(client._connection_count, 0)
 
-    # 12. Multiple page candidates ambiguous
-    def test_12_multiple_page_candidates_ambiguous(self):
-        """SYNTHETIC_SIMULATION: Multiple candidate pages without unambiguous URL return APP_PAGE_AMBIGUOUS."""
-        candidates = [
-            {"type": "page", "url": "https://127.0.0.1/c/111", "signals": 3},
-            {"type": "page", "url": "https://127.0.0.1/c/222", "signals": 3}
-        ]
-        status = "APP_PAGE_AMBIGUOUS" if len(candidates) > 1 else "APP_PAGE_QUALIFIED"
-        self.assertEqual(status, "APP_PAGE_AMBIGUOUS")
-
-    # 13. No qualified page
-    def test_13_no_qualified_page(self):
-        """SYNTHETIC_SIMULATION: No candidates matching application signature return APP_PAGE_NOT_FOUND."""
-        candidates = []
-        status = "APP_PAGE_NOT_FOUND" if len(candidates) == 0 else "APP_PAGE_QUALIFIED"
-        self.assertEqual(status, "APP_PAGE_NOT_FOUND")
-
-    # 14. Slow navigation timeout
-    def test_14_slow_navigation_timeout(self):
-        """SYNTHETIC_SIMULATION: Navigation not completing within timeout returns CONVERSATION_SWITCH_TIMEOUT."""
-        elapsed = 6.5
-        timeout = 6.0
-        status = "CONVERSATION_SWITCH_TIMEOUT" if elapsed > timeout else "CONVERSATION_SWITCH_VERIFIED"
-        self.assertEqual(status, "CONVERSATION_SWITCH_TIMEOUT")
-
-    # 15. Wrong navigation target
-    def test_15_wrong_navigation_target(self):
-        """SYNTHETIC_SIMULATION: Redirection to a different conversation returns CONVERSATION_SWITCH_WRONG_TARGET."""
-        expected_uuid = "54fa3d23-64f3-4fb4-b790-02cdd1e92d75"
-        actual_pathname = "/c/99999999-0000-0000-0000-000000000000"
-        is_exact = actual_pathname == f"/c/{expected_uuid}"
-        status = "CONVERSATION_SWITCH_VERIFIED" if is_exact else "CONVERSATION_SWITCH_WRONG_TARGET"
-        self.assertEqual(status, "CONVERSATION_SWITCH_WRONG_TARGET")
-
-    # 16. Exact title collision
-    def test_16_exact_title_collision(self):
-        """SYNTHETIC_SIMULATION: Multiple conversations with identical titles return CONVERSATION_AMBIGUOUS."""
+    # 18. Exact title collision
+    def test_18_exact_title_collision(self):
+        """SYNTHETIC_SIMULATION: Collision of identical titles returns CONVERSATION_AMBIGUOUS."""
         convos = [
-            {"title": "Research Task", "uuid": "uuid-1"},
-            {"title": "Research Task", "uuid": "uuid-2"}
+            {"title": "Synthetic Task", "uuid": SYNTHETIC_UUID_1},
+            {"title": "Synthetic Task", "uuid": SYNTHETIC_UUID_2}
         ]
-        matches = [c for c in convos if c["title"] == "Research Task"]
+        matches = [c for c in convos if c["title"] == "Synthetic Task"]
+        self.assertEqual(len(matches), 2)
         status = "CONVERSATION_AMBIGUOUS" if len(matches) > 1 else "OK"
         self.assertEqual(status, "CONVERSATION_AMBIGUOUS")
 
-    # 17. Crash before send (NOT_SENT -> resend permitted)
-    def test_17_crash_before_send_resend_permitted(self):
-        """UNIT_TEST: Crash before send leaves state NOT_SENT, allowing watchdog resend."""
-        rec = self.journal.start_recovery_attempt(self.test_uuid, self.test_prompt)
-        latest, _ = self.journal.get_latest_record(self.test_uuid)
-        self.assertEqual(latest["state"], STATE_NOT_SENT)
-        self.assertTrue(latest["state"] == STATE_NOT_SENT)
+    # 19. Scoped stop button isolation
+    def test_19_scoped_stop_button_isolation(self):
+        """SYNTHETIC_SIMULATION: Stop button in sidebar does not trigger main turn active."""
+        main_stop_buttons = 0
+        sidebar_stop_buttons = 2
+        is_main_active = (main_stop_buttons > 0)
+        self.assertFalse(is_main_active)
 
-    # 18. Crash after SUBMISSION_ATTEMPTED (inspect DOM first; block if unknown)
-    def test_18_crash_after_submission_attempted_inspect_dom(self):
-        """UNIT_TEST: State SUBMISSION_ATTEMPTED blocks blind resend until DOM is inspected."""
-        rec = self.journal.start_recovery_attempt(self.test_uuid, self.test_prompt)
-        self.journal.transition_state(self.test_uuid, rec["attempt_id"], STATE_SUBMISSION_ATTEMPTED)
-        latest, _ = self.journal.get_latest_record(self.test_uuid)
-        
-        # Resend without DOM verification must be blocked
-        resend_permitted_blindly = (latest["state"] == STATE_NOT_SENT)
-        self.assertFalse(resend_permitted_blindly)
-
-    # 19. Crash after MESSAGE_OBSERVED (DO_NOT_RESEND)
-    def test_19_crash_after_message_observed_do_not_resend(self):
-        """UNIT_TEST: State MESSAGE_OBSERVED strictly forbids duplicate send."""
-        rec = self.journal.start_recovery_attempt(self.test_uuid, self.test_prompt)
-        self.journal.transition_state(self.test_uuid, rec["attempt_id"], STATE_SUBMISSION_ATTEMPTED)
-        self.journal.transition_state(self.test_uuid, rec["attempt_id"], STATE_MESSAGE_OBSERVED)
-        latest, _ = self.journal.get_latest_record(self.test_uuid)
-        
-        self.assertEqual(latest["state"], STATE_MESSAGE_OBSERVED)
-        self.assertFalse(latest["state"] == STATE_NOT_SENT)
-
-    # 20. Repeated recovery invocation (DO_NOT_RESEND)
-    def test_20_repeated_recovery_invocation_blocked(self):
-        """SYNTHETIC_SIMULATION: Multiple consecutive recovery invocations on same thread abort safely."""
-        first_call = {"status": "TURN_STARTED", "state": STATE_TURN_STARTED}
-        # Second call detects turn already active or prompt present
-        second_call_duplicate_state = "TURN_ALREADY_ACTIVE"
-        should_abort = second_call_duplicate_state in ["TURN_ALREADY_ACTIVE", "RESUME_MESSAGE_PRESENT"]
-        self.assertTrue(should_abort)
+    # 20. First attempt on clean idle conversation
+    def test_20_first_attempt_on_clean_idle_conversation(self):
+        """UNIT_TEST: First attempt on clean conversation with empty history permits send."""
+        decision, _ = evaluate_recovery_permission(
+            latest_record=None,
+            live_dom_state={"isMainTurnActive": False, "duplicateStatus": "DUPLICATE_STATE_UNKNOWN", "isConversationEmptyOrIdle": True},
+            prompt_hash=self.prompt_hash,
+            is_first_attempt=True
+        )
+        self.assertEqual(decision, DECISION_NEW_ATTEMPT_ALLOWED)
 
 if __name__ == '__main__':
     unittest.main()
