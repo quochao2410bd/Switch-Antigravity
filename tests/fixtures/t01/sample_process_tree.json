@@ -1,0 +1,37 @@
+[
+  {
+    "ProcessId": 14472,
+    "ParentProcessId": 3500,
+    "Name": "Antigravity.exe",
+    "Role": "Main Electron Browser Process",
+    "CommandLine": "\"C:\\Users\\<USER>\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe\""
+  },
+  {
+    "ProcessId": 6008,
+    "ParentProcessId": 14472,
+    "Name": "Antigravity.exe",
+    "Role": "GPU Process",
+    "CommandLine": "\"C:\\Users\\<USER>\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe\" --type=gpu-process --user-data-dir=\"C:\\Users\\<USER>\\AppData\\Roaming\\Antigravity\""
+  },
+  {
+    "ProcessId": 7380,
+    "ParentProcessId": 14472,
+    "Name": "Antigravity.exe",
+    "Role": "Utility NetworkService",
+    "CommandLine": "\"C:\\Users\\<USER>\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe\" --type=utility --utility-sub-type=network.mojom.NetworkService --user-data-dir=\"C:\\Users\\<USER>\\AppData\\Roaming\\Antigravity\""
+  },
+  {
+    "ProcessId": 12992,
+    "ParentProcessId": 14472,
+    "Name": "Antigravity.exe",
+    "Role": "Renderer Process (UI Webview)",
+    "CommandLine": "\"C:\\Users\\<USER>\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe\" --type=renderer --user-data-dir=\"C:\\Users\\<USER>\\AppData\\Roaming\\Antigravity\" --app-path=\"C:\\Users\\<USER>\\AppData\\Local\\Programs\\antigravity\\resources\\app.asar\""
+  },
+  {
+    "ProcessId": 7520,
+    "ParentProcessId": 14472,
+    "Name": "language_server.exe",
+    "Role": "Language Server / Agent Core RPC Service",
+    "CommandLine": "C:\\Users\\<USER>\\AppData\\Local\\Programs\\antigravity\\resources\\bin\\language_server.exe --standalone --override_ide_name antigravity --subclient_type hub --override_ide_version 2.10.0 --override_user_agent_name antigravity --https_server_port 0 --csrf_token <REDACTED_CSRF_TOKEN> --app_data_dir antigravity --api_server_url https://generativelanguage.googleapis.com --cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com --enable_sidecars --host_bridge_url=http://127.0.0.1:58860 --host_bridge_token=<REDACTED_HOST_BRIDGE_TOKEN>"
+  }
+]

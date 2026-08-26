@@ -1,0 +1,25 @@
+{
+  "tables": {
+    "trajectory_meta": {
+      "schema": "CREATE TABLE `trajectory_meta` (`trajectory_id` text,`cascade_id` text,`trajectory_type` integer,`source` integer,PRIMARY KEY (`trajectory_id`))",
+      "columns": [
+        "trajectory_id",
+        "cascade_id",
+        "trajectory_type",
+        "source"
+      ],
+      "sample_row": {
+        "trajectory_id": "83a53ccd-8127-463e-a422-205d5c34cf0c",
+        "cascade_id": "4674ef3b-d559-4a90-87e2-c30b11f03250",
+        "trajectory_type": 4,
+        "source": 1
+      }
+    },
+    "steps": {
+      "schema": "CREATE TABLE `steps` (`idx` integer,`step_type` integer NOT NULL DEFAULT 0,`status` integer NOT NULL DEFAULT 0,`has_subtrajectory` numeric NOT NULL DEFAULT false,`metadata` blob,`error_details` blob,`permissions` blob,`task_details` blob,`render_info` blob,`step_payload` blob,`step_format` integer NOT NULL DEFAULT 0,PRIMARY KEY (`idx`))"
+    },
+    "trajectory_metadata_blob": {
+      "schema": "CREATE TABLE `trajectory_metadata_blob` (`id` text DEFAULT 'main',`data` blob,PRIMARY KEY (`id`))"
+    }
+  }
+}
