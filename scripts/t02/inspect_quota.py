@@ -36,11 +36,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from refresh_quota_safe import (
     INSPECTED_AGM_SOURCE_REVISION,
     EvidenceSourceOrigin,
+    LiveExecutionAttestation,
     RefreshEvidence,
     RefreshResult,
     TransportTrustClass,
     is_canonical_email,
     verify_evidence_signature,
+    verify_live_execution_attestation,
 )
 
 
@@ -154,6 +156,7 @@ def _validate_refresh_evidence_internal(
     canonical_account: str,
     now_epoch: float,
     expected_session_id: str,
+    expected_binary_sha256: Optional[str] = None,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
     session_secret: Optional[str] = None,
@@ -176,7 +179,7 @@ def _validate_refresh_evidence_internal(
             "Untrusted deserialized evidence without verified HMAC signature is rejected in supervisor mode"
         ]
 
-    # 2. Source Origin Check (Critical Item 2)
+    # 2. Source Origin & Attestation Check (Critical Item 2, 3, 4)
     if evidence.source_origin == EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE:
         if not allow_synthetic_test:
             return FreshnessState.STALE_CACHED, None, [
@@ -185,7 +188,14 @@ def _validate_refresh_evidence_internal(
         warnings.append("Validated under explicit test mode")
     elif evidence.source_origin == EvidenceSourceOrigin.DRY_RUN:
         return FreshnessState.STALE_CACHED, None, ["Dry-run evidence cannot establish freshness"]
-    elif evidence.source_origin != EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION:
+    elif evidence.source_origin == EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION:
+        # Sealed Process-Local Attestation Verification (Item 3 & 4)
+        if evidence.transport_trust == TransportTrustClass.PROCESS_LOCAL:
+            if not verify_live_execution_attestation(evidence.attestation, canonical_account, evidence.binary_sha256):
+                return FreshnessState.STALE_CACHED, None, [
+                    "Process-local live evidence lacks valid sealed executor attestation capability; untrusted local construction"
+                ]
+    else:
         return FreshnessState.STALE_CACHED, None, [f"Unknown evidence source origin: '{evidence.source_origin}'"]
 
     # 3. Canonical Account Exact Match (RFC 5322)
@@ -208,7 +218,7 @@ def _validate_refresh_evidence_internal(
             f"Exact argv mismatch (expected {expected_argv}, got {evidence.argv})"
         ]
 
-    # 5. Binary Identity Binding (Item 4)
+    # 5. Binary Identity & Independent Expected Hash Verification (Critical Item 1 & 2)
     if not evidence.canonical_executable_path or evidence.canonical_executable_path == "none":
         return FreshnessState.STALE_CACHED, None, ["Refresh evidence lacks valid canonical executable path"]
     if not evidence.binary_sha256 or evidence.binary_sha256 == "UNKNOWN_SHA256":
@@ -217,6 +227,11 @@ def _validate_refresh_evidence_internal(
         return FreshnessState.STALE_CACHED, None, [
             f"AGM source revision mismatch (expected '{INSPECTED_AGM_SOURCE_REVISION}', got '{evidence.source_revision_inspected}')"
         ]
+    if expected_binary_sha256 is not None:
+        if evidence.binary_sha256.lower() != expected_binary_sha256.lower():
+            return FreshnessState.STALE_CACHED, None, [
+                f"BINARY_IDENTITY_MISMATCH: Observed binary SHA-256 '{evidence.binary_sha256}' does not match expected '{expected_binary_sha256}'"
+            ]
 
     # 6. Mandatory Session ID Check
     if not expected_session_id or not expected_session_id.strip():
@@ -267,6 +282,7 @@ def validate_refresh_evidence_supervisor(
     canonical_account: str,
     now_epoch: float,
     expected_session_id: str,
+    expected_binary_sha256: Optional[str] = None,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
     session_secret: Optional[str] = None
@@ -280,6 +296,7 @@ def validate_refresh_evidence_supervisor(
         canonical_account=canonical_account,
         now_epoch=now_epoch,
         expected_session_id=expected_session_id,
+        expected_binary_sha256=expected_binary_sha256,
         max_freshness_age_sec=max_freshness_age_sec,
         allowed_clock_skew_sec=allowed_clock_skew_sec,
         session_secret=session_secret,
@@ -292,6 +309,7 @@ def _validate_refresh_evidence_for_test(
     canonical_account: str,
     now_epoch: float,
     expected_session_id: str,
+    expected_binary_sha256: Optional[str] = None,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
     session_secret: Optional[str] = None
@@ -302,6 +320,7 @@ def _validate_refresh_evidence_for_test(
         canonical_account=canonical_account,
         now_epoch=now_epoch,
         expected_session_id=expected_session_id,
+        expected_binary_sha256=expected_binary_sha256,
         max_freshness_age_sec=max_freshness_age_sec,
         allowed_clock_skew_sec=allowed_clock_skew_sec,
         session_secret=session_secret,

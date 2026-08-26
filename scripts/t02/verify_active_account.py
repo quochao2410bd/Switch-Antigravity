@@ -49,6 +49,20 @@ class CredentialVerificationStatus(str, Enum):
 
 
 @dataclass
+class SanitizedVerificationOutput:
+    """Safe supervisor DTO containing zero raw emails or fingerprints (Item 10)."""
+    account_ref: Optional[str]
+    status: str
+    credential_present: bool
+    evidence_rank: str
+    matches_expected: Optional[bool]
+    scope: str
+    desktop_adoption_status: str
+    verification_source: str
+    details: str
+
+
+@dataclass
 class VerificationResult:
     account_ref: Optional[str]  # Pseudonymous hash by default
     status: CredentialVerificationStatus
@@ -63,6 +77,28 @@ class VerificationResult:
     raw_expected_account: Optional[str] = None
     raw_detected_email: Optional[str] = None
     token_fingerprint: Optional[str] = None
+
+    def to_sanitized_dto(self) -> SanitizedVerificationOutput:
+        """Converts to safe supervisor DTO guaranteed free of raw emails/tokens."""
+        return SanitizedVerificationOutput(
+            account_ref=self.account_ref,
+            status=self.status.value,
+            credential_present=self.credential_present,
+            evidence_rank=self.evidence_rank,
+            matches_expected=self.matches_expected,
+            scope=self.scope,
+            desktop_adoption_status=self.desktop_adoption_status,
+            verification_source=self.verification_source,
+            details=self.details
+        )
+
+    def to_private_diagnostic_dict(self) -> dict:
+        """Explicit diagnostic extraction including raw values."""
+        d = asdict(self.to_sanitized_dto())
+        d["raw_expected_account"] = self.raw_expected_account
+        d["raw_detected_email"] = self.raw_detected_email
+        d["token_fingerprint"] = self.token_fingerprint
+        return d
 
 
 def pseudonymize_account(account: Optional[str]) -> Optional[str]:

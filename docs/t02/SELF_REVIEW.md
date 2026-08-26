@@ -1,19 +1,19 @@
-# T02 Adversarial Self-Review (Zero-Trust Round 4 Revision)
+# T02 Adversarial Self-Review (Zero-Trust Round 5 Final Closure)
 
-## 1. Adversarial Audit of Round 4 Remediations
+## 1. Adversarial Audit of Round 5 Remediations
 
-1. **Deserialized Trust Enforcement:** Fixed trust bypass where dicts chose their own origin. Forced `UNTRUSTED_DESERIALIZED` on all deserialized payloads.
-2. **Sealed Live Origin Minting:** Separated `_execute_live_refresh_sealed()` from `execute_refresh_for_test()`. Fake runners cannot mint live evidence.
-3. **Exact Argv Equality:** Enforced element-by-element argv checking with zero suffix matching.
-4. **Binary SHA-256 Binding:** Added binary hashing and bound to inspected revision `1d3ce8497e36ffa60c3b4e369168315a7ae4d469`.
-5. **Credential Envelope:** PowerShell returns structured envelope separating `1168` (not found) from zero-length blobs (missing token fields).
-6. **Default Output Pseudonymization:** Default CLI outputs emit pseudonymous references (`acc_<hash>`).
-7. **Global Test Isolation Trap:** Globally trapped subprocess and urllib handlers, verifying `OS_CRED_READ_CALLS = 0`, `OS_CRED_WRITE_CALLS = 0`, `LIVE_AGM_CALLS = 0`, `LIVE_GOOGLE_HTTP_CALLS = 0`.
-8. **Clean Supervisor API:** Removed test-weakening flags from supervisor production interfaces.
+1. **Independent Binary Hash Binding:** Validates observed SHA-256 against expected binary SHA-256 (`expected_binary_sha256`). Mismatches fail closed.
+2. **Wrong-But-Valid SHA Failure:** Tested syntactically valid 64-hex mismatched hashes; fails closed to `BINARY_IDENTITY_MISMATCH`.
+3. **Process-Local Capability Attestation:** Introduced `LiveExecutionAttestation`. Tested manual typed forgery; fails closed to `STALE_CACHED`.
+4. **Sealed Live Origin Minting:** Tested sealed live executor with private hook; mints valid attestation and proves freshness in supervisor mode without hitting Google network.
+5. **TOCTOU Binary Mutation Check:** Tested pre/post execution binary hash mutation; fails closed to `BINARY_IDENTITY_UNVERIFIED`.
+6. **Supervisor Privacy DTO:** Verified supervisor DTO excludes raw emails and token fingerprints.
+7. **Global Isolation Tripwires:** Verified tripwire triggers `RuntimeError` on unmocked calls, and verified zero host operations across test suite.
 
 ---
 
 ## 2. Unresolved Boundaries
 
-1. **Desktop Adoption Gate:** Status remains **`LIVE_DESKTOP_A_TO_B_ADOPTION = UNKNOWN`**.
-2. **Host Credential Restoration:** Status remains **`HOST_CREDENTIAL_RESTORATION = UNKNOWN`**.
+1. **Binary Source Equivalence:** `BINARY_SOURCE_EQUIVALENCE = UNKNOWN` (unless explicit expected SHA-256 configured).
+2. **Desktop Adoption Gate:** `LIVE_DESKTOP_A_TO_B_ADOPTION = UNKNOWN`.
+3. **Host Credential Restoration:** `HOST_CREDENTIAL_RESTORATION = UNKNOWN`.

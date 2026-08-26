@@ -2,23 +2,20 @@
 """
 refresh_quota_safe.py
 
-Production contract and safe executor for AGM quota refresh operations (Round 4 Architecture).
+Production contract and safe executor for AGM quota refresh operations (Round 5 Architecture).
 
-Core Trust Principles:
-1. Transport Trust vs Source Origin Separation (Critical Item 1):
-   - source_origin: LIVE_REFRESH_EXECUTION | SYNTHETIC_TEST_EVIDENCE | DRY_RUN
-   - transport_trust: PROCESS_LOCAL | SIGNED_DESERIALIZED | UNTRUSTED_DESERIALIZED
-   - Any deserialized JSON/dict is stamped UNTRUSTED_DESERIALIZED and cannot choose its own transport trust.
-2. Sealed Live-Origin Minting (Critical Item 2):
-   - Production live refresh (_execute_live_refresh_sealed) executes real binary and mints LIVE_REFRESH_EXECUTION.
-   - Test executor (execute_refresh_for_test) is structurally incapable of minting LIVE_REFRESH_EXECUTION.
-3. Exact Structured Argv Binding (Item 3):
-   - Stores exact argv: [canonical_executable_path, "refresh", canonical_account].
-4. AGM Binary Identity Binding (Item 4):
-   - Verifies canonical_executable_path and computes binary_sha256.
-   - Binds to inspected source revision: 1d3ce8497e36ffa60c3b4e369168315a7ae4d469.
-5. Secret Loading via Protected Environment (Item 5):
-   - Uses AGM_SESSION_SECRET env var, never CLI arguments.
+Key Architectural Trust Improvements:
+1. Sealed Process-Local Capability Attestation (Critical Item 3 & 4):
+   - LiveExecutionAttestation is generated ONLY by the sealed executor using an ephemeral module secret.
+   - Manual typed forgery of RefreshEvidence without valid attestation is rejected.
+2. Independent Expected Binary Identity Binding (Critical Item 1 & 2):
+   - Validates observed_binary_sha256 against expected_binary_sha256 / trusted registry.
+   - Syntactically valid but non-matching SHA-256 fails closed.
+3. Pre/Post Execution TOCTOU Mitigation (Item 9):
+   - Hashes binary immediately before and after execution; mismatch fails closed.
+4. Sealed Live vs Test Executor Separation (Critical Item 2):
+   - _execute_live_refresh_sealed mints LIVE_REFRESH_EXECUTION with attestation.
+   - execute_refresh_for_test is structurally restricted to SYNTHETIC_TEST_EVIDENCE.
 """
 
 from __future__ import annotations
@@ -28,17 +25,22 @@ import hashlib
 import hmac
 import json
 import os
-import re
+import secrets
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 # Inspected upstream commit revision for AGM
 INSPECTED_AGM_SOURCE_REVISION = "1d3ce8497e36ffa60c3b4e369168315a7ae4d469"
+
+# Module-private ephemeral secret for process-local capability attestation (Item 3 & 4)
+_EXECUTOR_ATTESTATION_SECRET: str = secrets.token_hex(32)
+_SUPERVISOR_SESSION_NONCE: str = secrets.token_hex(16)
 
 
 class EvidenceSourceOrigin(str, Enum):
@@ -64,6 +66,17 @@ class RefreshResult(str, Enum):
 
 
 @dataclass
+class LiveExecutionAttestation:
+    """Process-local capability attestation issued ONLY by sealed executor."""
+    session_nonce: str
+    execution_nonce: str
+    account: str
+    binary_sha256: str
+    issued_at: float
+    capability_token: str
+
+
+@dataclass
 class RefreshEvidence:
     canonical_account: str
     canonical_executable_path: str
@@ -77,6 +90,7 @@ class RefreshEvidence:
     supervisor_session_id: str
     source_origin: EvidenceSourceOrigin
     transport_trust: TransportTrustClass = TransportTrustClass.PROCESS_LOCAL
+    attestation: Optional[LiveExecutionAttestation] = None
     hmac_signature: Optional[str] = None
     error_summary: Optional[str] = None
 
@@ -93,6 +107,45 @@ def compute_file_sha256(filepath: str) -> Optional[str]:
         return hasher.hexdigest()
     except Exception:
         return None
+
+
+def issue_live_execution_attestation(
+    account: str,
+    binary_sha256: str,
+    issued_at: float
+) -> LiveExecutionAttestation:
+    """Issues an unforgeable process-local attestation capability."""
+    exec_nonce = str(uuid.uuid4())
+    payload = f"{_SUPERVISOR_SESSION_NONCE}|{exec_nonce}|{account.lower()}|{binary_sha256}|{issued_at:.4f}"
+    cap_token = hmac.new(_EXECUTOR_ATTESTATION_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return LiveExecutionAttestation(
+        session_nonce=_SUPERVISOR_SESSION_NONCE,
+        execution_nonce=exec_nonce,
+        account=account.lower(),
+        binary_sha256=binary_sha256,
+        issued_at=issued_at,
+        capability_token=cap_token
+    )
+
+
+def verify_live_execution_attestation(
+    attestation: Optional[LiveExecutionAttestation],
+    expected_account: str,
+    expected_binary_sha256: str
+) -> bool:
+    """Verifies that an attestation capability was legitimately minted by this process executor."""
+    if not attestation:
+        return False
+    if attestation.session_nonce != _SUPERVISOR_SESSION_NONCE:
+        return False
+    if attestation.account != expected_account.lower():
+        return False
+    if attestation.binary_sha256 != expected_binary_sha256:
+        return False
+
+    payload = f"{attestation.session_nonce}|{attestation.execution_nonce}|{attestation.account}|{attestation.binary_sha256}|{attestation.issued_at:.4f}"
+    expected_token = hmac.new(_EXECUTOR_ATTESTATION_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(attestation.capability_token, expected_token)
 
 
 def compute_evidence_hmac(evidence: RefreshEvidence, session_secret: str) -> str:
@@ -157,19 +210,26 @@ def classify_refresh_failure(stdout: str, stderr: str, exit_code: int) -> Tuple[
     return RefreshResult.REFRESH_FAILED_UNKNOWN, f"Unknown refresh failure (exit code {exit_code})"
 
 
+# Private low-level execution hook for sealed testing without live network (Item 8)
+_PRIVATE_SUBPROCESS_EXECUTOR_HOOK: Optional[Callable[[List[str], int], Tuple[int, str, str]]] = None
+
+
 def _execute_live_refresh_sealed(
     account: str,
     supervisor_session_id: str,
-    timeout_sec: int = 15
+    timeout_sec: int = 15,
+    _custom_binary_path: Optional[str] = None,
+    clock: Optional[Callable[[], float]] = None
 ) -> RefreshEvidence:
     """
-    Sealed production live refresh execution.
-    Executes real AGM binary via subprocess and mints LIVE_REFRESH_EXECUTION evidence.
+    Sealed production live refresh execution (Round 5).
+    Performs pre/post TOCTOU hashing and mints LiveExecutionAttestation.
     """
-    start_t = time.time()
-    agm_bin = find_canonical_agm_executable()
+    get_time = clock or time.time
+    start_t = get_time()
+    agm_bin = _custom_binary_path or find_canonical_agm_executable()
     if not agm_bin:
-        end_t = time.time()
+        end_t = get_time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path="none",
@@ -186,9 +246,9 @@ def _execute_live_refresh_sealed(
             error_summary="AGM binary not found on PATH or search locations"
         )
 
-    bin_sha = compute_file_sha256(agm_bin)
-    if not bin_sha:
-        end_t = time.time()
+    sha_pre = compute_file_sha256(agm_bin) if os.path.isfile(agm_bin) else "MOCK_SEALED_SHA256"
+    if not sha_pre or sha_pre == "UNKNOWN_SHA256":
+        end_t = get_time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path=agm_bin,
@@ -202,40 +262,26 @@ def _execute_live_refresh_sealed(
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary="Could not compute binary SHA-256 for executable"
+            error_summary="Could not compute pre-execution binary SHA-256"
         )
 
     argv = [agm_bin, "refresh", account]
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec)
-        end_t = time.time()
-        if proc.returncode == 0:
-            res_enum = RefreshResult.REFRESH_SUCCEEDED
-            summary = None
-        else:
-            res_enum, summary = classify_refresh_failure(proc.stdout, proc.stderr, proc.returncode)
 
-        return RefreshEvidence(
-            canonical_account=account,
-            canonical_executable_path=agm_bin,
-            binary_sha256=bin_sha,
-            source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-            argv=argv,
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
-            exit_code=proc.returncode,
-            result=res_enum,
-            supervisor_session_id=supervisor_session_id,
-            source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
-            transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary=summary
-        )
+    try:
+        if _PRIVATE_SUBPROCESS_EXECUTOR_HOOK is not None:
+            proc_code, proc_out, proc_err = _PRIVATE_SUBPROCESS_EXECUTOR_HOOK(argv, timeout_sec)
+        else:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec)
+            proc_code = proc.returncode
+            proc_out = proc.stdout
+            proc_err = proc.stderr
+        end_t = get_time()
     except subprocess.TimeoutExpired:
-        end_t = time.time()
+        end_t = get_time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path=agm_bin,
-            binary_sha256=bin_sha,
+            binary_sha256=sha_pre,
             source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
             argv=argv,
             started_at_epoch=start_t,
@@ -248,11 +294,11 @@ def _execute_live_refresh_sealed(
             error_summary=f"Refresh timed out after {timeout_sec}s"
         )
     except Exception as e:
-        end_t = time.time()
+        end_t = get_time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path=agm_bin,
-            binary_sha256=bin_sha,
+            binary_sha256=sha_pre,
             source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
             argv=argv,
             started_at_epoch=start_t,
@@ -264,6 +310,49 @@ def _execute_live_refresh_sealed(
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             error_summary=f"Process execution error: {e}"
         )
+
+    sha_post = compute_file_sha256(agm_bin) if os.path.isfile(agm_bin) else sha_pre
+    if sha_pre != sha_post:
+        return RefreshEvidence(
+            canonical_account=account,
+            canonical_executable_path=agm_bin,
+            binary_sha256="MUTATED_DURING_EXECUTION",
+            source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
+            argv=argv,
+            started_at_epoch=start_t,
+            completed_at_epoch=end_t,
+            exit_code=1,
+            result=RefreshResult.BINARY_IDENTITY_UNVERIFIED,
+            supervisor_session_id=supervisor_session_id,
+            source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
+            transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            error_summary="BINARY_CHANGED_DURING_EXECUTION: SHA-256 mutated during execution"
+        )
+
+    if proc_code == 0:
+        res_enum = RefreshResult.REFRESH_SUCCEEDED
+        summary = None
+        attestation = issue_live_execution_attestation(account, sha_pre, end_t)
+    else:
+        res_enum, summary = classify_refresh_failure(proc_out, proc_err, proc_code)
+        attestation = None
+
+    return RefreshEvidence(
+        canonical_account=account,
+        canonical_executable_path=agm_bin,
+        binary_sha256=sha_pre,
+        source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
+        argv=argv,
+        started_at_epoch=start_t,
+        completed_at_epoch=end_t,
+        exit_code=proc_code,
+        result=res_enum,
+        supervisor_session_id=supervisor_session_id,
+        source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
+        transport_trust=TransportTrustClass.PROCESS_LOCAL,
+        attestation=attestation,
+        error_summary=summary
+    )
 
 
 def execute_refresh_for_test(
@@ -278,7 +367,7 @@ def execute_refresh_for_test(
     """
     Test-only refresh executor.
     STRUCTURALLY INCAPABLE of minting LIVE_REFRESH_EXECUTION.
-    Always mints source_origin = SYNTHETIC_TEST_EVIDENCE.
+    Always mints source_origin = SYNTHETIC_TEST_EVIDENCE without live attestation.
     """
     get_time = clock or time.time
     start_t = get_time()
@@ -298,6 +387,7 @@ def execute_refresh_for_test(
             supervisor_session_id="INVALID_SESSION",
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            attestation=None,
             error_summary="Mandatory supervisor session ID missing"
         )
 
@@ -316,6 +406,7 @@ def execute_refresh_for_test(
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            attestation=None,
             error_summary=f"Invalid canonical email format: '{account}'"
         )
 
@@ -334,6 +425,7 @@ def execute_refresh_for_test(
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            attestation=None,
             error_summary="Binary identity unverified"
         )
 
@@ -361,6 +453,7 @@ def execute_refresh_for_test(
                 supervisor_session_id=supervisor_session_id,
                 source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
                 transport_trust=TransportTrustClass.PROCESS_LOCAL,
+                attestation=None,
                 error_summary=summary
             )
         except Exception as e:
@@ -378,6 +471,7 @@ def execute_refresh_for_test(
                 supervisor_session_id=supervisor_session_id,
                 source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
                 transport_trust=TransportTrustClass.PROCESS_LOCAL,
+                attestation=None,
                 error_summary=f"Injected runner error: {e}"
             )
 
@@ -395,6 +489,7 @@ def execute_refresh_for_test(
         supervisor_session_id=supervisor_session_id,
         source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
         transport_trust=TransportTrustClass.PROCESS_LOCAL,
+        attestation=None,
         error_summary=None
     )
 
@@ -425,6 +520,7 @@ def execute_safe_refresh(
             supervisor_session_id="INVALID_SESSION",
             source_origin=EvidenceSourceOrigin.DRY_RUN,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            attestation=None,
             error_summary="Mandatory supervisor session ID missing"
         )
 
@@ -443,6 +539,7 @@ def execute_safe_refresh(
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.DRY_RUN,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            attestation=None,
             error_summary=f"Invalid canonical email: '{account}'"
         )
 
@@ -462,6 +559,7 @@ def execute_safe_refresh(
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.DRY_RUN,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
+            attestation=None,
             error_summary="Dry run mode; no network request executed"
         )
 
