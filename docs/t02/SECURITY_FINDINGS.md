@@ -1,28 +1,28 @@
-# T02 Security Audit and Findings: AGM Integration (Zero-Trust Round 3 Revision)
+# T02 Security Audit and Findings: AGM Integration (Zero-Trust Round 4 Revision)
 
 ## 1. Threat Model & Provenance Trust Model
 
-### 1.1 RefreshEvidence Trust Model
-- **Process-Local Typed Origin:** Supervisor accepts `RefreshEvidence` instances directly returned from `execute_safe_refresh()` with `origin == EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION`.
-- **HMAC Session Signing:** Serialized evidence across process boundaries requires HMAC-SHA256 signature verification with an ephemeral session secret. Unsigned or mismatched records are classified `UNTRUSTED_DESERIALIZED` / `RESEARCH_ONLY` and rejected.
-- **Synthetic Isolation:** `SYNTHETIC_TEST_EVIDENCE` records are rejected by default in supervisor mode, preventing test artifacts from leaking into production decision paths.
+### 1.1 Transport Trust vs Source Origin Model
+- **Process-Local Execution:** Trusted execution within the same supervisor process mints `source_origin = EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION`, `transport_trust = TransportTrustClass.PROCESS_LOCAL`.
+- **Deserialized Payloads:** All deserialized JSON/dict inputs are initialized as `transport_trust = TransportTrustClass.UNTRUSTED_DESERIALIZED`. Forged self-declarations of `LIVE_REFRESH_EXECUTION` cannot bypass verification.
+- **HMAC Session Signing:** Cross-process serialized evidence requires HMAC-SHA256 signature verification loaded from `$env:AGM_SESSION_SECRET`. Unsigned payloads fail closed.
+- **Test Isolation:** `execute_refresh_for_test()` is structurally sealed to only mint `SYNTHETIC_TEST_EVIDENCE`.
 
-### 1.2 Credential Store Scope & Isolation
-- **Target Restriction:** T02 safe wrapper strictly restricts target to `"agy"`, operating solely against Windows Credential Manager `gemini:antigravity`.
-- **Non-Interference:** T02 does not touch IDE SQLite databases or kill Desktop processes.
-- **Host Test Isolation:** All unit and synthetic test suites utilize dependency-injected mock runners and verifiers, ensuring 100% host vault isolation (zero reads, zero writes).
+### 1.2 Target Scope Restriction
+- T02 safe switch is restricted strictly to `--target agy`, writing exclusively to Windows Credential Manager `gemini:antigravity`. Targets `ide` and `all` are rejected.
 
 ---
 
-## 2. Production Log Exposure & Output Redaction (Item 16)
+## 2. Production Log Exposure & Output Redaction (Item 8)
 
-- **Default Output:** Emits only sanitized metadata: `account_ref`, `status`, `target_product`, `scope`, `desktop_adoption_status`, `exit_code`.
-- **Diagnostic Mode:** Raw subprocess stderr/stdout and token fingerprint prefixes are sequestered behind explicit `--diagnostic-mode` flags.
+- **Default Output:** Emits pseudonymous account references (`acc_<sha256_prefix>`), status enums, exit codes, and sanitized messages.
+- **Private Diagnostic Mode:** Raw account emails, subprocess streams (`agm_stdout`, `agm_stderr`), and token SHA-256 fingerprint prefixes are isolated behind `--private-diagnostic-mode`.
 - **Zero Raw Secret Exposure:** Raw OAuth tokens (`access_token`, `refresh_token`) are NEVER logged, printed, or persisted.
 
 ---
 
-## 3. Incident Post-Mortem Status
+## 3. Host Credential Incident Status (Item 10)
 
 - **Status:** `HOST_CREDENTIAL_RESTORATION = UNKNOWN`.
-- Active credential target is restored; mock test decoupling via dependency injection permanently prevents test-runner mutation of host OS credentials.
+- Historical byte-for-byte token payload equality prior to synthetic testing cannot be proven without historical secret storage.
+- All test suites are globally trapped with zero host vault reads/writes.

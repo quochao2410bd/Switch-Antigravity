@@ -2,24 +2,21 @@
 """
 inspect_quota.py
 
-Safe read-only parser and normalizer for AGM (Antigravity Manager) quota output.
-Converts table output into a structured, typed AccountQuota schema
-with strict RefreshEvidence trust invariant validation and fail-closed schema checks.
+Safe read-only parser and normalizer for AGM quota output (Round 4 Architecture).
 
-Trust Model:
-1. Process-Local Trust & HMAC Session Signing.
-2. Origin Invariant: Production freshness requires EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION.
-   Synthetic test evidence is strictly forbidden from supervisor production mode.
-3. Strict Invariant Checking:
-   - result == REFRESH_SUCCEEDED
-   - exit_code == 0
-   - canonical email RFC 5322 match
-   - command exact binding
-   - trusted AGM executable and supported AGM version
-   - mandatory supervisor session ID match
-   - start_t <= completed_t <= now + clock_skew (max 2.0s)
-   - age <= max_freshness_age_sec (300.0s) and duration sane
-4. Both List mode and Info mode fail closed on unexpected / corrupted table schemas.
+Core Trust Principles:
+1. Deserialized JSON Cannot Choose Its Own Trust Class (Critical Item 1):
+   - All deserialized dicts/JSON start strictly as UNTRUSTED_DESERIALIZED.
+   - Only valid HMAC-SHA256 verification elevates to SIGNED_DESERIALIZED.
+2. Production Supervisor API Has No Test-Weakening Flags (Item 12):
+   - validate_refresh_evidence_supervisor strictly requires LIVE_REFRESH_EXECUTION and PROCESS_LOCAL/SIGNED_DESERIALIZED.
+3. Exact Argv Equality (Item 3):
+   - Validates [canonical_executable_path, "refresh", canonical_account] element-by-element. No suffix matching.
+4. Binary Identity Binding (Item 4):
+   - Checks binary_sha256 and source_revision_inspected.
+5. Strict Table Schema Enforcement (Item 6):
+   - List mode: EMAIL, STATUS, GEM-PRO, GEM-FLASH, CLAUDE in exact order.
+   - Info mode: PROVIDER, MODEL, SCORE, RESET in exact order.
 """
 
 from __future__ import annotations
@@ -35,13 +32,13 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 
-# Add current dir to path to import refresh_quota_safe
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from refresh_quota_safe import (
-    SUPPORTED_AGM_VERSIONS,
-    EvidenceTrustOrigin,
+    INSPECTED_AGM_SOURCE_REVISION,
+    EvidenceSourceOrigin,
     RefreshEvidence,
     RefreshResult,
+    TransportTrustClass,
     is_canonical_email,
     verify_evidence_signature,
 )
@@ -107,69 +104,91 @@ def parse_percentage_field(val: str) -> Optional[int]:
     return None
 
 
-def validate_refresh_evidence(
+def deserialize_evidence_payload(
+    payload: dict,
+    session_secret: Optional[str] = None
+) -> Tuple[Optional[RefreshEvidence], List[str]]:
+    """
+    Safely deserializes a JSON/dict payload.
+    CRITICAL SECURITY INVARIANT:
+    All deserialized payloads are initialized as UNTRUSTED_DESERIALIZED regardless of fields.
+    Only successful HMAC verification elevates transport_trust to SIGNED_DESERIALIZED.
+    """
+    warnings: List[str] = []
+    try:
+        res_val = payload.get("result")
+        res_enum = RefreshResult(res_val) if isinstance(res_val, str) else res_val
+        orig_val = payload.get("source_origin") or payload.get("origin")
+        orig_enum = EvidenceSourceOrigin(orig_val) if isinstance(orig_val, str) else orig_val
+
+        evidence = RefreshEvidence(
+            canonical_account=payload.get("canonical_account", ""),
+            canonical_executable_path=payload.get("canonical_executable_path", payload.get("agm_executable", "")),
+            binary_sha256=payload.get("binary_sha256", "UNKNOWN_SHA256"),
+            source_revision_inspected=payload.get("source_revision_inspected", INSPECTED_AGM_SOURCE_REVISION),
+            argv=payload.get("argv", []),
+            started_at_epoch=float(payload.get("started_at_epoch", 0.0)),
+            completed_at_epoch=float(payload.get("completed_at_epoch", 0.0)),
+            exit_code=int(payload.get("exit_code", 1)),
+            result=res_enum,
+            supervisor_session_id=payload.get("supervisor_session_id", ""),
+            source_origin=orig_enum,
+            transport_trust=TransportTrustClass.UNTRUSTED_DESERIALIZED,  # Forced untrusted!
+            hmac_signature=payload.get("hmac_signature"),
+            error_summary=payload.get("error_summary")
+        )
+
+        if session_secret and evidence.hmac_signature:
+            if verify_evidence_signature(evidence, session_secret):
+                evidence.transport_trust = TransportTrustClass.SIGNED_DESERIALIZED
+            else:
+                warnings.append("HMAC signature verification failed for serialized evidence")
+        return evidence, warnings
+    except Exception as e:
+        warnings.append(f"Malformed serialized evidence dict: {e}")
+        return None, warnings
+
+
+def _validate_refresh_evidence_internal(
     evidence: Optional[Union[RefreshEvidence, dict]],
     canonical_account: str,
     now_epoch: float,
+    expected_session_id: str,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
-    expected_session_id: Optional[str] = None,
     session_secret: Optional[str] = None,
-    allow_synthetic_test_origin: bool = False
+    allow_synthetic_test: bool = False
 ) -> Tuple[FreshnessState, Optional[float], List[str]]:
-    """
-    Validates a RefreshEvidence record against all production trust invariants.
-    Returns (FreshnessState, refresh_confirmed_at_epoch, warnings).
-    """
     warnings: List[str] = []
     if evidence is None:
         return FreshnessState.STALE_CACHED, None, ["No refresh evidence provided; treating cached quota as STALE_CACHED"]
 
-    # Convert dict to RefreshEvidence if needed (tagged as UNTRUSTED_DESERIALIZED unless verified)
     if isinstance(evidence, dict):
-        try:
-            res_val = evidence.get("result")
-            res_enum = RefreshResult(res_val) if isinstance(res_val, str) else res_val
-            orig_val = evidence.get("origin", EvidenceTrustOrigin.UNTRUSTED_DESERIALIZED.value)
-            orig_enum = EvidenceTrustOrigin(orig_val) if isinstance(orig_val, str) else orig_val
-            evidence = RefreshEvidence(
-                canonical_account=evidence.get("canonical_account", ""),
-                agm_executable=evidence.get("agm_executable", ""),
-                agm_version_or_revision=evidence.get("agm_version_or_revision", "UNKNOWN_VERSION"),
-                command=evidence.get("command", ""),
-                started_at_epoch=float(evidence.get("started_at_epoch", 0.0)),
-                completed_at_epoch=float(evidence.get("completed_at_epoch", 0.0)),
-                exit_code=int(evidence.get("exit_code", 1)),
-                result=res_enum,
-                supervisor_session_id=evidence.get("supervisor_session_id", ""),
-                origin=orig_enum,
-                hmac_signature=evidence.get("hmac_signature"),
-                error_summary=evidence.get("error_summary")
-            )
-        except Exception as e:
-            return FreshnessState.STALE_CACHED, None, [f"Malformed RefreshEvidence record: {e}"]
+        ev_obj, deser_warn = deserialize_evidence_payload(evidence, session_secret=session_secret)
+        warnings.extend(deser_warn)
+        if ev_obj is None:
+            return FreshnessState.STALE_CACHED, None, ["Failed to deserialize evidence dict"]
+        evidence = ev_obj
 
-    # INVARIANT 1: Origin Validation (Item 2)
-    if evidence.origin == EvidenceTrustOrigin.SYNTHETIC_TEST_EVIDENCE:
-        if not allow_synthetic_test_origin:
+    # 1. Transport Trust Check (Critical Item 1)
+    if evidence.transport_trust == TransportTrustClass.UNTRUSTED_DESERIALIZED:
+        return FreshnessState.STALE_CACHED, None, [
+            "Untrusted deserialized evidence without verified HMAC signature is rejected in supervisor mode"
+        ]
+
+    # 2. Source Origin Check (Critical Item 2)
+    if evidence.source_origin == EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE:
+        if not allow_synthetic_test:
             return FreshnessState.STALE_CACHED, None, [
-                "Synthetic test evidence is prohibited from establishing production PROVEN_FRESH status"
+                "Synthetic test evidence is strictly forbidden from establishing production PROVEN_FRESH status"
             ]
-        warnings.append("Validated under synthetic test origin mode")
-    elif evidence.origin == EvidenceTrustOrigin.DRY_RUN:
+        warnings.append("Validated under explicit test mode")
+    elif evidence.source_origin == EvidenceSourceOrigin.DRY_RUN:
         return FreshnessState.STALE_CACHED, None, ["Dry-run evidence cannot establish freshness"]
-    elif evidence.origin == EvidenceTrustOrigin.UNTRUSTED_DESERIALIZED:
-        if session_secret and evidence.hmac_signature:
-            if not verify_evidence_signature(evidence, session_secret):
-                return FreshnessState.STALE_CACHED, None, ["HMAC signature verification failed for serialized evidence"]
-        else:
-            return FreshnessState.STALE_CACHED, None, [
-                "Unsigned deserialized evidence is unverified across trust boundary; rejected in production mode"
-            ]
-    elif evidence.origin != EvidenceTrustOrigin.LIVE_REFRESH_EXECUTION:
-        return FreshnessState.STALE_CACHED, None, [f"Unknown evidence origin: '{evidence.origin}'"]
+    elif evidence.source_origin != EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION:
+        return FreshnessState.STALE_CACHED, None, [f"Unknown evidence source origin: '{evidence.source_origin}'"]
 
-    # INVARIANT 2: Account Exact Match (Item 3)
+    # 3. Canonical Account Exact Match (RFC 5322)
     if not is_canonical_email(evidence.canonical_account):
         return FreshnessState.STALE_CACHED, None, [f"Refresh evidence account '{evidence.canonical_account}' is non-canonical"]
     if evidence.canonical_account.lower() != canonical_account.lower():
@@ -177,22 +196,29 @@ def validate_refresh_evidence(
             f"Refresh evidence account mismatch (expected '{canonical_account}', got '{evidence.canonical_account}')"
         ]
 
-    # INVARIANT 3: Command Exact Binding (Item 3)
-    expected_cmd = f"agm refresh {evidence.canonical_account}"
-    if evidence.command.strip() != expected_cmd and not evidence.command.endswith(f"refresh {evidence.canonical_account}"):
+    # 4. Exact Argv Equality Check (Item 3 - No Suffix Matching!)
+    expected_argv = [evidence.canonical_executable_path, "refresh", evidence.canonical_account]
+    if (
+        len(evidence.argv) != 3
+        or evidence.argv[0] != evidence.canonical_executable_path
+        or evidence.argv[1] != "refresh"
+        or evidence.argv[2].lower() != canonical_account.lower()
+    ):
         return FreshnessState.STALE_CACHED, None, [
-            f"Refresh evidence command mismatch (expected '{expected_cmd}', got '{evidence.command}')"
+            f"Exact argv mismatch (expected {expected_argv}, got {evidence.argv})"
         ]
 
-    # INVARIANT 4: Trusted Executable & Known Version (Item 3 & 5)
-    if not evidence.agm_executable or evidence.agm_executable == "none":
-        return FreshnessState.STALE_CACHED, None, ["Refresh evidence lacks valid AGM executable path"]
-    if evidence.agm_version_or_revision == "UNKNOWN_VERSION" or evidence.agm_version_or_revision not in SUPPORTED_AGM_VERSIONS:
+    # 5. Binary Identity Binding (Item 4)
+    if not evidence.canonical_executable_path or evidence.canonical_executable_path == "none":
+        return FreshnessState.STALE_CACHED, None, ["Refresh evidence lacks valid canonical executable path"]
+    if not evidence.binary_sha256 or evidence.binary_sha256 == "UNKNOWN_SHA256":
+        return FreshnessState.STALE_CACHED, None, ["AGM binary SHA-256 identity is unverified; fail closed"]
+    if evidence.source_revision_inspected != INSPECTED_AGM_SOURCE_REVISION:
         return FreshnessState.STALE_CACHED, None, [
-            f"AGM version '{evidence.agm_version_or_revision}' is unverified or unsupported; fail closed"
+            f"AGM source revision mismatch (expected '{INSPECTED_AGM_SOURCE_REVISION}', got '{evidence.source_revision_inspected}')"
         ]
 
-    # INVARIANT 5: Session ID Exact Match (Item 3 & 4)
+    # 6. Mandatory Session ID Check
     if not expected_session_id or not expected_session_id.strip():
         return FreshnessState.STALE_CACHED, None, ["Mandatory supervisor expected_session_id was omitted in validation"]
     if evidence.supervisor_session_id != expected_session_id:
@@ -200,7 +226,7 @@ def validate_refresh_evidence(
             f"Session ID mismatch (expected '{expected_session_id}', got '{evidence.supervisor_session_id}')"
         ]
 
-    # INVARIANT 6: Result & Exit Code Consistency (Item 3)
+    # 7. Result & Exit Code Consistency
     if evidence.result != RefreshResult.REFRESH_SUCCEEDED:
         return FreshnessState.REFRESH_FAILED, None, [
             f"Refresh failed with status {evidence.result.value}: {evidence.error_summary or 'non-zero exit'}"
@@ -210,27 +236,23 @@ def validate_refresh_evidence(
             f"Contradictory evidence: status is REFRESH_SUCCEEDED but exit_code is {evidence.exit_code}; fail closed"
         ]
 
-    # INVARIANT 7: Timestamp Ordering & Monotonicity (Item 3)
+    # 8. Monotonic Timestamps & Sane Duration
     if evidence.started_at_epoch > evidence.completed_at_epoch:
         return FreshnessState.STALE_CACHED, None, [
             f"Invalid timestamp monotonicity: started ({evidence.started_at_epoch}) > completed ({evidence.completed_at_epoch})"
         ]
-
-    # INVARIANT 8: Sane Duration (Item 3)
     duration = evidence.completed_at_epoch - evidence.started_at_epoch
     if duration > 60.0 or duration < 0.0:
         return FreshnessState.STALE_CACHED, None, [
             f"Insane execution duration: {duration:.2f}s (must be between 0.0s and 60.0s)"
         ]
 
-    # INVARIANT 9: Clock Skew & Future Timestamp Rejection (Item 3)
+    # 9. Clock Skew Ceiling & Freshness Expiration
     future_skew = evidence.completed_at_epoch - now_epoch
     if future_skew > allowed_clock_skew_sec:
         return FreshnessState.STALE_CACHED, None, [
             f"Refresh completed_at is in the future by {future_skew:.2f}s (> allowed skew {allowed_clock_skew_sec}s); rejected"
         ]
-
-    # INVARIANT 10: Freshness Expiration Window (Item 3)
     age = now_epoch - evidence.completed_at_epoch
     if age > max_freshness_age_sec:
         return FreshnessState.STALE_CACHED, evidence.completed_at_epoch, [
@@ -238,6 +260,53 @@ def validate_refresh_evidence(
         ]
 
     return FreshnessState.PROVEN_FRESH, evidence.completed_at_epoch, warnings
+
+
+def validate_refresh_evidence_supervisor(
+    evidence: Optional[Union[RefreshEvidence, dict]],
+    canonical_account: str,
+    now_epoch: float,
+    expected_session_id: str,
+    max_freshness_age_sec: float = 300.0,
+    allowed_clock_skew_sec: float = 2.0,
+    session_secret: Optional[str] = None
+) -> Tuple[FreshnessState, Optional[float], List[str]]:
+    """
+    Production supervisor validation entry point.
+    NO TEST-WEAKENING FLAGS EXPOSED (Item 12).
+    """
+    return _validate_refresh_evidence_internal(
+        evidence=evidence,
+        canonical_account=canonical_account,
+        now_epoch=now_epoch,
+        expected_session_id=expected_session_id,
+        max_freshness_age_sec=max_freshness_age_sec,
+        allowed_clock_skew_sec=allowed_clock_skew_sec,
+        session_secret=session_secret,
+        allow_synthetic_test=False
+    )
+
+
+def _validate_refresh_evidence_for_test(
+    evidence: Optional[Union[RefreshEvidence, dict]],
+    canonical_account: str,
+    now_epoch: float,
+    expected_session_id: str,
+    max_freshness_age_sec: float = 300.0,
+    allowed_clock_skew_sec: float = 2.0,
+    session_secret: Optional[str] = None
+) -> Tuple[FreshnessState, Optional[float], List[str]]:
+    """Test-only validation harness."""
+    return _validate_refresh_evidence_internal(
+        evidence=evidence,
+        canonical_account=canonical_account,
+        now_epoch=now_epoch,
+        expected_session_id=expected_session_id,
+        max_freshness_age_sec=max_freshness_age_sec,
+        allowed_clock_skew_sec=allowed_clock_skew_sec,
+        session_secret=session_secret,
+        allow_synthetic_test=True
+    )
 
 
 def parse_agm_list(
@@ -248,22 +317,18 @@ def parse_agm_list(
     source_label: str = "AGM_CLI_LIST",
     supervisor_session_id: Optional[str] = None,
     session_secret: Optional[str] = None,
-    allow_synthetic_test_origin: bool = False,
     lenient_parser: bool = False,
-    now_epoch: Optional[float] = None
+    now_epoch: Optional[float] = None,
+    _test_mode_allow_synthetic: bool = False
 ) -> List[AccountQuotaSummary]:
     """
-    Parses the standard output of `agm list`.
-    Enforces strict table header validation and RefreshEvidence trust invariants.
+    Parses `agm list` output with strict table header validation.
     """
     now = now_epoch if now_epoch is not None else time.time()
     ev_map = refresh_evidence_map or {}
 
     lines = text.strip().splitlines()
-    if not lines:
-        return []
-
-    if any("No accounts yet" in line for line in lines):
+    if not lines or any("No accounts yet" in line for line in lines):
         return []
 
     results: List[AccountQuotaSummary] = []
@@ -273,7 +338,6 @@ def parse_agm_list(
 
     for line in lines:
         if "EMAIL" in line and "STATUS" in line and "GEM-PRO" in line and "GEM-FLASH" in line and "CLAUDE" in line:
-            header_found = True
             email_idx = line.find("EMAIL")
             status_idx = line.find("STATUS")
             gp_idx = line.find("GEM-PRO")
@@ -281,6 +345,7 @@ def parse_agm_list(
             cl_idx = line.find("CLAUDE")
             if email_idx < status_idx < gp_idx < gf_idx < cl_idx:
                 col_bounds = (email_idx, status_idx, gp_idx, gf_idx, cl_idx)
+                header_found = True
                 format_state = FormatSupportState.FORMAT_SUPPORTED
             break
 
@@ -309,11 +374,7 @@ def parse_agm_list(
 
     for line in lines:
         line_clean = line.strip()
-        if not line_clean:
-            continue
-        if "EMAIL" in line and "STATUS" in line:
-            continue
-        if line_clean.startswith("---") or line_clean.startswith("==="):
+        if not line_clean or ("EMAIL" in line and "STATUS" in line) or line_clean.startswith("---") or line_clean.startswith("==="):
             continue
 
         warnings: List[str] = []
@@ -360,14 +421,14 @@ def parse_agm_list(
             freshness = FreshnessState.STALE_CACHED
             ref_confirmed_at = None
         elif email_part in ev_map:
-            freshness, ref_confirmed_at, ev_warn = validate_refresh_evidence(
+            val_func = _validate_refresh_evidence_for_test if _test_mode_allow_synthetic else validate_refresh_evidence_supervisor
+            freshness, ref_confirmed_at, ev_warn = val_func(
                 ev_map[email_part],
                 canonical_account=email_part,
                 now_epoch=now,
                 max_freshness_age_sec=max_freshness_age_sec,
-                expected_session_id=supervisor_session_id,
-                session_secret=session_secret,
-                allow_synthetic_test_origin=allow_synthetic_test_origin
+                expected_session_id=supervisor_session_id or "",
+                session_secret=session_secret
             )
             warnings.extend(ev_warn)
         elif all(v is None for v in [gp_val, gf_val, cl_val]):
@@ -419,12 +480,12 @@ def parse_agm_info(
     source_label: str = "AGM_CLI_INFO",
     supervisor_session_id: Optional[str] = None,
     session_secret: Optional[str] = None,
-    allow_synthetic_test_origin: bool = False,
-    now_epoch: Optional[float] = None
+    now_epoch: Optional[float] = None,
+    _test_mode_allow_synthetic: bool = False
 ) -> Optional[AccountQuotaSummary]:
     """
-    Parses output of `agm info <email>`.
-    Fails closed if the model table format is corrupted or missing expected headers.
+    Parses `agm info <email>` output with STRICT table header verification (Item 6).
+    Enforces exact column order: PROVIDER, MODEL, SCORE, RESET.
     """
     now = now_epoch if now_epoch is not None else time.time()
     lines = text.strip().splitlines()
@@ -448,19 +509,24 @@ def parse_agm_info(
                 is_expired = True
         elif "No quota data" in line_clean:
             warnings.append("No quota data recorded in store")
-        elif "PROVIDER" in line and "MODEL" in line and "SCORE" in line:
-            header_found = True
-            in_table = True
+        elif "PROVIDER" in line:
+            # Strict column header check (Item 6)
+            tokens = line_clean.split()
+            if tokens == ["PROVIDER", "MODEL", "SCORE", "RESET"]:
+                header_found = True
+                in_table = True
+            else:
+                warnings.append(f"Info table header deviation: expected ['PROVIDER', 'MODEL', 'SCORE', 'RESET'], got {tokens}")
             continue
         elif line_clean.startswith("---") or line_clean.startswith("==="):
             continue
         elif in_table and line_clean:
             tokens = line_clean.split()
-            if len(tokens) >= 3:
+            if len(tokens) >= 4:
                 provider = tokens[0]
                 model = tokens[1]
                 score_str = tokens[2]
-                reset_str = tokens[3] if len(tokens) > 3 else None
+                reset_str = tokens[3]
                 if reset_str and not earliest_reset:
                     earliest_reset = reset_str
                 pct = parse_percentage_field(score_str)
@@ -474,29 +540,30 @@ def parse_agm_info(
                     reset_time=reset_str,
                     freshness_state=FreshnessState.STALE_CACHED
                 )
+            else:
+                warnings.append(f"Info row column count mismatch: '{line_clean}'")
 
     if not email:
         return None
 
-    # Fail closed if table header was missing or corrupted in info output
     format_state = FormatSupportState.FORMAT_SUPPORTED if header_found else FormatSupportState.FORMAT_UNSUPPORTED
     if not header_found:
-        warnings.append("AGM info output missing expected PROVIDER/MODEL/SCORE headers; fail closed")
+        warnings.append("AGM info output missing or deviated from expected table header schema; fail closed")
 
-    # Validate provenance for info mode
+    # Validate provenance
     if raw_unvalidated_timestamp is not None:
         warnings.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
         freshness = FreshnessState.STALE_CACHED
         ref_confirmed_at = None
     elif refresh_evidence is not None:
-        freshness, ref_confirmed_at, ev_warn = validate_refresh_evidence(
+        val_func = _validate_refresh_evidence_for_test if _test_mode_allow_synthetic else validate_refresh_evidence_supervisor
+        freshness, ref_confirmed_at, ev_warn = val_func(
             refresh_evidence,
             canonical_account=email,
             now_epoch=now,
             max_freshness_age_sec=max_freshness_age_sec,
-            expected_session_id=supervisor_session_id,
-            session_secret=session_secret,
-            allow_synthetic_test_origin=allow_synthetic_test_origin
+            expected_session_id=supervisor_session_id or "",
+            session_secret=session_secret
         )
         warnings.extend(ev_warn)
     elif len(models) == 0:
@@ -546,16 +613,15 @@ def parse_agm_info(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inspect and normalize AGM quota output with validated provenance.")
+    parser = argparse.ArgumentParser(description="Inspect and normalize AGM quota output.")
     parser.add_argument("--file", "-f", help="Read raw AGM output from file")
     parser.add_argument("--mode", "-m", choices=["list", "info", "auto"], default="auto", help="Parsing mode")
     parser.add_argument("--session-id", help="Mandatory supervisor session ID for production validation")
-    parser.add_argument("--session-secret", help="Optional secret for HMAC evidence signature verification")
     parser.add_argument("--provenance-json", help="Optional JSON dict of RefreshEvidence mapping email -> record")
-    parser.add_argument("--allow-synthetic-test", action="store_true", help="Explicit test mode to allow synthetic origin")
     parser.add_argument("--research-lenient-parser", action="store_true", help="Enable research fallback tokenization")
     args = parser.parse_args()
 
+    session_secret = os.environ.get("AGM_SESSION_SECRET")
     ev_map = {}
     if args.provenance_json:
         try:
@@ -591,8 +657,7 @@ def main():
             content,
             refresh_evidence=first_ev,
             supervisor_session_id=args.session_id,
-            session_secret=args.session_secret,
-            allow_synthetic_test_origin=args.allow_synthetic_test
+            session_secret=session_secret
         )
         data = asdict(res) if res else None
     else:
@@ -600,8 +665,7 @@ def main():
             content,
             refresh_evidence_map=ev_map,
             supervisor_session_id=args.session_id,
-            session_secret=args.session_secret,
-            allow_synthetic_test_origin=args.allow_synthetic_test,
+            session_secret=session_secret,
             lenient_parser=args.research_lenient_parser
         )
         data = [asdict(r) for r in res_list]

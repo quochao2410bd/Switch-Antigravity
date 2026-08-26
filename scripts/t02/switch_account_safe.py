@@ -2,19 +2,16 @@
 """
 switch_account_safe.py
 
-Hardened, safety-first wrapper around AGM account switching for Switch-Antigravity.
+Hardened, safety-first wrapper around AGM account switching for Switch-Antigravity (Round 4).
 
 Safety Constraints & Outcome Model:
 1. Strict Scope: Target restricted exclusively to 'agy' (Credential Store only).
-   'ide' and 'all' targets are strictly rejected.
-2. No Desktop Termination: Does NOT force-kill or restart Antigravity.exe (managed by coordinator).
-3. Canonical Email Enforcement: Rejects non-canonical aliases.
-4. Exit Code Contract:
+2. Default Account Pseudonymization: Outputs pseudonymous account_ref by default; raw email only in private diagnostic mode.
+3. Exit Code Contract:
    - 0: CREDENTIAL_IDENTITY_VERIFIED (Vault written + Google userinfo identity confirmed)
    - 1: FAILURE (Command failed, verify mismatch, invalid input, wildcard rejected)
    - 2: SWITCH_WRITTEN_UNVERIFIED (Vault written + identity unverified/offline)
    - 3: DRY_RUN (Simulation mode; no OS changes)
-5. Log Redaction: Clean, safe default output; raw stderr/stdout isolated to diagnostic mode.
 """
 
 from __future__ import annotations
@@ -28,12 +25,13 @@ import sys
 from enum import Enum
 from typing import Callable, Optional
 
-# Add current dir to path to import verify_active_account and refresh_quota_safe
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from refresh_quota_safe import is_canonical_email
+from refresh_quota_safe import find_canonical_agm_executable, is_canonical_email
 from verify_active_account import (
     CredentialVerificationStatus,
     VerificationResult,
+    format_verification_output,
+    pseudonymize_account,
     verify_active_account,
 )
 
@@ -49,38 +47,21 @@ class SwitchOutcome(str, Enum):
     AGM_NOT_FOUND = "AGM_NOT_FOUND"
 
 
-def find_agm_executable() -> Optional[str]:
-    agm_exe = shutil.which("agm")
-    if agm_exe:
-        return agm_exe
-
-    candidates = [
-        os.path.join(os.environ.get("TEMP", ""), "agm.exe"),
-        os.path.expanduser(r"~\.local\bin\agm.exe"),
-        os.path.expanduser(r"~\go\bin\agm.exe"),
-        os.path.expanduser(r"~\bin\agm.exe"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
 def execute_safe_switch(
     account: str,
     target: str = "agy",
     confirm: bool = False,
     introspect_network: bool = False,
-    diagnostic_mode: bool = False,
-    agm_runner: Optional[Callable[[List[str], int], Tuple[int, str, str]]] = None,
+    private_diagnostic_mode: bool = False,
+    agm_runner: Optional[Callable[[list, int], tuple]] = None,
     verifier: Optional[Callable[[Optional[str], bool], VerificationResult]] = None,
     executable_resolver: Optional[Callable[[], Optional[str]]] = None
 ) -> dict:
     """
     Safely executes an AGM account switch for the 'agy' target.
-    Uses dependency injection for agm_runner, verifier, and executable_resolver for 100% test isolation.
     """
     verify_func = verifier or (lambda exp, net: verify_active_account(expected_account=exp, introspect_network=net))
+    pseudonymous_ref = pseudonymize_account(account)
 
     if not account or not account.strip():
         return {
@@ -103,7 +84,6 @@ def execute_safe_switch(
             "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
-    # Item 6: Enforce canonical email only
     if not is_canonical_email(account):
         return {
             "status": SwitchOutcome.INVALID_ARGUMENT.value,
@@ -114,7 +94,6 @@ def execute_safe_switch(
             "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
-    # Item 11: Narrow target scope strictly to 'agy'
     if target != "agy":
         return {
             "status": SwitchOutcome.INVALID_ARGUMENT.value,
@@ -126,23 +105,22 @@ def execute_safe_switch(
         }
 
     if not confirm:
-        # Item 14: Use injected verifier or probe safely
         pre_verification = verify_func(None, False)
         out = {
             "status": SwitchOutcome.DRY_RUN.value,
-            "target_account": account,
+            "account_ref": pseudonymous_ref,
             "target_product": target,
             "message": "Dry-run mode: no changes applied. Pass --confirm to execute switch.",
             "exit_code": 3,
             "scope": "CREDENTIAL_STORE_ONLY",
             "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
-        if diagnostic_mode:
-            out["pre_switch_state"] = pre_verification.__dict__
+        if private_diagnostic_mode:
+            out["raw_target_account"] = account
+            out["pre_switch_state"] = format_verification_output(pre_verification, private_diagnostic=True)
         return out
 
-    # Locate AGM binary
-    get_bin = executable_resolver or find_agm_executable
+    get_bin = executable_resolver or find_canonical_agm_executable
     agm_bin = get_bin()
     if not agm_bin:
         return {
@@ -154,7 +132,6 @@ def execute_safe_switch(
             "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
-    # Execute AGM switch via injected runner or subprocess
     cmd = [agm_bin, "switch", account, "--target", target]
     if agm_runner is not None:
         try:
@@ -196,22 +173,21 @@ def execute_safe_switch(
     if exit_code != 0:
         out = {
             "status": SwitchOutcome.SWITCH_COMMAND_FAILED.value,
-            "target_account": account,
+            "account_ref": pseudonymous_ref,
             "agm_exit_code": exit_code,
             "message": f"AGM switch exited with code {exit_code}",
             "exit_code": 1,
             "scope": "CREDENTIAL_STORE_ONLY",
             "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
-        if diagnostic_mode:
+        if private_diagnostic_mode:
+            out["raw_target_account"] = account
             out["agm_stdout"] = stdout.strip()
             out["agm_stderr"] = stderr.strip()
         return out
 
-    # Post-switch independent verification
     post_verification = verify_func(account, introspect_network)
 
-    # Determine explicit outcome & exit code contract (Item 5)
     if post_verification.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED:
         outcome = SwitchOutcome.CREDENTIAL_IDENTITY_VERIFIED
         overall_exit = 0
@@ -224,7 +200,7 @@ def execute_safe_switch(
 
     out = {
         "status": outcome.value,
-        "target_account": account,
+        "account_ref": pseudonymous_ref,
         "target_product": target,
         "agm_command_succeeded": (exit_code == 0),
         "credential_store_written": post_verification.credential_present,
@@ -234,11 +210,12 @@ def execute_safe_switch(
         "scope": "CREDENTIAL_STORE_ONLY",
         "exit_code": overall_exit
     }
-    if diagnostic_mode:
+    if private_diagnostic_mode:
+        out["raw_target_account"] = account
         out["agm_exit_code"] = exit_code
         out["agm_stdout"] = stdout.strip()
         out["agm_stderr"] = stderr.strip()
-        out["post_switch_state"] = post_verification.__dict__
+        out["post_switch_state"] = format_verification_output(post_verification, private_diagnostic=True)
     return out
 
 
@@ -248,7 +225,7 @@ def main():
     parser.add_argument("--target", "-t", default="agy", choices=["agy"], help="Target product surface (restricted to agy)")
     parser.add_argument("--confirm", action="store_true", help="Confirm execution (without this, dry-run only)")
     parser.add_argument("--network", "-n", action="store_true", help="Perform live Google userinfo introspection")
-    parser.add_argument("--diagnostic-mode", action="store_true", help="Include raw process diagnostics in output")
+    parser.add_argument("--private-diagnostic-mode", action="store_true", help="Include raw account email and process diagnostics")
     args = parser.parse_args()
 
     res = execute_safe_switch(
@@ -256,7 +233,7 @@ def main():
         target=args.target,
         confirm=args.confirm,
         introspect_network=args.network,
-        diagnostic_mode=args.diagnostic_mode
+        private_diagnostic_mode=args.private_diagnostic_mode
     )
     print(json.dumps(res, indent=2))
     sys.exit(res.get("exit_code", 1))
