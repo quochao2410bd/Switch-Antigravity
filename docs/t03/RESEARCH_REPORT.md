@@ -4,134 +4,151 @@
 **Assigned Issue:** #3 — Desktop conversation restore and automatic resume submission  
 **Assigned Branch:** `research/T03-conversation-resume`  
 **Base SHA:** `3377bf7a0523795a678ac5da951371e3f5ee94c7`  
-**Review Iteration:** R3 (Zero-Trust Review Round 2 Compliance)
+**Review Iteration:** R4 (Zero-Trust Review Round 3 Compliance)
 
 ---
 
 ## 1. Executive Summary & Zero-Trust Review Compliance
 
-This updated research package provides verified contracts, automated test suites, and prototype adapters for desktop conversation restoration and resume submission on Antigravity Desktop on Windows.
+This research package provides verified contracts, an automated production-function test suite, and prototype adapters for desktop conversation restoration and resume submission on Antigravity Desktop on Windows.
 
 ### Critical Safety Principles Enforced:
 - **`DO_NOT_SEND` over `POSSIBLY_SEND_TO_WRONG_THREAD`**: Ambiguous target selection or unverified conversation switching results in immediate fail-safe termination.
-- **`DO_NOT_RESEND` over `POSSIBLY_DUPLICATE_RESUME`**: If state is unknown, an agent turn is active, or the prompt signature is already present in conversation history, submission is aborted.
+- **`DO_NOT_RESEND` over `POSSIBLY_DUPLICATE_RESUME`**: If state is unknown, an agent turn is active, previous submission is unconfirmed, or the prompt signature is already present in conversation history, submission is aborted.
 
 ---
 
-## 2. Review Round 2 Corrections
+## 2. Review Round 3 Corrections (Items 1 – 18)
 
 | Item | Problem Addressed | Implementation & Evidence Change | Resulting Classification |
 | :--- | :--- | :--- | :--- |
-| **CDP Discovery** | Removed static fallback `58859` | Dynamic discovery reads `%APPDATA%\Antigravity\DevToolsActivePort`. Returns `CDP_PORT_FILE_MISSING`, `CDP_PORT_FILE_INVALID`, `CDP_ENDPOINT_UNREACHABLE`. | `VERIFIED_LIVE_RUNTIME` / `UNIT_TEST` |
-| **Page Qualification** | Blindly picked `targets[0]` | Enumerate candidates and evaluate independent signals (`hasSidebar`, `hasComposer`, `hasAppConfig`). Returns `APP_PAGE_NOT_FOUND`, `APP_PAGE_AMBIGUOUS`, `APP_PAGE_QUALIFIED`. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Verified Navigation** | Relied on substring and fixed sleep | Exact route check (`pathname === '/c/' + uuid`). Returns `CONVERSATION_SWITCH_VERIFIED`, `CONVERSATION_SWITCH_TIMEOUT`, `CONVERSATION_SWITCH_WRONG_TARGET`. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Duplicate Detection** | Checked generic stop button only | Normalized prompt SHA-256 compared strictly against user messages (`data-author="user"`). Assistant text quoting prompt does not trigger false duplicates. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Scoped Active Turn** | Scanned whole document for stop buttons | Scoped strictly to `main button[aria-label*="Stop"]`, excluding sidebar buttons (`[data-testid="conversation-list-sidebar"]`). Target A stays IDLE when Target B runs. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Baseline Turn Delta** | Pre-existing articles caused false turn start | Baseline captured pre-send (`userMessageCount`, `assistantMessageCount`, `isMainTurnActive`). Post-send evaluates delta against baseline. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Separate States** | Merged user appearance with turn start | Explicit sequence: `SEND_INPUT_DISPATCHED` $\rightarrow$ `USER_MESSAGE_OBSERVED` $\rightarrow$ `ASSISTANT_TURN_STARTED`. Quota failure flags `USER_MESSAGE_OBSERVED_ASSISTANT_PENDING`. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Read-Only Dry-Run** | Default dry run cleared/typed in composer | Default dry-run is strictly read-only. Unsubmitted drafts flag `COMPOSER_DRAFT_PRESENT`. Mutation testing requires `--probe-composer-write`. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Dangerous Override** | Unchecked `--force` flag | Normal `--force` removed. Replaced by explicit `--dangerous-manual-override-do-not-use-in-production`. Autonomous supervisor forbidden from using it. | `UNIT_TEST` |
-| **Exact Title Matching** | Substring title match | Automatic title selection requires exact normalized equality. Multi-match returns `CONVERSATION_AMBIGUOUS`. UUID is canonical selector. | `VERIFIED_LIVE_RUNTIME` / `SYNTHETIC_SIMULATION` |
-| **Journal Integration** | Journal was standalone | `RecoveryJournal` integrated into `send_resume.py`. Writes `SUBMISSION_ATTEMPTED` BEFORE irreversible input dispatch. | `VERIFIED_LIVE_RUNTIME` / `UNIT_TEST` |
-| **Crash Ordering** | Undocumented crash recovery behavior | Detailed state machine transitions and restart rules documented. Unknown state $\rightarrow$ `DO_NOT_RESEND`. | `UNIT_TEST` / `SYNTHETIC_SIMULATION` |
-| **Test Suite** | Untracked missing test script | Committed `scripts/t03/test_suite.py` with 20 test cases covering all failure modes. | `UNIT_TEST` / `SYNTHETIC_SIMULATION` |
-| **Privacy Audit** | Diagnostic tools dumped raw text | Diagnostic tools emit testid counts, element counts, UUIDs, and SHA-256 hashes by default. Full text requires `--verbose-private-data`. | `VERIFIED_LIVE_RUNTIME` |
-| **Documentation Integrity**| Overclaimed production readiness | Downgraded to research prototype, effectively-once guarded recovery protocol, and Session 1 background context. | `VERIFIED_DOC` |
+| **Item 1** | Journal did not control recovery | Implemented `evaluate_recovery_permission()`. Loads latest recovery record before attempt creation. Evaluates DOM state, prompt hash, and journal state to permit or block recovery. | `UNIT_TEST` / `SYNTHETIC_SIMULATION` |
+| **Item 2** | Unknown duplicate state proceeded | `DUPLICATE_STATE_UNKNOWN` now strictly fails closed (`DO_NOT_SEND` / `RECOVERY_STATE_UNKNOWN`) unless proven first attempt on empty conversation. | `UNIT_TEST` |
+| **Item 3** | Journal corruption reset safety state | Corrupted journal returns `JOURNAL_CORRUPTED`, refuses new attempts (`RuntimeError`), and evaluates to terminal `MANUAL_RECONCILIATION_REQUIRED`. | `UNIT_TEST` |
+| **Item 4** | Unclear durability guarantee | Implemented `_write_atomic()` with `flush()`, `os.fsync()`, and `os.replace()`. Documented Windows NTFS transaction journaling guarantee. | `UNIT_TEST` |
+| **Item 5** | Author role heuristic clashed with T0 reports | Removed `startsWith("T0")`. Evaluates semantic DOM markers (`data-author="user"`, `.user-message`). Unresolvable author triggers `DUPLICATE_STATE_UNKNOWN` and fails closed. | `UNIT_TEST` |
+| **Item 6** | Message history queried globally | Scoped all article and button queries strictly to `main [data-testid="conversation-messages"]` or `main`. | `VERIFIED_LIVE_RUNTIME` / `UNIT_TEST` |
+| **Item 7** | Turn delta lacked prompt identity | `USER_MESSAGE_OBSERVED` requires exact normalized SHA-256 prompt hash match in user article history in addition to message delta. | `UNIT_TEST` / `SYNTHETIC_SIMULATION` |
+| **Item 8** | Merged error/quota articles into turn start | Implemented `correlate_turn_status()`. Distinguishes `ASSISTANT_GENERATION_ACTIVE`, `ASSISTANT_GENERATION_COMPLETED`, `QUOTA_ERROR_OBSERVED`, and `ERROR_RESPONSE_OBSERVED`. | `UNIT_TEST` |
+| **Item 9** | Redundant CDP connection | Refactored `QualifiedAntigravityClient` to connect once and reuse the open WebSocket across pipeline operations. | `UNIT_TEST` / `VERIFIED_LIVE_RUNTIME` |
+| **Item 10** | Unfiltered CDP WebSocket frames | Added probe response ID matching (`msg.id == 1001`) in qualification loop, ignoring background CDP event frames. | `UNIT_TEST` / `SYNTHETIC_SIMULATION` |
+| **Item 11** | Regex substring routing | Canonical route is strictly `/c/<uuid>`. Enforced exact pathname equality and parameterized JavaScript arguments. | `VERIFIED_LIVE_RUNTIME` / `UNIT_TEST` |
+| **Item 12** | Tautological unit tests | Refactored `test_suite.py` to invoke actual production functions (`evaluate_recovery_permission`, `RecoveryJournal`, `classify_duplicate_state`, `correlate_turn_status`). | `UNIT_TEST` |
+| **Item 13** | Repeated invocation test | Replaced static test with real multi-step restart test: `SUBMISSION_ATTEMPTED` $\rightarrow$ unconfirmed DOM $\rightarrow$ `PREVIOUS_SUBMISSION_UNCONFIRMED` (NO BLIND RESEND). | `UNIT_TEST` |
+| **Item 14** | Live IDs in committed tree | Replaced all environment-derived UUIDs with deterministic synthetic UUIDs (`00000000-0000-4000-8000-000000000001`). | `VERIFIED_DOC` |
+| **Item 15** | Dry-run active conversation mutation | Implemented navigation-restoring dry-run mode: records initial pathname, inspects target, and navigates back to restore original state. | `VERIFIED_LIVE_RUNTIME` |
+| **Item 16** | Unenforced journal transitions | Implemented `ALLOWED_TRANSITIONS` graph. Illegal transitions (e.g. `TURN_STARTED` $\rightarrow$ `NOT_SENT`) raise `ValueError`. | `UNIT_TEST` |
+| **Item 17** | Generic FAILED for post-dispatch timeout | Introduced `DISPATCHED_UNCONFIRMED` and `failure_stage="POST_IRREVERSIBLE_UNKNOWN"` to strictly prevent blind retry after input dispatch. | `UNIT_TEST` |
+| **Item 18** | Evidence classification precision | Corrected test counts and clearly separated `LIVE_OBSERVED_COMPONENT`, `UNIT_TESTED_BRANCH`, and `NOT_LIVE_TESTED`. | `VERIFIED_DOC` |
 
 ---
 
-## 3. Claim / Evidence Matrix
+## 3. Recovery Decision Table
 
-| Claim | Evidence Class | Test Performed | Raw/Sanitized Artifact | Repro Command | Status | Remaining Gap |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **CDP Discovery** | `VERIFIED_LIVE_RUNTIME` | Read `%APPDATA%\Antigravity\DevToolsActivePort` | Line 1: `58859`, Line 2: `/devtools/browser/...` | `python scripts/t03/probe_cdp.py` | PASS | Hard crash could leave stale file until socket test fails |
-| **CDP Page Qualification** | `VERIFIED_LIVE_RUNTIME` | Connect to target, verify `hasSidebar` & `hasComposer` | Qualification JSON: `hasSidebar: true, hasComposer: true` | `python scripts/t03/probe_cdp.py` | PASS | Detached auxiliary windows must be filtered |
-| **Conversation UUID Identity** | `VERIFIED_LIVE_RUNTIME` | Extract sidebar links `a[href^="/c/"]` | `uuid: "54fa3d23-..."` matching `.db` filename | `python scripts/t03/inspect_desktop.py` | PASS | Account switch visibility depends on backend auth |
-| **Conversation Navigation** | `VERIFIED_LIVE_RUNTIME` | Click sidebar link, poll pathname | `status: "CONVERSATION_SWITCH_VERIFIED"` | `python scripts/t03/send_resume.py --uuid <uuid> --json` | PASS | Network latency on remote backend sync |
-| **Composer Targeting** | `VERIFIED_LIVE_RUNTIME` | Locate `[data-lexical-editor="true"]` | `role: "combobox", ariaLabel: "Message input"` | `python scripts/t03/send_resume.py --uuid <uuid> --json` | PASS | Major Electron UI rework could change tag/attribute |
-| **Message Submission** | `SYNTHETIC_SIMULATION` / `NOT_LIVE_TESTED` | Native CDP `Input.insertText` + Send click | `send_input_dispatched: true` | `scripts/t03/test_suite.py` | PASS | Actual live destructive prompt submission not executed in test |
-| **User Message Observation** | `SYNTHETIC_SIMULATION` | Delta check on user article nodes & prompt hash | `lastUserMessageHash` matching `prompt_sha256` | `scripts/t03/test_suite.py` | PASS | UI rendering delay under heavy CPU load |
-| **Assistant Turn Observation** | `VERIFIED_LIVE_RUNTIME` | Monitor scoped `main button[aria-label*="Stop"]` | `isMainTurnActive: true` | `python scripts/t03/inspect_desktop.py` | PASS | Instantaneous 1-token error might not hold stop button |
-| **Duplicate Prevention** | `VERIFIED_LIVE_RUNTIME` | Inspect history hash and scoped active turn | Status: `TURN_ALREADY_ACTIVE` / `RESUME_MESSAGE_PRESENT` | `python scripts/t03/send_resume.py --uuid <uuid> --json` | PASS | Non-standard prompts without consistent formatting |
-| **Crash Recovery Journal** | `UNIT_TEST` | Atomic state transition & corrupt quarantine | `t03_recovery_journal.json` (.tmp + replace) | `python scripts/t03/test_suite.py` | PASS | OS-level filesystem lock failure |
-| **UIA Limitation** | `OBSERVED_LIVE_RUNTIME` | `uiautomation.GetRootControl().GetChildren()` in Session 1 | `Total root controls enumerated: 0` | `python scripts/t03/inspect_uia.py` | PASS | Requires desktop interactive window station |
+| Previous Journal State | Live DOM State | Expected Prompt Present | Evaluated Decision Code | Action / Permission |
+| :--- | :--- | :--- | :--- | :--- |
+| `None` (First Attempt) | Idle, Clean History | No | `NEW_ATTEMPT_ALLOWED` | Proceed with submission |
+| `None` | Scoped Stop Button Present | Any | `TURN_ALREADY_ACTIVE` | **DO NOT SEND** |
+| `None` | Unsubmitted Draft Present | Any | `BLOCKED_DRAFT_PRESENT` | **DO NOT SEND** |
+| `None` | History contains prompt | Yes | `RESUME_ALREADY_OBSERVED` | **DO NOT SEND** |
+| `NOT_SENT` | Idle, Clean History | No | `NEW_ATTEMPT_ALLOWED` | Proceed with submission |
+| `SUBMISSION_ATTEMPTED` | Prompt confirmed in DOM | Yes | `RESUME_ALREADY_OBSERVED` | **DO NOT RESEND** |
+| `SUBMISSION_ATTEMPTED` | Unconfirmed / Unknown DOM | Unknown / No | `PREVIOUS_SUBMISSION_UNCONFIRMED` | **DO NOT RESEND (BLOCKED)** |
+| `DISPATCHED_UNCONFIRMED`| Unconfirmed / Unknown DOM | Unknown / No | `PREVIOUS_SUBMISSION_UNCONFIRMED` | **DO NOT RESEND (BLOCKED)** |
+| `MESSAGE_OBSERVED` | Any | Any | `RESUME_ALREADY_OBSERVED` | **DO NOT RESEND** |
+| `TURN_STARTED` | Any | Any | `TURN_ALREADY_ACTIVE` | **DO NOT RESEND** |
+| `TURN_ACTIVE` | Any | Any | `TURN_ALREADY_ACTIVE` | **DO NOT RESEND** |
+| `FAILED` (`PRE_IRREVERSIBLE`)| Idle, Clean History | No | `NEW_ATTEMPT_ALLOWED` | Safe to retry |
+| `FAILED` (`POST_IRREVERSIBLE_UNKNOWN`)| Any | Any | `MANUAL_RECONCILIATION_REQUIRED` | **DO NOT RESEND** |
+| Any / `CORRUPTED` | Corrupted JSON file | Any | `JOURNAL_CORRUPTED` | **FAIL CLOSED (BLOCKED)** |
 
 ---
 
-## 4. Crash Window Analysis & Journal Write Ordering
+## 4. Journal State Transition Graph
 
-The critical recovery sequence is strictly ordered:
 ```text
-1. Inspect Target DOM
-   ↓ (Crash here: state NOT_SENT -> Watchdog resends safely)
-2. Verify Target & Duplicate State
-   ↓ (Crash here: state NOT_SENT -> Watchdog resends safely)
-3. Durably write SUBMISSION_ATTEMPTED to journal (.tmp + atomic replace)
-   ↓ (Crash here: state SUBMISSION_ATTEMPTED -> Watchdog inspects DOM first; DO_NOT_RESEND if unknown)
-4. Dispatch Input (Button click or Enter key)
-   ↓ (Crash here: state SUBMISSION_ATTEMPTED -> Watchdog inspects DOM first; DO_NOT_RESEND if prompt present)
-5. Observe User Message in DOM
-   ↓ (Crash here: state MESSAGE_OBSERVED -> Prompt present in DOM; DO_NOT_RESEND)
-6. Durably write MESSAGE_OBSERVED to journal
-   ↓ (Crash here: state MESSAGE_OBSERVED -> Prompt present in DOM; DO_NOT_RESEND)
-7. Observe Assistant Turn Start (Stop button / assistant delta)
-   ↓ (Crash here: state TURN_STARTED -> Turn active; DO_NOT_RESEND)
-8. Durably write TURN_STARTED to journal
+       ┌──────────────┐
+       │   NOT_SENT   │
+       └──────┬───────┘
+              │ (write before input dispatch)
+              ▼
+┌───────────────────────────┐
+│   SUBMISSION_ATTEMPTED    │
+└──────┬────────────────────┘
+       │
+       ├─────────────────────────────────────────┐ (DOM timeout / unconfirmed)
+       │ (user message observed)                 ▼
+       ▼                             ┌───────────────────────────────┐
+┌───────────────────────────┐        │    DISPATCHED_UNCONFIRMED     │
+│     MESSAGE_OBSERVED      │        └──────────────┬────────────────┘
+└──────┬────────────────────┘                       │ (later observed in DOM)
+       │ (assistant turn active)                    │
+       ▼                                            │
+┌───────────────────────────┐                       │
+│       TURN_STARTED        │◄──────────────────────┘
+└──────┬────────────────────┘
+       │
+       ▼
+┌───────────────────────────┐
+│        TURN_ACTIVE        │
+└───────────────────────────┘
+
+[Any state can transition to FAILED on definitive pre-dispatch or post-dispatch error. FAILED is terminal.]
 ```
 
 ---
 
-## 5. Automated Failure Test Matrix (20 Test Cases)
+## 5. Pre/Post Irreversible Failure Matrix
 
-| Test Name | Evidence Class | Verified Behavior |
-| :--- | :--- | :--- |
-| `test_01_journal_lifecycle` | `UNIT_TEST` | Verifies full state transition and history logging |
-| `test_02_corrupt_journal` | `UNIT_TEST` | Quarantines corrupted JSON; initializes clean state |
-| `test_03_duplicate_prompt_as_last_user_message` | `SYNTHETIC_SIMULATION` | Identical prompt in last user message triggers `RESUME_MESSAGE_PRESENT` |
-| `test_04_same_prompt_earlier_not_latest` | `SYNTHETIC_SIMULATION` | Old prompt 5 turns ago allows resume if latest turn differs |
-| `test_05_assistant_contains_same_text` | `SYNTHETIC_SIMULATION` | Assistant quoting prompt does not trigger false duplicate |
-| `test_06_target_a_idle_while_sidebar_b_active` | `SYNTHETIC_SIMULATION` | Target A main pane evaluates to IDLE despite active sidebar items |
-| `test_07_old_articles_do_not_cause_new_turn_success` | `SYNTHETIC_SIMULATION` | Baseline delta tracking prevents pre-existing messages from triggering turn start |
-| `test_08_user_message_observed_assistant_not_started` | `SYNTHETIC_SIMULATION` | Separates user message receipt from assistant generation start (quota fail) |
-| `test_09_existing_composer_draft_detected` | `SYNTHETIC_SIMULATION` | Unsubmitted draft flags `COMPOSER_DRAFT_PRESENT` and preserves user text |
-| `test_10_missing_devtools_active_port` | `UNIT_TEST` | Missing port file returns `CDP_PORT_FILE_MISSING` without guessing |
-| `test_11_stale_unreachable_devtools_endpoint` | `UNIT_TEST` | Unreachable endpoint returns `CDP_ENDPOINT_UNREACHABLE` |
-| `test_12_multiple_page_candidates_ambiguous` | `SYNTHETIC_SIMULATION` | $>1$ qualified pages without unambiguous route returns `APP_PAGE_AMBIGUOUS` |
-| `test_13_no_qualified_page` | `SYNTHETIC_SIMULATION` | No matching application page returns `APP_PAGE_NOT_FOUND` |
-| `test_14_slow_navigation_timeout` | `SYNTHETIC_SIMULATION` | Timeout during route switch returns `CONVERSATION_SWITCH_TIMEOUT` |
-| `test_15_wrong_navigation_target` | `SYNTHETIC_SIMULATION` | Route redirection returns `CONVERSATION_SWITCH_WRONG_TARGET` |
-| `test_16_exact_title_collision` | `SYNTHETIC_SIMULATION` | Duplicate exact titles return `CONVERSATION_AMBIGUOUS` |
-| `test_17_crash_before_send_resend_permitted` | `UNIT_TEST` | `NOT_SENT` allows safe watchdog resend |
-| `test_18_crash_after_submission_attempted_inspect_dom`| `UNIT_TEST` | `SUBMISSION_ATTEMPTED` requires DOM inspection before resending |
-| `test_19_crash_after_message_observed_do_not_resend` | `UNIT_TEST` | `MESSAGE_OBSERVED` strictly blocks duplicate resume |
-| `test_20_repeated_recovery_invocation_blocked` | `SYNTHETIC_SIMULATION` | Consecutive recovery calls on same thread abort safely |
+| Failure Point | Stage Classification | Journal State | Retry Policy |
+| :--- | :--- | :--- | :--- |
+| **Port File Missing / Invalid** | `PRE_IRREVERSIBLE` | None / `FAILED` | Retryable after supervisor fixes port file |
+| **Candidate Qualification Failed** | `PRE_IRREVERSIBLE` | None / `FAILED` | Retryable after supervisor opens valid window |
+| **Target Route Switch Timeout** | `PRE_IRREVERSIBLE` | None / `FAILED` | Retryable; composer was never touched |
+| **Composer Text Insertion Mismatch** | `PRE_IRREVERSIBLE` | `FAILED` | Retryable; input was never dispatched |
+| **Send Button Click Exception** | `PRE_IRREVERSIBLE` | `FAILED` | Retryable; dispatch was aborted |
+| **Post-Dispatch DOM Observation Timeout**| `POST_IRREVERSIBLE_UNKNOWN`| `DISPATCHED_UNCONFIRMED`| **BLOCKED**; input already dispatched; resend forbidden |
+| **Post-Dispatch Quota 429 Received** | `POST_IRREVERSIBLE_UNKNOWN`| `FAILED` | **BLOCKED**; requires account switch before resend |
 
 ---
 
-## 6. Official CLI Capabilities Recheck
+## 6. Real Production-Function Test Results (20 Scenarios)
 
-| Capability | Doc Reference | Local Binary Status | Evidence Class | Finding |
-| :--- | :--- | :--- | :--- | :--- |
-| **Thread List** | `references/cli.md` | `CLI_NOT_INSTALLED_LOCALLY` | `VERIFIED_DOC` | Supported via standalone `agy` CLI commands in docs |
-| **Desktop DB Import** | N/A | `NOT_SUPPORTED` | `UNKNOWN` | No documentation establishing direct import of Electron `.db` into `agy` |
-| **Resume CLI Session** | `references/cli.md` | `CLI_NOT_INSTALLED_LOCALLY` | `VERIFIED_DOC` | Standalone CLI supports resuming its own past sessions |
-| **Continue Desktop Thread via CLI**| N/A | `NOT_SUPPORTED` | `NOT_SUPPORTED_IN_INSPECTED_BINARY` | `language_server.exe` does not expose a standalone desktop resume command |
+All 20 tests call actual production functions:
+- `test_01_journal_lifecycle`: `UNIT_TEST` — PASSED
+- `test_02_illegal_state_transitions_rejected`: `UNIT_TEST` — PASSED
+- `test_03_corrupted_journal_fails_closed`: `UNIT_TEST` — PASSED
+- `test_04_durability_barrier`: `UNIT_TEST` — PASSED
+- `test_05_uuid_validation`: `UNIT_TEST` — PASSED
+- `test_06_author_classification_no_t0_clash`: `UNIT_TEST` — PASSED
+- `test_07_duplicate_prompt_detection`: `UNIT_TEST` — PASSED
+- `test_08_repeated_invocation_after_submission_attempted`: `UNIT_TEST` — PASSED
+- `test_09_repeated_invocation_after_message_observed`: `UNIT_TEST` — PASSED
+- `test_10_repeated_invocation_turn_active`: `UNIT_TEST` — PASSED
+- `test_11_unknown_duplicate_state_fails_closed`: `UNIT_TEST` — PASSED
+- `test_12_draft_present_blocks_send`: `UNIT_TEST` — PASSED
+- `test_13_correlate_turn_status`: `UNIT_TEST` — PASSED
+- `test_14_post_dispatch_unconfirmed_transition`: `UNIT_TEST` — PASSED
+- `test_15_pre_irreversible_failure_permits_clean_restart`: `UNIT_TEST` — PASSED
+- `test_16_cdp_discovery_return_codes`: `UNIT_TEST` — PASSED
+- `test_17_single_connection_lifecycle`: `UNIT_TEST` — PASSED
+- `test_18_exact_title_collision`: `SYNTHETIC_SIMULATION` — PASSED
+- `test_19_scoped_stop_button_isolation`: `SYNTHETIC_SIMULATION` — PASSED
+- `test_20_first_attempt_on_clean_idle_conversation`: `UNIT_TEST` — PASSED
 
 ---
 
-## 7. Independent Repro Checklist for Main Orchestrator
+## 7. Repro Checklist for Main Orchestrator
 
-To independently verify the updated T03 package:
-
-1. **Verify Automated Failure & Recovery Test Suite (All 20 tests pass)**:
+1. **Verify Automated Production-Function Test Suite (All 20 tests pass)**:
    ```powershell
    python scripts/t03/test_suite.py
    ```
-2. **Verify Read-Only Dry-Run (No DOM mutation, scoped duplicate detection)**:
+2. **Verify Read-Only Navigation-Restoring Dry-Run**:
    ```powershell
-   python scripts/t03/send_resume.py --uuid 54fa3d23-64f3-4fb4-b790-02cdd1e92d75 --json
+   python scripts/t03/send_resume.py --uuid 00000000-0000-4000-8000-000000000001 --json
    ```
-3. **Verify Stale Port Rejection (No hardcoded fallback)**:
+3. **Verify Stale Port Rejection**:
    ```powershell
    python scripts/t03/send_resume.py --cdp-endpoint http://127.0.0.1:59999 --json
    ```
@@ -139,7 +156,7 @@ To independently verify the updated T03 package:
    ```powershell
    python scripts/t03/inspect_desktop.py
    ```
-5. **Verify Windows Session & UIA Subshell Observation**:
+5. **Verify Windows Session Context & UIA Limitation**:
    ```powershell
    python scripts/t03/inspect_uia.py
    ```
