@@ -2,17 +2,16 @@
 """
 verify_active_account.py
 
-Independent active account verification probe for Antigravity on Windows.
+Windows Credential Store verification probe for Antigravity on Windows.
 
-Separates:
-- AGM_STATE (what AGM thinks or records in SQLite)
-- ANTIGRAVITY_ACTIVE_STATE (what is actually active in Windows Credential Manager / Antigravity)
-
-Evidence Ranks:
-- STRONG: Direct cryptographic hash match or userinfo introspection from Windows Credential Manager payload ('gemini:antigravity').
-- MEDIUM: AGM SQLite DB active setting ('active_cloud_account.agy' / 'active_cloud_account.ide').
-- WEAK: CLI return code or textual output saying '✓ Antigravity CLI (agy)'.
-- UNKNOWN: Verification not possible or credentials unreadable.
+Explicit State Terminology:
+- CREDENTIAL_STORE_IDENTITY_VERIFIED: Windows Credential Manager ('gemini:antigravity')
+  contains a valid token whose Google OAuth userinfo matches the expected email.
+- CREDENTIAL_STORE_WRITTEN_UNVERIFIED: Token present in vault, but network userinfo
+  introspection was not performed or failed.
+- CREDENTIAL_STORE_EMPTY: No 'gemini:antigravity' target found.
+- DESKTOP_ACTIVE_IDENTITY_VERIFIED: UNKNOWN / UNPROVEN in T02 scope (requires
+  in-process Desktop turn/session evidence from T03/integration).
 """
 
 from __future__ import annotations
@@ -25,17 +24,28 @@ import subprocess
 import sys
 import urllib.request
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Optional
+
+
+class CredentialVerificationStatus(str, Enum):
+    CREDENTIAL_STORE_IDENTITY_VERIFIED = "CREDENTIAL_STORE_IDENTITY_VERIFIED"
+    CREDENTIAL_STORE_WRITTEN_UNVERIFIED = "CREDENTIAL_STORE_WRITTEN_UNVERIFIED"
+    CREDENTIAL_STORE_EMPTY = "CREDENTIAL_STORE_EMPTY"
+    VERIFICATION_FAILED_MISMATCH = "VERIFICATION_FAILED_MISMATCH"
+    DESKTOP_ACTIVE_IDENTITY_VERIFIED = "UNKNOWN_DESKTOP_UNPROVEN"
 
 
 @dataclass
 class VerificationResult:
     expected_account: Optional[str]
     detected_active_email: Optional[str]
-    token_fingerprint: Optional[str]  # SHA-256 hash prefix of token (safe, non-secret)
+    token_fingerprint: Optional[str]  # Non-secret SHA-256 prefix
     credential_present: bool
+    status: CredentialVerificationStatus
     evidence_rank: str  # "STRONG", "MEDIUM", "WEAK", "UNKNOWN"
-    matches_expected: bool
+    matches_expected: Optional[bool]  # True, False, or None if unverified
+    desktop_adoption_status: str  # Always "UNKNOWN" in T02 scope
     verification_source: str
     details: str
 
@@ -93,16 +103,26 @@ Add-Type -TypeDefinition $code -Language CSharp
         return None
 
 
-def verify_active_account(expected_account: Optional[str] = None, introspect_network: bool = False) -> VerificationResult:
-    payload = read_windows_credential_payload()
+def verify_active_account(
+    expected_account: Optional[str] = None,
+    introspect_network: bool = False,
+    mock_payload: Optional[dict] = None
+) -> VerificationResult:
+    """
+    Verifies the active token in the Windows credential store.
+    If mock_payload is provided, uses that instead of reading host OS vault (safe for testing).
+    """
+    payload = mock_payload if mock_payload is not None else read_windows_credential_payload()
     if not payload:
         return VerificationResult(
             expected_account=expected_account,
             detected_active_email=None,
             token_fingerprint=None,
             credential_present=False,
+            status=CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY,
             evidence_rank="UNKNOWN",
-            matches_expected=False,
+            matches_expected=False if expected_account else None,
+            desktop_adoption_status="UNKNOWN",
             verification_source="WINDOWS_CREDENTIAL_MANAGER",
             details="No 'gemini:antigravity' target found in Windows Credential Manager"
         )
@@ -117,16 +137,16 @@ def verify_active_account(expected_account: Optional[str] = None, introspect_net
             detected_active_email=None,
             token_fingerprint=None,
             credential_present=True,
+            status=CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY,
             evidence_rank="UNKNOWN",
-            matches_expected=False,
+            matches_expected=False if expected_account else None,
+            desktop_adoption_status="UNKNOWN",
             verification_source="WINDOWS_CREDENTIAL_MANAGER",
-            details="Credential payload exists but contains empty access and refresh tokens"
+            details="Credential payload exists but contains empty access/refresh tokens"
         )
 
-    # Compute safe SHA-256 fingerprint of access token
     fingerprint = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16] if access_token else None
 
-    # Check if userinfo network introspection is requested
     detected_email = None
     if introspect_network and access_token:
         try:
@@ -138,43 +158,54 @@ def verify_active_account(expected_account: Optional[str] = None, introspect_net
                 if resp.status == 200:
                     info = json.loads(resp.read().decode("utf-8"))
                     detected_email = info.get("email")
-        except Exception as e:
+        except Exception:
             detected_email = None
 
-    matches = False
-    evidence_rank = "STRONG" if detected_email else "MEDIUM"
-    if expected_account and detected_email:
-        matches = (expected_account.lower() == detected_email.lower())
-    elif not expected_account:
-        matches = True
-
-    details = (
-        f"Verified active token in Windows Credential Manager. "
-        f"Detected identity: {detected_email or 'unverified (network introspection disabled)'}, "
-        f"Token Fingerprint: {fingerprint}"
-    )
+    if detected_email:
+        if expected_account:
+            matches = (detected_email.lower() == expected_account.lower())
+            status = (
+                CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
+                if matches
+                else CredentialVerificationStatus.VERIFICATION_FAILED_MISMATCH
+            )
+        else:
+            matches = True
+            status = CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
+        evidence_rank = "STRONG"
+        details = f"Introspected active OAuth identity: {detected_email} (Fingerprint: {fingerprint})"
+    else:
+        matches = None  # Explicitly UNVERIFIED
+        status = CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED
+        evidence_rank = "MEDIUM"
+        details = (
+            f"Credential present in store with token fingerprint {fingerprint}. "
+            f"Identity unverified (network introspection disabled or offline)."
+        )
 
     return VerificationResult(
         expected_account=expected_account,
         detected_active_email=detected_email,
         token_fingerprint=fingerprint,
         credential_present=True,
+        status=status,
         evidence_rank=evidence_rank,
         matches_expected=matches,
+        desktop_adoption_status="UNKNOWN",
         verification_source="WINDOWS_CREDENTIAL_MANAGER",
         details=details
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Independently verify active Antigravity account.")
+    parser = argparse.ArgumentParser(description="Independently verify Windows Credential Manager identity.")
     parser.add_argument("--expected", "-e", help="Expected email address to verify against")
     parser.add_argument("--network", "-n", action="store_true", help="Perform live Google userinfo introspection")
     args = parser.parse_args()
 
     res = verify_active_account(args.expected, introspect_network=args.network)
     print(json.dumps(asdict(res), indent=2))
-    if args.expected and not res.matches_expected:
+    if args.expected and res.matches_expected is False:
         sys.exit(1)
 
 

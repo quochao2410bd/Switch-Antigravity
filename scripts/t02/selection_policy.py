@@ -5,9 +5,9 @@ selection_policy.py
 Deterministic account selection engine for Switch-Antigravity watchdog.
 
 Guarantees:
-1. Never repeatedly choose the same exhausted account.
-2. Never rotate indefinitely (enforces max_rotations).
-3. Never choose stale or unverified quota blindly.
+1. Stale cached quota is NEVER eligible for selection without explicit fresh provenance.
+2. Never repeatedly choose the same exhausted account.
+3. Never rotate indefinitely (enforces max_rotations).
 4. Never choose accounts in active failure penalty / cooldown.
 5. Deterministic, stable tie-breaking.
 6. Explicit terminal state classification:
@@ -22,13 +22,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
-from inspect_quota import AccountQuotaSummary
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from inspect_quota import AccountQuotaSummary, FreshnessState
 
 
 class TerminalState(str, Enum):
@@ -120,7 +122,7 @@ class AccountSelector:
 
         evaluated: List[Dict[str, any]] = []
         eligible_candidates: List[Tuple[AccountQuotaSummary, int, int]] = []  # (account, quota_score, failure_count)
-        has_unknown_quota_account = False
+        has_stale_or_unknown_account = False
 
         for acc in accounts:
             ref = acc.safe_account_ref
@@ -147,7 +149,7 @@ class AccountSelector:
                 "cooldown_remaining_sec": max(0, penalty.cooldown_until_epoch - t),
                 "failure_count": penalty.failure_count,
                 "quota_score": score,
-                "quota_age_sec": t - acc.observed_at_epoch,
+                "freshness_state": acc.freshness_state.value,
                 "status": "REJECTED"
             }
 
@@ -158,13 +160,19 @@ class AccountSelector:
                 eval_entry["reject_reason"] = "Currently active exhausted account"
             elif is_in_cooldown:
                 eval_entry["reject_reason"] = f"In cooldown until {penalty.cooldown_until_epoch} ({penalty.last_failure_reason})"
-            elif score is None:
-                has_unknown_quota_account = True
+            elif acc.freshness_state == FreshnessState.STALE_CACHED:
+                has_stale_or_unknown_account = True
+                eval_entry["reject_reason"] = "Cached quota lacks verified fresh provenance (run agm refresh)"
+            elif acc.freshness_state == FreshnessState.REFRESH_FAILED:
+                eval_entry["reject_reason"] = "Recent quota refresh failed"
+            elif acc.freshness_state == FreshnessState.UNKNOWN_UNFETCHED or score is None:
+                has_stale_or_unknown_account = True
                 eval_entry["reject_reason"] = "Quota value is missing/unknown (needs refresh)"
             elif score < self.config.min_quota_pct:
                 eval_entry["reject_reason"] = f"Quota score ({score}%) below threshold ({self.config.min_quota_pct}%)"
-            elif (t - acc.observed_at_epoch) > self.config.max_quota_age_sec:
-                eval_entry["reject_reason"] = f"Quota observation is stale (age: {t - acc.observed_at_epoch}s > max {self.config.max_quota_age_sec}s)"
+            elif acc.refresh_confirmed_at_epoch and (t - acc.refresh_confirmed_at_epoch) > self.config.max_quota_age_sec:
+                has_stale_or_unknown_account = True
+                eval_entry["reject_reason"] = f"Refresh provenance expired ({t - acc.refresh_confirmed_at_epoch}s > max {self.config.max_quota_age_sec}s)"
             else:
                 eval_entry["status"] = "ELIGIBLE"
                 eligible_candidates.append((acc, score, penalty.failure_count))
@@ -172,11 +180,11 @@ class AccountSelector:
             evaluated.append(eval_entry)
 
         if not eligible_candidates:
-            if has_unknown_quota_account:
+            if has_stale_or_unknown_account:
                 return SelectionResult(
                     selected_account=None,
                     terminal_state=TerminalState.BLOCKED_QUOTA_UNKNOWN,
-                    decision_reason="All potential candidate accounts have unknown quota; live refresh required",
+                    decision_reason="All potential candidate accounts have stale or unknown quota; live refresh required",
                     evaluated_candidates=evaluated,
                     rotation_count=self.rotation_attempts
                 )
@@ -207,44 +215,68 @@ class AccountSelector:
 
 
 def test_selection_policy():
-    print("=== Testing Selection Policy ===")
+    print("=== Testing Selection Policy with Freshness Provenance ===")
     config = SelectionConfig(min_quota_pct=20, max_rotation_attempts=3)
     selector = AccountSelector(config)
 
     now = 1000000
 
-    # Mock accounts
-    a1 = AccountQuotaSummary("acc1@test.com", ["cli"], True, False, False, 10, 50, 0, {}, now - 10, "MOCK", [], True)  # Pro 10% (below 20)
-    a2 = AccountQuotaSummary("acc2@test.com", [], False, False, False, 80, 80, 80, {}, now - 10, "MOCK", [], True)  # Pro 80% (eligible)
-    a3 = AccountQuotaSummary("acc3@test.com", [], False, False, False, 90, 90, 90, {}, now - 10, "MOCK", [], True)  # Pro 90% (winner)
-    a4 = AccountQuotaSummary("acc4@test.com", ["token-exp"], False, False, True, 100, 100, 100, {}, now - 10, "MOCK", [], False)  # Expired
+    # 1. Test stale cached account (parsed now, but refreshed 5 hours ago) -> MUST BE REJECTED!
+    stale_acc = AccountQuotaSummary(
+        safe_account_ref="stale@test.com",
+        status_tags=[],
+        is_active_cli=False,
+        is_active_ide=False,
+        is_token_expired=False,
+        gemini_pro_pct=100,  # 100% quota, but stale!
+        gemini_flash_pct=100,
+        claude_pct=100,
+        models={},
+        parsed_at_epoch=now,
+        refresh_confirmed_at_epoch=now - 18000,  # 5 hours ago
+        quota_reset_time=None,
+        freshness_state=FreshnessState.STALE_CACHED,
+        source="MOCK",
+        parse_warnings=[],
+        eligible=False
+    )
+    res_stale = selector.select_next_account([stale_acc], now=now)
+    assert res_stale.selected_account is None
+    assert res_stale.terminal_state == TerminalState.BLOCKED_QUOTA_UNKNOWN
+    print("  [PASS] Stale cached quota (5 hours old) rejected -> BLOCKED_QUOTA_UNKNOWN")
+
+    # 2. Test proven fresh accounts
+    a1 = AccountQuotaSummary("acc1@test.com", ["cli"], True, False, False, 10, 50, 0, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, "MOCK", [], False)
+    a2 = AccountQuotaSummary("acc2@test.com", [], False, False, False, 80, 80, 80, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, "MOCK", [], True)
+    a3 = AccountQuotaSummary("acc3@test.com", [], False, False, False, 90, 90, 90, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, "MOCK", [], True)
+    a4 = AccountQuotaSummary("acc4@test.com", ["token-exp"], False, False, True, 100, 100, 100, {}, now, now - 10, None, FreshnessState.PROVEN_FRESH, "MOCK", [], False)
 
     res = selector.select_next_account([a1, a2, a3, a4], current_active_ref="acc1@test.com", now=now)
     assert res.selected_account == "acc3@test.com"
     assert res.terminal_state == TerminalState.NONE
-    print("  [PASS] Chosen highest quota non-current account: acc3@test.com (90%)")
+    print("  [PASS] Chosen highest proven fresh non-current account: acc3@test.com (90%)")
 
-    # Simulate failure on acc3
+    # 3. Simulate failure on acc3
     selector.record_failure("acc3@test.com", "Verification failed", now=now)
     res2 = selector.select_next_account([a1, a2, a3, a4], current_active_ref="acc1@test.com", now=now)
     assert res2.selected_account == "acc2@test.com"
-    print("  [PASS] After failure, acc3 penalty applied; selected next eligible: acc2@test.com")
+    print("  [PASS] After failure penalty, selected next eligible: acc2@test.com")
 
-    # Simulate failure on acc2
+    # 4. Simulate failure on acc2
     selector.record_failure("acc2@test.com", "Verification failed", now=now)
     res3 = selector.select_next_account([a1, a2, a3, a4], current_active_ref="acc1@test.com", now=now)
     assert res3.selected_account is None
     assert res3.terminal_state == TerminalState.BLOCKED_NO_ACCOUNT
     print("  [PASS] No accounts remaining above threshold -> BLOCKED_NO_ACCOUNT")
 
-    # Simulate 3rd failure hitting max rotations
+    # 5. Simulate 3rd failure hitting max rotations
     selector.record_failure("acc1@test.com", "Fatal crash", now=now)
     res4 = selector.select_next_account([a1, a2, a3, a4], current_active_ref="acc1@test.com", now=now)
     assert res4.selected_account is None
     assert res4.terminal_state == TerminalState.FAILED_SAFE
     print("  [PASS] Max rotation limit reached -> FAILED_SAFE")
 
-    print("\nAll selection policy unit tests passed!")
+    print("\nAll selection policy tests passed!")
 
 
 if __name__ == "__main__":
