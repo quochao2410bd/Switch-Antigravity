@@ -1,9 +1,9 @@
 {
-  "conversation_id": "4674ef3b-d559-4a90-87e2-c30b11f03250",
-  "title": "T01",
-  "step_count": 128,
-  "trajectory_id": "83a53ccd-8127-463e-a422-205d5c34cf0c",
-  "workspace_uri": "file:///c:/Users/<USER>/Documents/antigravity/excited-oppenheimer",
-  "git_branch": "master",
-  "project_id": "f9401a86-c599-4395-b076-31829765c539"
+  "conversation_id": "00000000-0000-4000-8000-000000000001",
+  "title": "Sample Active Task",
+  "step_count": 100,
+  "trajectory_id": "10000000-0000-4000-8000-000000000001",
+  "workspace_uri": "file:///c:/Users/<USER>/Documents/workspace",
+  "git_branch": "main",
+  "project_id": "90000000-0000-4000-8000-000000000001"
 }

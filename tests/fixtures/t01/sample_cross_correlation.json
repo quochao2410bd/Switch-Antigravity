@@ -1,14 +1,26 @@
 {
-  "cascade_id": "4674ef3b-d559-4a90-87e2-c30b11f03250",
-  "sources_verified": {
-    "1_sqlite_db_filename": "conversations/4674ef3b-d559-4a90-87e2-c30b11f03250.db",
-    "2_trajectory_meta_table": {
-      "cascade_id": "4674ef3b-d559-4a90-87e2-c30b11f03250",
-      "trajectory_id": "83a53ccd-8127-463e-a422-205d5c34cf0c"
-    },
-    "3_brain_directory": "brain/4674ef3b-d559-4a90-87e2-c30b11f03250/",
-    "4_proto_index_subfield_6": "4674ef3b-d559-4a90-87e2-c30b11f03250",
-    "5_cdp_page_url_path": "/c/4674ef3b-d559-4a90-87e2-c30b11f03250"
+  "local_four_way_correlation": {
+    "status": "VERIFIED_RUNTIME",
+    "matching_conversations_count": 9,
+    "total_conversations_count": 9,
+    "sources": [
+      "sqlite_db_filename (%USERPROFILE%\\.gemini\\antigravity\\conversations\\<cascade_id>.db)",
+      "sqlite_trajectory_meta_table (cascade_id column)",
+      "brain_directory (%USERPROFILE%\\.gemini\\antigravity\\brain\\<cascade_id>\\)",
+      "proto_summaries_index (agyhub_summaries_proto.pb Field 17 Subfield 6)"
+    ],
+    "sample_synthetic_correlation": {
+      "cascade_id": "00000000-0000-4000-8000-000000000001",
+      "trajectory_id": "10000000-0000-4000-8000-000000000001",
+      "db_filename_matches_table": true,
+      "brain_dir_exists": true,
+      "proto_index_matches": true
+    }
   },
-  "correlation_match": true
+  "active_cdp_correlation": {
+    "status": "VERIFIED_RUNTIME",
+    "active_renderer_targets_count": 1,
+    "active_target_matched_cascade_id": true,
+    "sample_active_target_url": "https://127.0.0.1:58861/c/00000000-0000-4000-8000-000000000001?section=90000000-0000-4000-8000-000000000001"
+  }
 }

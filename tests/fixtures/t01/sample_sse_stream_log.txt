@@ -1,3 +1,2 @@
 ERROR: logging before google.Init: I0826 21:56:08.887617  546948 http_helpers.go:246] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x3a059134385a685c ResponseID: hv6OatrMKZqB1e8Pq4LUqAg
 ERROR: logging before google.Init: I0826 21:56:09.710346  546936 http_helpers.go:246] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0xcf18df115095001f ResponseID: hf6OavyNGPPUqfkPlbHicA
-ERROR: logging before google.Init: I0826 21:56:12.160986  547421 http_helpers.go:246] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0xdb2189647125877c ResponseID: if6OatzcJ-SRvr0P9ZvyiQk

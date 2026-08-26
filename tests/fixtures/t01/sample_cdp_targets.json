@@ -1,9 +1,9 @@
 [
   {
-    "id": "9D4E5D621CAD31DF70D72A4FD346265F",
+    "id": "PAGE_TARGET_0001",
     "type": "page",
-    "title": "T01",
-    "url": "https://127.0.0.1:58861/c/4674ef3b-d559-4a90-87e2-c30b11f03250?section=f9401a86-c599-4395-b076-31829765c539",
-    "webSocketDebuggerUrl": "ws://127.0.0.1:58859/devtools/page/9D4E5D621CAD31DF70D72A4FD346265F"
+    "title": "Sample Active Task",
+    "url": "https://127.0.0.1:58861/c/00000000-0000-4000-8000-000000000001?section=90000000-0000-4000-8000-000000000001",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:58859/devtools/page/PAGE_TARGET_0001"
   }
 ]

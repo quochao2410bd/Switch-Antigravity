@@ -9,8 +9,8 @@
         "source"
       ],
       "sample_row": {
-        "trajectory_id": "83a53ccd-8127-463e-a422-205d5c34cf0c",
-        "cascade_id": "4674ef3b-d559-4a90-87e2-c30b11f03250",
+        "trajectory_id": "10000000-0000-4000-8000-000000000001",
+        "cascade_id": "00000000-0000-4000-8000-000000000001",
         "trajectory_type": 4,
         "source": 1
       }

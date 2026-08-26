@@ -3,7 +3,6 @@ import glob
 import sqlite3
 import json
 import urllib.request
-import re
 
 def parse_proto_simple(data):
     idx = 0
@@ -110,18 +109,18 @@ def correlate_all():
     proto_summaries = extract_proto_cascade_ids()
     cdp_urls = extract_cdp_active_urls()
     
-    print("=== Cross-Source Cascade ID Correlation Matrix ===")
+    print("=== Conversation Identifier Correlation Analysis ===")
     print(f"Total SQLite DBs found: {len(db_files)}")
     print(f"Total Proto Summaries entries: {len(proto_summaries)}")
-    print(f"Total CDP Targets URLs: {len(cdp_urls)}\n")
+    print(f"Total Active CDP Page Targets: {len(cdp_urls)}\n")
 
-    correlated_results = []
+    local_four_way_matches = 0
+    active_cdp_matches = 0
     
     for db_path in sorted(db_files):
         filename = os.path.basename(db_path)
-        cid_from_filename = os.path.splitext(filename)[0]
+        cid = os.path.splitext(filename)[0]
         
-        # 1. SQLite trajectory_meta
         cid_from_meta = None
         tid_from_meta = None
         try:
@@ -136,42 +135,30 @@ def correlate_all():
         except Exception as e:
             cid_from_meta = f"ERROR: {e}"
 
-        # 2. Brain directory existence
-        brain_path = os.path.join(brain_dir, cid_from_filename)
-        brain_exists = os.path.isdir(brain_path)
+        brain_exists = os.path.isdir(os.path.join(brain_dir, cid))
+        proto_entry = proto_summaries.get(cid)
+        proto_matched = (proto_entry is not None and proto_entry.get("cascade_id_in_sub17") == cid)
+        cdp_matched = any(f"/c/{cid}" in u for u in cdp_urls)
 
-        # 3. Proto summaries existence
-        proto_entry = proto_summaries.get(cid_from_filename)
-        proto_matched = (proto_entry is not None and proto_entry.get("cascade_id_in_sub17") == cid_from_filename)
-
-        # 4. CDP URL match
-        cdp_matched = any(f"/c/{cid_from_filename}" in u for u in cdp_urls)
-
-        # Validation
-        all_match = (cid_from_filename == cid_from_meta and brain_exists and proto_matched)
-        
-        record = {
-            "cascade_id": cid_from_filename,
-            "filename_matches_table": (cid_from_filename == cid_from_meta),
-            "brain_dir_exists": brain_exists,
-            "proto_index_matches": proto_matched,
-            "cdp_active": cdp_matched,
-            "trajectory_id": tid_from_meta,
-            "title": proto_entry.get("title") if proto_entry else None
-        }
-        correlated_results.append(record)
-        
-        status_sym = "[PASS]" if all_match else "[MISMATCH]"
-        print(f"{status_sym} Cascade ID: {cid_from_filename}")
+        local_4way = (cid == cid_from_meta and brain_exists and proto_matched)
+        if local_4way:
+            local_four_way_matches += 1
+        if cdp_matched:
+            active_cdp_matches += 1
+            
+        status = "[LOCAL-4WAY-PASS]" if local_4way else "[LOCAL-MISMATCH]"
+        cdp_status = "ACTIVE_IN_CDP_RENDERER" if cdp_matched else "background_or_closed"
+        print(f"{status} Cascade ID: {cid}")
         print(f"  - DB Filename: {filename}")
         print(f"  - trajectory_meta: cascade_id={cid_from_meta}, trajectory_id={tid_from_meta}")
-        print(f"  - Brain Directory: {'EXISTS' if brain_exists else 'MISSING'}")
+        print(f"  - Brain Dir: {'EXISTS' if brain_exists else 'MISSING'}")
         print(f"  - Proto Index: {'MATCHED' if proto_matched else 'NOT MATCHED'}")
-        print(f"  - Active CDP URL: {'ACTIVE IN RENDERER' if cdp_matched else 'Not active in foreground'}")
+        print(f"  - CDP Foreground Status: {cdp_status}")
         print()
 
-    total_pass = sum(1 for r in correlated_results if r['filename_matches_table'] and r['brain_dir_exists'] and r['proto_index_matches'])
-    print(f"Total Fully Correlated Across Filesystem, DB & Proto: {total_pass}/{len(correlated_results)}")
+    print("--- Correlation Summary ---")
+    print(f"1. LOCAL FOUR-WAY CORRELATION (DB filename + trajectory_meta + brain dir + proto index): {local_four_way_matches}/{len(db_files)}")
+    print(f"2. ACTIVE FOREGROUND CDP CORRELATION (Active Renderer URL vs Cascade ID): {active_cdp_matches}/{len(cdp_urls)} active target(s)")
 
 if __name__ == "__main__":
     correlate_all()
