@@ -4,14 +4,21 @@ verify_active_account.py
 
 Windows Credential Store verification probe for Antigravity on Windows.
 
-Explicit State Terminology:
+Explicit State Model & Error Classification:
 - CREDENTIAL_STORE_IDENTITY_VERIFIED: Windows Credential Manager ('gemini:antigravity')
-  contains a valid token whose Google OAuth userinfo matches the expected email.
+  contains a valid token whose Google OAuth userinfo matches the expected canonical email.
 - CREDENTIAL_STORE_WRITTEN_UNVERIFIED: Token present in vault, but network userinfo
-  introspection was not performed or failed.
-- CREDENTIAL_STORE_EMPTY: No 'gemini:antigravity' target found.
-- DESKTOP_ACTIVE_IDENTITY_VERIFIED: UNKNOWN / UNPROVEN in T02 scope (requires
-  in-process Desktop turn/session evidence from T03/integration).
+  introspection was not performed or offline.
+- CREDENTIAL_STORE_EMPTY: No 'gemini:antigravity' target found (Win32 1168).
+- CREDENTIAL_STORE_ACCESS_DENIED: Access denied reading OS vault (Win32 5).
+- CREDENTIAL_STORE_READ_ERROR: OS-level read error from CredRead.
+- CREDENTIAL_STORE_UNAVAILABLE: PowerShell or Credential Manager API unavailable.
+- CREDENTIAL_PAYLOAD_INVALID: Malformed JSON or corrupted blob structure.
+- IDENTITY_MISMATCH: Introspected OAuth identity does not match expected account.
+- TOKEN_REJECTED: Google OAuth returned HTTP 401 / expired token.
+- NETWORK_UNAVAILABLE: Introspection failed due to timeout or network error.
+- USERINFO_INVALID_RESPONSE: Malformed JSON or missing email in userinfo response.
+- DESKTOP_ACTIVE_IDENTITY_VERIFIED: Strictly UNKNOWN_DESKTOP_UNPROVEN in T02 scope.
 """
 
 from __future__ import annotations
@@ -22,17 +29,25 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional, Tuple
 
 
 class CredentialVerificationStatus(str, Enum):
     CREDENTIAL_STORE_IDENTITY_VERIFIED = "CREDENTIAL_STORE_IDENTITY_VERIFIED"
     CREDENTIAL_STORE_WRITTEN_UNVERIFIED = "CREDENTIAL_STORE_WRITTEN_UNVERIFIED"
     CREDENTIAL_STORE_EMPTY = "CREDENTIAL_STORE_EMPTY"
-    VERIFICATION_FAILED_MISMATCH = "VERIFICATION_FAILED_MISMATCH"
+    CREDENTIAL_STORE_ACCESS_DENIED = "CREDENTIAL_STORE_ACCESS_DENIED"
+    CREDENTIAL_STORE_READ_ERROR = "CREDENTIAL_STORE_READ_ERROR"
+    CREDENTIAL_STORE_UNAVAILABLE = "CREDENTIAL_STORE_UNAVAILABLE"
+    CREDENTIAL_PAYLOAD_INVALID = "CREDENTIAL_PAYLOAD_INVALID"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    TOKEN_REJECTED = "TOKEN_REJECTED"
+    NETWORK_UNAVAILABLE = "NETWORK_UNAVAILABLE"
+    USERINFO_INVALID_RESPONSE = "USERINFO_INVALID_RESPONSE"
     DESKTOP_ACTIVE_IDENTITY_VERIFIED = "UNKNOWN_DESKTOP_UNPROVEN"
 
 
@@ -45,15 +60,16 @@ class VerificationResult:
     status: CredentialVerificationStatus
     evidence_rank: str  # "STRONG", "MEDIUM", "WEAK", "UNKNOWN"
     matches_expected: Optional[bool]  # True, False, or None if unverified
+    scope: str  # "CREDENTIAL_STORE_ONLY"
     desktop_adoption_status: str  # Always "UNKNOWN" in T02 scope
     verification_source: str
     details: str
 
 
-def read_windows_credential_payload() -> Optional[dict]:
+def read_windows_credential_payload() -> Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]:
     """
     Safely reads 'gemini:antigravity' from Windows Credential Manager via PowerShell.
-    Returns parsed JSON dict without printing sensitive secrets to stdout.
+    Returns (parsed_dict, error_status, error_details).
     """
     ps_script = r'''
 $ErrorActionPreference = 'Stop'
@@ -73,58 +89,125 @@ public class CredR {
   public static extern bool CredRead(string target, uint type, uint reservedFlag, out IntPtr credentialPtr);
   [DllImport("advapi32.dll", SetLastError = true)]
   public static extern void CredFree(IntPtr buffer);
-  public static string Read(string target) {
+  public static int Read(string target, out string blob) {
     IntPtr p;
-    if (!CredRead(target, 1, 0, out p)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    blob = null;
+    if (!CredRead(target, 1, 0, out p)) return Marshal.GetLastWin32Error();
     try {
       CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
       byte[] b = new byte[c.CredentialBlobSize];
       Marshal.Copy(c.CredentialBlob, b, 0, (int)c.CredentialBlobSize);
-      return Encoding.UTF8.GetString(b);
+      blob = Encoding.UTF8.GetString(b);
+      return 0;
     } finally { CredFree(p); }
   }
 }
 '@
 Add-Type -TypeDefinition $code -Language CSharp
-[CredR]::Read('gemini:antigravity')
+$blob = ""
+$code = [CredR]::Read('gemini:antigravity', [ref]$blob)
+if ($code -eq 1168) { Write-Output "ERR_NOT_FOUND"; exit 0 }
+if ($code -eq 5) { Write-Output "ERR_ACCESS_DENIED"; exit 0 }
+if ($code -ne 0) { Write-Output "ERR_WIN32_$code"; exit 0 }
+Write-Output $blob
 '''
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             capture_output=True,
             text=True,
-            check=True
+            timeout=10
         )
         raw = proc.stdout.strip()
         if not raw:
-            return None
-        return json.loads(raw)
-    except Exception:
-        return None
+            return None, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "Empty output from credential reader"
+        if raw == "ERR_NOT_FOUND":
+            return None, CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, "Target 'gemini:antigravity' not found in vault (Win32 1168)"
+        if raw == "ERR_ACCESS_DENIED":
+            return None, CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED, "Access denied reading 'gemini:antigravity' (Win32 5)"
+        if raw.startswith("ERR_WIN32_"):
+            return None, CredentialVerificationStatus.CREDENTIAL_STORE_READ_ERROR, f"Win32 error reading vault: {raw}"
+
+        data = json.loads(raw)
+        return data, None, None
+    except subprocess.TimeoutExpired:
+        return None, CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE, "PowerShell credential query timed out"
+    except json.JSONDecodeError as e:
+        return None, CredentialVerificationStatus.CREDENTIAL_PAYLOAD_INVALID, f"Corrupted JSON in credential blob: {e}"
+    except Exception as e:
+        return None, CredentialVerificationStatus.CREDENTIAL_STORE_UNAVAILABLE, f"Subprocess / PowerShell unavailable: {e}"
+
+
+def default_google_userinfo_fetcher(access_token: str, timeout_sec: int = 10) -> Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]:
+    """Default live HTTP userinfo lookup against Google OAuth endpoint."""
+    try:
+        req = urllib.request.Request(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data, None, None
+            return None, CredentialVerificationStatus.USERINFO_INVALID_RESPONSE, f"Unexpected HTTP status {resp.status}"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None, CredentialVerificationStatus.TOKEN_REJECTED, f"OAuth token rejected by Google API (HTTP {e.code})"
+        return None, CredentialVerificationStatus.USERINFO_INVALID_RESPONSE, f"Google API HTTP error: {e.code}"
+    except urllib.error.URLError as e:
+        return None, CredentialVerificationStatus.NETWORK_UNAVAILABLE, f"Network error during userinfo lookup: {e.reason}"
+    except json.JSONDecodeError:
+        return None, CredentialVerificationStatus.USERINFO_INVALID_RESPONSE, "Malformed JSON received from userinfo endpoint"
+    except Exception as e:
+        return None, CredentialVerificationStatus.NETWORK_UNAVAILABLE, f"Userinfo network lookup error: {e}"
 
 
 def verify_active_account(
     expected_account: Optional[str] = None,
     introspect_network: bool = False,
-    mock_payload: Optional[dict] = None
+    mock_payload: Optional[dict] = None,
+    mock_error_status: Optional[CredentialVerificationStatus] = None,
+    userinfo_fetcher: Optional[Callable[[str], Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]]] = None
 ) -> VerificationResult:
     """
     Verifies the active token in the Windows credential store.
-    If mock_payload is provided, uses that instead of reading host OS vault (safe for testing).
+    Dependency injection for mock_payload and userinfo_fetcher enables thorough unit testing without OS/network side-effects.
     """
-    payload = mock_payload if mock_payload is not None else read_windows_credential_payload()
-    if not payload:
+    if mock_error_status is not None:
         return VerificationResult(
             expected_account=expected_account,
             detected_active_email=None,
             token_fingerprint=None,
             credential_present=False,
-            status=CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY,
+            status=mock_error_status,
             evidence_rank="UNKNOWN",
             matches_expected=False if expected_account else None,
+            scope="CREDENTIAL_STORE_ONLY",
             desktop_adoption_status="UNKNOWN",
             verification_source="WINDOWS_CREDENTIAL_MANAGER",
-            details="No 'gemini:antigravity' target found in Windows Credential Manager"
+            details=f"Credential store error: {mock_error_status.value}"
+        )
+
+    if mock_payload is not None:
+        payload = mock_payload if mock_payload else None
+        read_err_status = CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY if not mock_payload else None
+        read_err_details = "Mock empty vault" if not mock_payload else None
+    else:
+        payload, read_err_status, read_err_details = read_windows_credential_payload()
+
+    if read_err_status:
+        return VerificationResult(
+            expected_account=expected_account,
+            detected_active_email=None,
+            token_fingerprint=None,
+            credential_present=False,
+            status=read_err_status,
+            evidence_rank="UNKNOWN",
+            matches_expected=False if expected_account else None,
+            scope="CREDENTIAL_STORE_ONLY",
+            desktop_adoption_status="UNKNOWN",
+            verification_source="WINDOWS_CREDENTIAL_MANAGER",
+            details=read_err_details or "Error reading Windows Credential Manager"
         )
 
     token_dict = payload.get("token", {})
@@ -140,6 +223,7 @@ def verify_active_account(
             status=CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY,
             evidence_rank="UNKNOWN",
             matches_expected=False if expected_account else None,
+            scope="CREDENTIAL_STORE_ONLY",
             desktop_adoption_status="UNKNOWN",
             verification_source="WINDOWS_CREDENTIAL_MANAGER",
             details="Credential payload exists but contains empty access/refresh tokens"
@@ -147,41 +231,65 @@ def verify_active_account(
 
     fingerprint = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16] if access_token else None
 
-    detected_email = None
-    if introspect_network and access_token:
-        try:
-            req = urllib.request.Request(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    info = json.loads(resp.read().decode("utf-8"))
-                    detected_email = info.get("email")
-        except Exception:
-            detected_email = None
-
-    if detected_email:
-        if expected_account:
-            matches = (detected_email.lower() == expected_account.lower())
-            status = (
-                CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
-                if matches
-                else CredentialVerificationStatus.VERIFICATION_FAILED_MISMATCH
-            )
-        else:
-            matches = True
-            status = CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
-        evidence_rank = "STRONG"
-        details = f"Introspected active OAuth identity: {detected_email} (Fingerprint: {fingerprint})"
-    else:
-        matches = None  # Explicitly UNVERIFIED
-        status = CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED
-        evidence_rank = "MEDIUM"
-        details = (
-            f"Credential present in store with token fingerprint {fingerprint}. "
-            f"Identity unverified (network introspection disabled or offline)."
+    if not introspect_network:
+        return VerificationResult(
+            expected_account=expected_account,
+            detected_active_email=None,
+            token_fingerprint=fingerprint,
+            credential_present=True,
+            status=CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED,
+            evidence_rank="MEDIUM",
+            matches_expected=None,
+            scope="CREDENTIAL_STORE_ONLY",
+            desktop_adoption_status="UNKNOWN",
+            verification_source="WINDOWS_CREDENTIAL_MANAGER",
+            details=f"Credential present in store with token fingerprint {fingerprint}. Identity unverified (network introspection disabled)."
         )
+
+    fetcher = userinfo_fetcher or default_google_userinfo_fetcher
+    userinfo_data, net_err_status, net_err_details = fetcher(access_token)
+
+    if net_err_status:
+        return VerificationResult(
+            expected_account=expected_account,
+            detected_active_email=None,
+            token_fingerprint=fingerprint,
+            credential_present=True,
+            status=net_err_status,
+            evidence_rank="WEAK",
+            matches_expected=None,
+            scope="CREDENTIAL_STORE_ONLY",
+            desktop_adoption_status="UNKNOWN",
+            verification_source="GOOGLE_USERINFO_ENDPOINT",
+            details=net_err_details or f"Network userinfo introspection failed ({net_err_status.value})"
+        )
+
+    detected_email = userinfo_data.get("email") if userinfo_data else None
+    if not detected_email:
+        return VerificationResult(
+            expected_account=expected_account,
+            detected_active_email=None,
+            token_fingerprint=fingerprint,
+            credential_present=True,
+            status=CredentialVerificationStatus.USERINFO_INVALID_RESPONSE,
+            evidence_rank="WEAK",
+            matches_expected=None,
+            scope="CREDENTIAL_STORE_ONLY",
+            desktop_adoption_status="UNKNOWN",
+            verification_source="GOOGLE_USERINFO_ENDPOINT",
+            details="Userinfo response omitted 'email' field"
+        )
+
+    if expected_account:
+        matches = (detected_email.lower() == expected_account.lower())
+        status = (
+            CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
+            if matches
+            else CredentialVerificationStatus.IDENTITY_MISMATCH
+        )
+    else:
+        matches = True
+        status = CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
 
     return VerificationResult(
         expected_account=expected_account,
@@ -189,23 +297,28 @@ def verify_active_account(
         token_fingerprint=fingerprint,
         credential_present=True,
         status=status,
-        evidence_rank=evidence_rank,
+        evidence_rank="STRONG",
         matches_expected=matches,
+        scope="CREDENTIAL_STORE_ONLY",
         desktop_adoption_status="UNKNOWN",
-        verification_source="WINDOWS_CREDENTIAL_MANAGER",
-        details=details
+        verification_source="GOOGLE_USERINFO_ENDPOINT",
+        details=f"Introspected active OAuth identity: {detected_email} (Fingerprint: {fingerprint})"
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Independently verify Windows Credential Manager identity.")
-    parser.add_argument("--expected", "-e", help="Expected email address to verify against")
+    parser.add_argument("--expected", "-e", help="Expected canonical email address to verify against")
     parser.add_argument("--network", "-n", action="store_true", help="Perform live Google userinfo introspection")
     args = parser.parse_args()
 
     res = verify_active_account(args.expected, introspect_network=args.network)
     print(json.dumps(asdict(res), indent=2))
-    if args.expected and res.matches_expected is False:
+    if res.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED:
+        sys.exit(0)
+    elif res.status == CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED:
+        sys.exit(2)
+    else:
         sys.exit(1)
 
 

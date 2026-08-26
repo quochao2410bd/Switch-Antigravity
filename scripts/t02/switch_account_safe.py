@@ -5,17 +5,15 @@ switch_account_safe.py
 Hardened, safety-first wrapper around AGM account switching for Switch-Antigravity.
 
 Safety Constraints & Outcome Model:
-1. Requires explicit account email / reference argument (refuses empty string, wildcard '*').
+1. Enforces canonical email only (refuses aliases without '@' domain, empty string, wildcards).
 2. Default behavior is dry-run / probe unless --confirm is explicitly passed.
 3. Performs pre-switch and post-switch credential store verification.
-4. Returns explicit, non-misleading outcome statuses:
-   - DRY_RUN: Simulation only.
-   - SWITCH_COMMAND_FAILED: AGM switch exited non-zero or threw error.
-   - SWITCH_WRITTEN_UNVERIFIED: Credential written to vault, but network identity unverified.
-   - CREDENTIAL_IDENTITY_VERIFIED: Credential written and verified via network introspection.
-   - VERIFY_FAILED: Credential introspection detected mismatching identity.
-   - DESKTOP_ADOPTION_UNPROVEN: Desktop process pickup remains unverified in T02 scope.
-5. Exit code is 0 ONLY on successful dry-run or fully verified switch. Returns code 1 on errors/rejections.
+4. Exit Code Contract:
+   - 0: CREDENTIAL_IDENTITY_VERIFIED (Token written and Google OAuth userinfo matched)
+   - 1: FAILURE (Command failed, verify mismatch, invalid input, wildcard rejected)
+   - 2: SWITCH_WRITTEN_UNVERIFIED (Token written to vault, but network userinfo unverified)
+   - 3: DRY_RUN (Simulation mode; no changes applied)
+5. Scope is explicitly CREDENTIAL_STORE_ONLY; Desktop adoption remains UNKNOWN in T02.
 """
 
 from __future__ import annotations
@@ -27,11 +25,11 @@ import shutil
 import subprocess
 import sys
 from enum import Enum
-from pathlib import Path
 from typing import Optional
 
-# Add current dir to path to import verify_active_account
+# Add current dir to path to import verify_active_account and refresh_quota_safe
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from refresh_quota_safe import is_canonical_email
 from verify_active_account import (
     CredentialVerificationStatus,
     VerificationResult,
@@ -79,7 +77,9 @@ def execute_safe_switch(
             "status": SwitchOutcome.INVALID_ARGUMENT.value,
             "error_code": "EMPTY_ACCOUNT",
             "message": "Account argument cannot be empty",
-            "exit_code": 1
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
     account = account.strip()
@@ -88,7 +88,20 @@ def execute_safe_switch(
             "status": SwitchOutcome.WILDCARD_REJECTED.value,
             "error_code": "WILDCARD_REJECTED",
             "message": f"Wildcard target '{account}' is strictly forbidden in safe switch",
-            "exit_code": 1
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
+        }
+
+    # Item 6: Enforce canonical email only to prevent false identity mismatch during userinfo comparison
+    if not is_canonical_email(account):
+        return {
+            "status": SwitchOutcome.INVALID_ARGUMENT.value,
+            "error_code": "NON_CANONICAL_EMAIL",
+            "message": f"Account '{account}' is not a valid canonical email. Aliases must be resolved prior to safe switch.",
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
     # Pre-switch verification
@@ -101,7 +114,9 @@ def execute_safe_switch(
             "switch_target": target,
             "pre_switch_state": pre_verification.__dict__,
             "message": "Dry-run mode: no changes applied. Pass --confirm to execute switch.",
-            "exit_code": 0
+            "exit_code": 3,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
     # Locate AGM binary
@@ -111,7 +126,9 @@ def execute_safe_switch(
             "status": SwitchOutcome.AGM_NOT_FOUND.value,
             "error_code": "AGM_NOT_FOUND",
             "message": "AGM executable not found on PATH or search locations",
-            "exit_code": 1
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
     # Execute AGM switch
@@ -126,14 +143,18 @@ def execute_safe_switch(
             "status": SwitchOutcome.SWITCH_COMMAND_FAILED.value,
             "error_code": "SWITCH_TIMEOUT",
             "message": "AGM switch command timed out after 15 seconds",
-            "exit_code": 1
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
     except Exception as e:
         return {
             "status": SwitchOutcome.SWITCH_COMMAND_FAILED.value,
             "error_code": "SWITCH_EXEC_FAILED",
             "message": f"Failed to execute AGM switch: {e}",
-            "exit_code": 1
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
     if exit_code != 0:
@@ -145,7 +166,9 @@ def execute_safe_switch(
             "agm_stderr": stderr.strip(),
             "pre_switch_state": pre_verification.__dict__,
             "message": f"AGM switch exited with code {exit_code}",
-            "exit_code": 1
+            "exit_code": 1,
+            "scope": "CREDENTIAL_STORE_ONLY",
+            "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN"
         }
 
     # Optional experimental restart (flagged clearly as unsafe / experimental)
@@ -169,16 +192,13 @@ def execute_safe_switch(
         introspect_network=introspect_network
     )
 
-    # Determine explicit outcome
+    # Determine explicit outcome & exit code contract (Item 5)
     if post_verification.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED:
         outcome = SwitchOutcome.CREDENTIAL_IDENTITY_VERIFIED
         overall_exit = 0
-    elif post_verification.status == CredentialVerificationStatus.VERIFICATION_FAILED_MISMATCH:
-        outcome = SwitchOutcome.VERIFY_FAILED
-        overall_exit = 1
     elif post_verification.status == CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED:
         outcome = SwitchOutcome.SWITCH_WRITTEN_UNVERIFIED
-        overall_exit = 0
+        overall_exit = 2  # Explicitly distinct from 0!
     else:
         outcome = SwitchOutcome.VERIFY_FAILED
         overall_exit = 1
@@ -187,11 +207,16 @@ def execute_safe_switch(
         "status": outcome.value,
         "target_account": account,
         "target_product": target,
+        "agm_command_succeeded": (exit_code == 0),
+        "credential_store_written": post_verification.credential_present,
+        "credential_identity_verified": (outcome == SwitchOutcome.CREDENTIAL_IDENTITY_VERIFIED),
+        "desktop_adoption_verified": False,
+        "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN",
+        "scope": "CREDENTIAL_STORE_ONLY",
         "agm_exit_code": exit_code,
         "agm_stdout": stdout.strip(),
         "agm_stderr": stderr.strip(),
         "experimental_desktop_restarted": desktop_restarted,
-        "desktop_adoption_status": "UNKNOWN_DESKTOP_UNPROVEN",
         "pre_switch_state": pre_verification.__dict__,
         "post_switch_state": post_verification.__dict__,
         "exit_code": overall_exit
@@ -200,7 +225,7 @@ def execute_safe_switch(
 
 def main():
     parser = argparse.ArgumentParser(description="Safely switch Antigravity account using AGM.")
-    parser.add_argument("account", help="Exact email address or alias to switch to")
+    parser.add_argument("account", help="Exact canonical email address to switch to")
     parser.add_argument("--target", "-t", default="agy", choices=["agy", "ide", "all"], help="Target product surface")
     parser.add_argument("--confirm", action="store_true", help="Confirm execution (without this, dry-run only)")
     parser.add_argument("--network", "-n", action="store_true", help="Perform live Google userinfo introspection")

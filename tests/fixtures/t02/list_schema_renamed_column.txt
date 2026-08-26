@@ -1,0 +1,3 @@
+USER_EMAIL                STATE      PRO_QUOTA  FLASH_QUOTA CLAUDE_QUOTA
+alice@example.com         cli,active 85%        90%         75%
+bob@example.com                      60%        70%         50%

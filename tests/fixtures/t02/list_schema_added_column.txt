@@ -1,0 +1,3 @@
+EMAIL                     STATUS     GEM-PRO    GEM-FLASH  CLAUDE     TIER
+alice@example.com         cli,active 85%        90%        75%        pro
+bob@example.com                      60%        70%        50%        free
