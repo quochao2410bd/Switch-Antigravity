@@ -4,10 +4,16 @@ Persistent Recovery Journal for Antigravity Resume Adapter (T03 Prototype)
 
 Manages crash-recovery state for conversation resume attempts.
 Stores strictly non-sensitive metadata (UUIDs, state, prompt SHA-256, timestamps).
-Implements strict state transition graph, durability barriers (flush + fsync + atomic replace),
-quarantine of corrupted journals, and deterministic recovery permission evaluation.
+
+Review Round 4 Implementation:
+- Strict schema validation (versioned, type-checked, semantic state validation).
+- FAILED + unknown failure_stage strictly fails closed (MANUAL_RECONCILIATION_REQUIRED).
+- Cross-process file locking (single-writer concurrency protection for critical regions).
+- Durability barrier: fsync failure raises JournalDurabilityError (never swallowed).
+- Forward attempt reconciliation: advances unconfirmed attempts to MESSAGE_OBSERVED / TURN_STARTED.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -15,6 +21,8 @@ import re
 import tempfile
 import time
 import uuid
+
+SCHEMA_VERSION = 2
 
 STATE_NOT_SENT = "NOT_SENT"
 STATE_SUBMISSION_ATTEMPTED = "SUBMISSION_ATTEMPTED"
@@ -34,12 +42,16 @@ VALID_STATES = {
     STATE_FAILED
 }
 
-# Strict allowed state transitions graph
+VALID_FAILURE_STAGES = {
+    "PRE_IRREVERSIBLE",
+    "POST_IRREVERSIBLE_UNKNOWN"
+}
+
 ALLOWED_TRANSITIONS = {
     STATE_NOT_SENT: {STATE_SUBMISSION_ATTEMPTED, STATE_FAILED},
     STATE_SUBMISSION_ATTEMPTED: {STATE_MESSAGE_OBSERVED, STATE_DISPATCHED_UNCONFIRMED, STATE_FAILED},
     STATE_DISPATCHED_UNCONFIRMED: {STATE_MESSAGE_OBSERVED, STATE_FAILED},
-    STATE_MESSAGE_OBSERVED: {STATE_TURN_STARTED, STATE_FAILED},
+    STATE_MESSAGE_OBSERVED: {STATE_TURN_STARTED, STATE_TURN_ACTIVE, STATE_FAILED},
     STATE_TURN_STARTED: {STATE_TURN_ACTIVE, STATE_FAILED},
     STATE_TURN_ACTIVE: {STATE_FAILED},
     STATE_FAILED: set()
@@ -51,18 +63,33 @@ DECISION_TURN_ALREADY_ACTIVE = "TURN_ALREADY_ACTIVE"
 DECISION_PREVIOUS_SUBMISSION_UNCONFIRMED = "PREVIOUS_SUBMISSION_UNCONFIRMED"
 DECISION_RECOVERY_STATE_UNKNOWN = "RECOVERY_STATE_UNKNOWN"
 DECISION_JOURNAL_CORRUPTED = "JOURNAL_CORRUPTED"
+DECISION_JOURNAL_SCHEMA_UNSUPPORTED = "JOURNAL_SCHEMA_UNSUPPORTED"
 DECISION_MANUAL_RECONCILIATION_REQUIRED = "MANUAL_RECONCILIATION_REQUIRED"
 DECISION_BLOCKED_DRAFT_PRESENT = "BLOCKED_DRAFT_PRESENT"
+DECISION_CONCURRENT_LOCK_ACTIVE = "CONCURRENT_LOCK_ACTIVE"
 
 UUID_REGEX = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+SHA256_REGEX = re.compile(r'^[0-9a-fA-F]{64}$')
+
+class JournalDurabilityError(RuntimeError):
+    """Raised when the journal durability barrier (fsync/write) fails."""
+    pass
+
+class JournalSchemaError(ValueError):
+    """Raised when the journal content violates strict semantic schema rules."""
+    pass
 
 def validate_uuid(convo_uuid):
     if not convo_uuid or not isinstance(convo_uuid, str) or not UUID_REGEX.match(convo_uuid.strip()):
         raise ValueError(f"Invalid UUID format: {convo_uuid}")
     return convo_uuid.strip().lower()
 
+def validate_prompt_sha(sha_str):
+    if not sha_str or not isinstance(sha_str, str) or not SHA256_REGEX.match(sha_str.strip()):
+        raise ValueError(f"Invalid SHA-256 hash: {sha_str}")
+    return sha_str.strip().lower()
+
 def get_default_journal_path():
-    """Return platform-safe location for recovery journal."""
     local_appdata = os.environ.get("LOCALAPPDATA")
     if local_appdata:
         base_dir = os.path.join(local_appdata, "SwitchAntigravity")
@@ -72,19 +99,86 @@ def get_default_journal_path():
     return os.path.join(base_dir, "t03_recovery_journal.json")
 
 def hash_prompt(prompt_text):
-    """Compute SHA-256 hash of normalized prompt text."""
     if not prompt_text:
         return ""
     normalized = " ".join(prompt_text.strip().split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+def validate_journal_schema(data):
+    """
+    Strict semantic validator for recovery journal data.
+    Validates version, structure, UUIDs, states, hashes, timestamps, and history records.
+    """
+    if not isinstance(data, dict):
+        raise JournalSchemaError("Journal root must be a JSON object")
+
+    ver = data.get("version")
+    if ver != SCHEMA_VERSION:
+        raise JournalSchemaError(f"Unsupported journal schema version: {ver} (expected {SCHEMA_VERSION})")
+
+    records = data.get("records")
+    if not isinstance(records, dict):
+        raise JournalSchemaError("Journal 'records' must be a dictionary")
+
+    for convo_key, record_list in records.items():
+        val_key = validate_uuid(convo_key)
+        if not isinstance(record_list, list):
+            raise JournalSchemaError(f"Record list for conversation '{convo_key}' must be an array")
+
+        for r in record_list:
+            if not isinstance(r, dict):
+                raise JournalSchemaError(f"Record in '{convo_key}' must be a JSON object")
+
+            attempt_id = r.get("attempt_id")
+            validate_uuid(attempt_id)
+
+            r_convo_uuid = r.get("conversation_uuid")
+            if validate_uuid(r_convo_uuid) != val_key:
+                raise JournalSchemaError(f"Record conversation_uuid mismatch: {r_convo_uuid} vs key {val_key}")
+
+            state = r.get("state")
+            if state not in VALID_STATES:
+                raise JournalSchemaError(f"Record state '{state}' is invalid. Must be one of {VALID_STATES}")
+
+            prompt_sha = r.get("prompt_sha256")
+            validate_prompt_sha(prompt_sha)
+
+            created_at = r.get("created_at_utc")
+            updated_at = r.get("updated_at_utc")
+            if not isinstance(created_at, (int, float)) or created_at <= 0:
+                raise JournalSchemaError(f"Invalid created_at_utc timestamp: {created_at}")
+            if not isinstance(updated_at, (int, float)) or updated_at < created_at:
+                raise JournalSchemaError(f"Invalid updated_at_utc timestamp: {updated_at}")
+
+            failure_stage = r.get("failure_stage")
+            if failure_stage is not None and failure_stage not in VALID_FAILURE_STAGES:
+                raise JournalSchemaError(f"Invalid failure_stage: {failure_stage}")
+
+            history = r.get("history")
+            if not isinstance(history, list):
+                raise JournalSchemaError(f"Record history for {attempt_id} must be a list")
+
+            for h in history:
+                if not isinstance(h, dict):
+                    raise JournalSchemaError("History entry must be a dictionary")
+                h_state = h.get("state")
+                if h_state not in VALID_STATES:
+                    raise JournalSchemaError(f"Invalid history state: {h_state}")
+                h_ts = h.get("timestamp")
+                if not isinstance(h_ts, (int, float)) or h_ts <= 0:
+                    raise JournalSchemaError(f"Invalid history timestamp: {h_ts}")
+
+    return True
 
 def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, journal_status="OK", is_first_attempt=False):
     """
     Deterministic evaluation of recovery permission.
     Returns (decision_code, explanation).
     """
-    if journal_status == "CORRUPTED":
-        return DECISION_JOURNAL_CORRUPTED, "Recovery journal is corrupted. Fail closed to prevent duplicate submission."
+    if journal_status == "SCHEMA_UNSUPPORTED":
+        return DECISION_JOURNAL_SCHEMA_UNSUPPORTED, "Journal schema version is unsupported. Fail closed."
+    if journal_status in ["CORRUPTED", "SCHEMA_INVALID"]:
+        return DECISION_JOURNAL_CORRUPTED, "Recovery journal is corrupted or semantically invalid. Fail closed."
 
     if not live_dom_state or not isinstance(live_dom_state, dict):
         return DECISION_RECOVERY_STATE_UNKNOWN, "Live DOM state could not be inspected."
@@ -121,9 +215,14 @@ def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, jou
             return DECISION_TURN_ALREADY_ACTIVE, f"Previous recovery turn was recorded in active state '{prev_state}'."
 
         if prev_state == STATE_FAILED:
-            failure_stage = latest_record.get("failure_stage", "UNKNOWN")
-            if failure_stage == "POST_IRREVERSIBLE_UNKNOWN":
-                return DECISION_MANUAL_RECONCILIATION_REQUIRED, "Previous attempt failed after input dispatch with unconfirmed outcome."
+            failure_stage = latest_record.get("failure_stage")
+            if failure_stage == "PRE_IRREVERSIBLE" and dom_duplicate_status == "RESUME_NOT_PRESENT":
+                return DECISION_NEW_ATTEMPT_ALLOWED, "Previous failure was confirmed pre-irreversible and target is clean."
+            # Any unknown/missing/invalid/post-irreversible stage must fail closed
+            return DECISION_MANUAL_RECONCILIATION_REQUIRED, (
+                f"Previous attempt is FAILED with unconfirmed failure stage '{failure_stage}'. "
+                "Manual reconciliation required; blind resend forbidden."
+            )
 
     if dom_duplicate_status == "DUPLICATE_STATE_UNKNOWN":
         if is_first_attempt and not latest_record and live_dom_state.get("isConversationEmptyOrIdle"):
@@ -135,25 +234,103 @@ def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, jou
 
     return DECISION_RECOVERY_STATE_UNKNOWN, f"Unhandled duplicate status '{dom_duplicate_status}'. Fail closed."
 
+def reconcile_existing_attempt(journal, conversation_uuid, latest_record, live_dom_state, prompt_hash):
+    """
+    Safely reconciles an existing unconfirmed attempt forward without mutating backward.
+    """
+    if not latest_record or not live_dom_state:
+        return latest_record, False
+
+    attempt_id = latest_record.get("attempt_id")
+    current_state = latest_record.get("state")
+    last_user_hash = live_dom_state.get("lastUserMessageHash")
+    is_turn_active = live_dom_state.get("isMainTurnActive", False)
+
+    reconciled = False
+    if current_state in [STATE_SUBMISSION_ATTEMPTED, STATE_DISPATCHED_UNCONFIRMED]:
+        if last_user_hash == prompt_hash:
+            journal.transition_state(
+                conversation_uuid, attempt_id, STATE_MESSAGE_OBSERVED,
+                detail="Forward reconciled: prompt confirmed in live DOM"
+            )
+            reconciled = True
+            current_state = STATE_MESSAGE_OBSERVED
+
+    if current_state == STATE_MESSAGE_OBSERVED and is_turn_active:
+        journal.transition_state(
+            conversation_uuid, attempt_id, STATE_TURN_STARTED,
+            detail="Forward reconciled: active turn detected in live DOM"
+        )
+        reconciled = True
+
+    updated_rec, _ = journal.get_latest_record(conversation_uuid)
+    return updated_rec, reconciled
+
 class RecoveryJournal:
     def __init__(self, journal_path=None):
         self.journal_path = journal_path or get_default_journal_path()
+        self.lock_path = f"{self.journal_path}.lock"
         self._is_corrupted = False
+        self._schema_unsupported = False
+
+    @contextlib.contextmanager
+    def exclusive_lock(self, timeout=5.0):
+        """
+        Cross-process advisory file lock for the recovery journal.
+        Guarantees single-writer execution across the critical region.
+        """
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        start_time = time.time()
+        lock_fd = None
+
+        while time.time() - start_time < timeout:
+            try:
+                lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                break
+            except OSError:
+                time.sleep(0.05)
+
+        if lock_fd is None:
+            raise TimeoutError(f"Could not acquire journal lock '{self.lock_path}' within {timeout}s")
+
+        try:
+            yield
+        finally:
+            try:
+                os.close(lock_fd)
+                if os.path.exists(self.lock_path):
+                    os.remove(self.lock_path)
+            except OSError:
+                pass
 
     def _read_raw(self):
-        """Read and validate journal file. Returns (data_dict, status_str)."""
+        """Read, validate schema, and return (data_dict, status_str)."""
+        if self._schema_unsupported:
+            return {"version": SCHEMA_VERSION, "records": {}, "error": "Journal schema version is unsupported"}, "SCHEMA_UNSUPPORTED"
         if self._is_corrupted:
-            return {"version": 2, "records": {}, "error": "Journal is marked corrupted"}, "CORRUPTED"
+            return {"version": SCHEMA_VERSION, "records": {}, "error": "Journal is marked corrupted"}, "CORRUPTED"
 
         if not os.path.exists(self.journal_path):
-            return {"version": 2, "records": {}}, "NOT_FOUND"
+            return {"version": SCHEMA_VERSION, "records": {}}, "NOT_FOUND"
 
         try:
             with open(self.journal_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, dict) or "records" not in data:
-                raise ValueError("Malformed journal schema: missing 'records' key")
+
+            if isinstance(data, dict) and data.get("version") != SCHEMA_VERSION:
+                self._schema_unsupported = True
+                return data, "SCHEMA_UNSUPPORTED"
+
+            validate_journal_schema(data)
             return data, "OK"
+        except JournalSchemaError as jse:
+            self._is_corrupted = True
+            corrupt_path = f"{self.journal_path}.corrupt.{int(time.time())}"
+            try:
+                os.replace(self.journal_path, corrupt_path)
+            except Exception:
+                pass
+            return {"version": SCHEMA_VERSION, "records": {}, "corrupted_backup": corrupt_path, "error": str(jse)}, "SCHEMA_INVALID"
         except Exception as e:
             self._is_corrupted = True
             corrupt_path = f"{self.journal_path}.corrupt.{int(time.time())}"
@@ -161,12 +338,14 @@ class RecoveryJournal:
                 os.replace(self.journal_path, corrupt_path)
             except Exception:
                 pass
-            return {"version": 2, "records": {}, "corrupted_backup": corrupt_path, "error": str(e)}, "CORRUPTED"
+            return {"version": SCHEMA_VERSION, "records": {}, "corrupted_backup": corrupt_path, "error": str(e)}, "CORRUPTED"
 
     def _write_atomic(self, data):
         """
         Durably persist data using temp file, flush, fsync, and atomic replace.
+        Fsync failures raise JournalDurabilityError and abort before send.
         """
+        validate_journal_schema(data)
         target_dir = os.path.dirname(self.journal_path)
         os.makedirs(target_dir, exist_ok=True)
 
@@ -177,8 +356,8 @@ class RecoveryJournal:
                 f.flush()
                 try:
                     os.fsync(f.fileno())
-                except OSError:
-                    pass
+                except OSError as ose:
+                    raise JournalDurabilityError(f"JOURNAL_DURABILITY_FAILED: fsync failed: {ose}") from ose
             os.replace(temp_path, self.journal_path)
         except Exception:
             if os.path.exists(temp_path):
@@ -189,11 +368,10 @@ class RecoveryJournal:
             raise
 
     def get_latest_record(self, conversation_uuid):
-        """Retrieve latest recovery record for given conversation UUID."""
         val_uuid = validate_uuid(conversation_uuid)
         data, status = self._read_raw()
-        if status == "CORRUPTED":
-            return None, "CORRUPTED"
+        if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
+            return None, status
         records = data.get("records", {})
         convo_records = records.get(val_uuid, [])
         if not convo_records:
@@ -201,14 +379,10 @@ class RecoveryJournal:
         return convo_records[-1], status
 
     def start_recovery_attempt(self, conversation_uuid, prompt_text):
-        """
-        Initialize and record a new recovery attempt in NOT_SENT state.
-        Refuses to start if journal is corrupted.
-        """
         val_uuid = validate_uuid(conversation_uuid)
         data, status = self._read_raw()
-        if status == "CORRUPTED":
-            raise RuntimeError("Cannot start recovery attempt: recovery journal is corrupted. Manual reconciliation required.")
+        if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
+            raise RuntimeError(f"Cannot start recovery attempt: journal is in invalid state '{status}'. Manual reconciliation required.")
 
         attempt_id = str(uuid.uuid4())
         prompt_sha = hash_prompt(prompt_text)
@@ -235,16 +409,15 @@ class RecoveryJournal:
         return record
 
     def transition_state(self, conversation_uuid, attempt_id, new_state, failure_stage=None, detail=None):
-        """
-        Update the state of an existing recovery attempt enforcing allowed transition graph.
-        """
         val_uuid = validate_uuid(conversation_uuid)
         if new_state not in VALID_STATES:
             raise ValueError(f"Invalid recovery state: {new_state}")
+        if failure_stage is not None and failure_stage not in VALID_FAILURE_STAGES:
+            raise ValueError(f"Invalid failure stage: {failure_stage}")
 
         data, status = self._read_raw()
-        if status == "CORRUPTED":
-            raise RuntimeError("Cannot transition state: recovery journal is corrupted.")
+        if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
+            raise RuntimeError(f"Cannot transition state: journal is in invalid state '{status}'.")
 
         records = data.get("records", {}).get(val_uuid, [])
         target_record = None

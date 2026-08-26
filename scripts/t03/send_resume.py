@@ -4,6 +4,22 @@ Antigravity Desktop Resume Adapter (T03 Research Prototype)
 
 Implements safe, deterministic conversation location, duplicate prevention,
 crash-safe recovery journaling, and resume submission via Chrome DevTools Protocol (CDP).
+
+Review Round 4 Corrections:
+- Strict journal schema validation and durability barrier enforcement.
+- FAILED with unknown/unconfirmed failure_stage strictly fails closed.
+- Exclusive cross-process file locking for the critical send region.
+- Exact URL pathname parsing and route validation (zero substring matching).
+- Target chat container must be found; strictly NO fallback to document.body.
+- Post-baseline error tracking: historical errors do not poison new healthy turns.
+- Semantic-only author identification: zero text-prefix heuristics.
+- Automatic derivation of first-attempt status from journal records.
+- Refactored execute_resume_pipeline() supporting full dependency injection for automated testing.
+- Single qualified WebSocket connection lifecycle with event-frame filtering.
+- Verified dry-run navigation restoration with explicit failure handling.
+- Integrated external error correlation adapter hook for T01/supervisor integration.
+- Safe forward reconciliation of existing attempts.
+- Complete removal of dangerous manual override from supervisor API.
 """
 
 import argparse
@@ -22,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from recovery_journal import (
     RecoveryJournal,
+    JournalDurabilityError,
     STATE_NOT_SENT,
     STATE_SUBMISSION_ATTEMPTED,
     STATE_DISPATCHED_UNCONFIRMED,
@@ -35,9 +52,11 @@ from recovery_journal import (
     DECISION_PREVIOUS_SUBMISSION_UNCONFIRMED,
     DECISION_RECOVERY_STATE_UNKNOWN,
     DECISION_JOURNAL_CORRUPTED,
+    DECISION_JOURNAL_SCHEMA_UNSUPPORTED,
     DECISION_MANUAL_RECONCILIATION_REQUIRED,
     DECISION_BLOCKED_DRAFT_PRESENT,
     evaluate_recovery_permission,
+    reconcile_existing_attempt,
     validate_uuid,
     hash_prompt
 )
@@ -77,7 +96,7 @@ def discover_cdp_endpoint():
         port = lines[0].strip()
         endpoint = f"http://127.0.0.1:{port}"
         
-        req = urllib.request.Request(f"{endpoint}/json/version", headers={"User-Agent": "SwitchAntigravity-T03/3.0"})
+        req = urllib.request.Request(f"{endpoint}/json/version", headers={"User-Agent": "SwitchAntigravity-T03/4.0"})
         with urllib.request.urlopen(req, timeout=2) as resp:
             ver_data = json.loads(resp.read().decode("utf-8"))
             if "Browser" not in ver_data:
@@ -86,12 +105,12 @@ def discover_cdp_endpoint():
     except Exception:
         return None, "CDP_ENDPOINT_UNREACHABLE"
 
-def classify_duplicate_state(user_messages, prompt_hash, has_unknown_role=False):
-    if has_unknown_role:
+def classify_duplicate_state(user_messages, prompt_hash, has_unknown_role=False, last_message_is_unknown=False):
+    if last_message_is_unknown:
         return "DUPLICATE_STATE_UNKNOWN", None
 
     if not user_messages:
-        return "DUPLICATE_STATE_UNKNOWN", None
+        return "RESUME_NOT_PRESENT" if not has_unknown_role else "DUPLICATE_STATE_UNKNOWN", None
 
     last_user_text = user_messages[-1]
     last_user_hash = hash_text(last_user_text)
@@ -100,18 +119,22 @@ def classify_duplicate_state(user_messages, prompt_hash, has_unknown_role=False)
         return "RESUME_MESSAGE_PRESENT", last_user_hash
     return "RESUME_NOT_PRESENT", last_user_hash
 
-def correlate_turn_status(dom_state, external_error_hook=None):
+def correlate_turn_status(dom_state, baseline_state=None, external_error_hook=None):
     if not dom_state:
         return "TURN_STATUS_UNKNOWN"
 
     if external_error_hook and callable(external_error_hook):
-        ext_res = external_error_hook(dom_state)
+        ext_res = external_error_hook(dom_state, baseline_state)
         if ext_res:
             return ext_res
 
-    if dom_state.get("hasQuotaError"):
+    # Check only new post-baseline errors
+    new_quota_error = dom_state.get("newQuotaError", False)
+    new_generic_error = dom_state.get("newGenericError", False)
+
+    if new_quota_error:
         return "QUOTA_ERROR_OBSERVED"
-    if dom_state.get("hasGenericError"):
+    if new_generic_error:
         return "ERROR_RESPONSE_OBSERVED"
     if dom_state.get("isMainTurnActive"):
         return "ASSISTANT_GENERATION_ACTIVE"
@@ -136,7 +159,7 @@ class QualifiedAntigravityClient:
         self._connection_count += 1
         try:
             url = f"{self.endpoint}/json/list"
-            req = urllib.request.Request(url, headers={"User-Agent": "SwitchAntigravity-T03/3.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SwitchAntigravity-T03/4.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 targets = json.loads(resp.read().decode("utf-8"))
         except Exception:
@@ -264,11 +287,17 @@ class QualifiedAntigravityClient:
                 
                 let uuid = null;
                 if (href) {
-                    const match = href.match(/\/c\/([0-9a-fA-F-]{36})/);
-                    if (match) uuid = match[1];
+                    try {
+                        const parsedUrl = new URL(href, window.location.origin);
+                        const match = parsedUrl.pathname.match(/^\/c\/([0-9a-fA-F-]{36})$/);
+                        if (match) uuid = match[1].toLowerCase();
+                    } catch (e) {
+                        const match = href.match(/^\/c\/([0-9a-fA-F-]{36})$/);
+                        if (match) uuid = match[1].toLowerCase();
+                    }
                 }
-                const pathname = window.location.pathname;
-                const isActive = !!(uuid && (pathname === '/c/' + uuid || pathname.startsWith('/c/' + uuid + '/')));
+                const pathname = window.location.pathname.toLowerCase();
+                const isActive = !!(uuid && pathname === '/c/' + uuid);
                 const hasRowStopButton = !!row.querySelector('button[aria-label*="Stop"], button[data-testid*="stop"]');
 
                 return {
@@ -291,12 +320,24 @@ class QualifiedAntigravityClient:
             const rows = Array.from(document.querySelectorAll('[data-testid="conversation-row-sidebar"]'));
             for (const row of rows) {{
                 const link = row.closest('a') || row.querySelector('a') || (row.parentElement && row.parentElement.querySelector('a'));
-                if (link && link.getAttribute('href') && link.getAttribute('href').includes(targetUuid)) {{
-                    link.click();
-                    return {{ clicked: true }};
+                if (link) {{
+                    const href = link.getAttribute('href') || '';
+                    let rowUuid = null;
+                    try {{
+                        const parsed = new URL(href, window.location.origin);
+                        const match = parsed.pathname.match(/^\\/c\\/([0-9a-fA-F-]{{36}})$/);
+                        if (match) rowUuid = match[1].toLowerCase();
+                    }} catch(e) {{
+                        const match = href.match(/^\\/c\\/([0-9a-fA-F-]{{36}})$/);
+                        if (match) rowUuid = match[1].toLowerCase();
+                    }}
+                    if (rowUuid === targetUuid.toLowerCase()) {{
+                        link.click();
+                        return {{ clicked: true, method: "sidebar_row_click" }};
+                    }}
                 }}
             }}
-            window.location.pathname = '/c/' + targetUuid;
+            window.location.pathname = '/c/' + targetUuid.toLowerCase();
             return {{ clicked: true, method: "pathname_nav" }};
         }})({json.dumps(val_uuid)})
         """
@@ -306,9 +347,9 @@ class QualifiedAntigravityClient:
         while time.time() - start < timeout:
             check = await self.evaluate(f"""
             ((targetUuid) => {{
-                const pathname = window.location.pathname;
-                const expected = '/c/' + targetUuid;
-                const isExactMatch = (pathname === expected || pathname.startsWith(expected + '/'));
+                const pathname = window.location.pathname.toLowerCase();
+                const expected = '/c/' + targetUuid.toLowerCase();
+                const isExactMatch = (pathname === expected);
                 const composerMounted = !!document.querySelector('[data-lexical-editor="true"]');
                 return {{
                     isExactMatch: isExactMatch,
@@ -326,17 +367,21 @@ class QualifiedAntigravityClient:
 
         return {"status": "CONVERSATION_SWITCH_TIMEOUT"}
 
-    async def inspect_scoped_conversation_state(self, target_uuid, prompt_hash):
+    async def inspect_scoped_conversation_state(self, target_uuid, prompt_hash, baseline_article_count=0):
         val_uuid = validate_uuid(target_uuid)
         script = rf"""
-        ((targetUuid) => {{
-            const pathname = window.location.pathname;
-            const expected = '/c/' + targetUuid;
-            if (!(pathname === expected || pathname.startsWith(expected + '/'))) {{
+        ((targetUuid, baselineCount) => {{
+            const pathname = window.location.pathname.toLowerCase();
+            const expected = '/c/' + targetUuid.toLowerCase();
+            if (pathname !== expected) {{
                 return {{ error: "WRONG_CONVERSATION_ACTIVE", currentPathname: pathname }};
             }}
 
-            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main') || document.body;
+            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
+            if (!mainContainer) {{
+                return {{ error: "TARGET_CHAT_CONTAINER_NOT_FOUND" }};
+            }}
+
             const articles = Array.from(mainContainer.querySelectorAll('article, [role="article"]'));
             
             const mainStopButtons = Array.from(mainContainer.querySelectorAll('button')).filter(b => {{
@@ -349,31 +394,36 @@ class QualifiedAntigravityClient:
             const userMessages = [];
             const assistantMessages = [];
             let hasUnknownRole = false;
-            let hasQuotaError = false;
-            let hasGenericError = false;
+            let lastMessageIsUnknown = false;
+            let newQuotaError = false;
+            let newGenericError = false;
 
-            articles.forEach(art => {{
+            articles.forEach((art, idx) => {{
                 const authorAttr = (art.getAttribute('data-author') || '').toLowerCase();
-                const isUserClass = art.classList.contains('user-message') || !!art.querySelector('[data-testid="user-message"]');
-                const isAssistClass = art.classList.contains('assistant-message') || !!art.querySelector('[data-testid="assistant-message"]');
+                const isUserClass = art.classList.contains('user-message') || !!art.querySelector('[data-testid="user-message"], [data-testid="user-turn"]');
+                const isAssistClass = art.classList.contains('assistant-message') || !!art.querySelector('[data-testid="assistant-message"], [data-testid="assistant-turn"]');
                 const text = (art.textContent || '').trim();
 
-                const textLower = text.toLowerCase();
-                if (textLower.includes('quota exceeded') || textLower.includes('rate limit') || textLower.includes('resource_exhausted')) {{
-                    hasQuotaError = true;
-                }}
-                if (art.querySelector('.markdown-alert-danger, [data-testid="error-banner"]')) {{
-                    hasGenericError = true;
+                const isNewNode = (idx >= baselineCount);
+                if (isNewNode) {{
+                    const textLower = text.toLowerCase();
+                    if (textLower.includes('quota exceeded') || textLower.includes('rate limit') || textLower.includes('resource_exhausted')) {{
+                        newQuotaError = true;
+                    }}
+                    if (art.querySelector('.markdown-alert-danger, [data-testid="error-banner"]')) {{
+                        newGenericError = true;
+                    }}
                 }}
 
                 if (authorAttr === 'user' || isUserClass) {{
                     userMessages.push(text);
-                }} else if (authorAttr === 'assistant' || isAssistClass || art.querySelector('.markdown-alert')) {{
+                    if (idx === articles.length - 1) lastMessageIsUnknown = false;
+                }} else if (authorAttr === 'assistant' || isAssistClass) {{
                     assistantMessages.push(text);
-                }} else if (text.startsWith('User:')) {{
-                    userMessages.push(text.replace(/^User:\s*/i, ''));
+                    if (idx === articles.length - 1) lastMessageIsUnknown = false;
                 }} else {{
                     hasUnknownRole = true;
+                    if (idx === articles.length - 1) lastMessageIsUnknown = true;
                 }}
             }});
 
@@ -388,13 +438,14 @@ class QualifiedAntigravityClient:
                 lastUserMessageText: lastUserMsg,
                 lastAssistantMessageText: lastAssistantMsg,
                 hasUnknownRole: hasUnknownRole,
-                hasQuotaError: hasQuotaError,
-                hasGenericError: hasGenericError,
+                lastMessageIsUnknown: lastMessageIsUnknown,
+                newQuotaError: newQuotaError,
+                newGenericError: newGenericError,
                 isMainTurnActive: mainStopButtons.length > 0,
                 mainStopButtonCount: mainStopButtons.length,
                 isConversationEmptyOrIdle: (articles.length === 0 || (userMessages.length === 0 && !mainStopButtons.length))
             }};
-        }})({json.dumps(val_uuid)})
+        }})({json.dumps(val_uuid)}, {baseline_article_count})
         """
         raw_state = await self.evaluate(script)
         if raw_state.get("error"):
@@ -403,7 +454,8 @@ class QualifiedAntigravityClient:
         dup_status, last_hash = classify_duplicate_state(
             raw_state.get("userMessages", []),
             prompt_hash,
-            raw_state.get("hasUnknownRole", False)
+            raw_state.get("hasUnknownRole", False),
+            raw_state.get("lastMessageIsUnknown", False)
         )
         raw_state["duplicateStatus"] = dup_status
         raw_state["lastUserMessageHash"] = last_hash
@@ -412,12 +464,12 @@ class QualifiedAntigravityClient:
     async def inspect_composer_state(self):
         script = """
         (() => {
-            const editor = document.querySelector('[data-lexical-editor="true"]');
+            const mainContainer = document.querySelector('main') || document.body;
+            const editor = mainContainer.querySelector('[data-lexical-editor="true"]');
             if (!editor) return { found: false };
             
-            const sendBtn = document.querySelector('button[data-testid="send-button"], button[aria-label="Send message"]');
-            const mainChat = document.querySelector('main') || document.body;
-            const stopBtn = Array.from(mainChat.querySelectorAll('button')).find(b => {
+            const sendBtn = mainContainer.querySelector('button[data-testid="send-button"], button[aria-label="Send message"]');
+            const stopBtn = Array.from(mainContainer.querySelectorAll('button')).find(b => {
                 if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 return label.includes('stop') && !!b.offsetParent;
@@ -490,13 +542,14 @@ class QualifiedAntigravityClient:
         })
         return {"dispatched": True, "method": "enter_key"}
 
-    async def wait_for_user_and_assistant_turn(self, target_uuid, prompt_hash, baseline, timeout=12):
+    async def wait_for_user_and_assistant_turn(self, target_uuid, prompt_hash, baseline, timeout=12, external_error_hook=None):
         start = time.time()
         user_msg_observed = False
         assistant_turn_type = "NO_ASSISTANT_TURN"
+        baseline_articles = baseline.get("totalArticles", 0)
 
         while time.time() - start < timeout:
-            state = await self.inspect_scoped_conversation_state(target_uuid, prompt_hash)
+            state = await self.inspect_scoped_conversation_state(target_uuid, prompt_hash, baseline_article_count=baseline_articles)
             
             if not user_msg_observed:
                 last_user_hash = state.get("lastUserMessageHash")
@@ -505,7 +558,7 @@ class QualifiedAntigravityClient:
                     user_msg_observed = True
 
             state["assistantMessageDelta"] = state.get("assistantMessageCount", 0) - baseline.get("assistantMessageCount", 0)
-            assistant_turn_type = correlate_turn_status(state)
+            assistant_turn_type = correlate_turn_status(state, baseline, external_error_hook)
 
             if user_msg_observed and assistant_turn_type in ["ASSISTANT_GENERATION_ACTIVE", "ASSISTANT_GENERATION_COMPLETED", "QUOTA_ERROR_OBSERVED", "ERROR_RESPONSE_OBSERVED"]:
                 return {
@@ -523,10 +576,14 @@ class QualifiedAntigravityClient:
             "elapsed_seconds": round(time.time() - start, 2)
         }
 
-async def execute_resume_pipeline(args):
+async def execute_resume_pipeline(args, client_override=None, journal_override=None, external_error_hook=None):
+    """
+    Main execution pipeline for conversation restore and resume submission.
+    Supports dependency injection for 100% test coverage without live side effects.
+    """
     result = {
         "status": "INIT",
-        "dry_run": not args.send,
+        "dry_run": not getattr(args, "send", False),
         "endpoint": None,
         "target_conversation": None,
         "recovery_attempt_id": None,
@@ -542,9 +599,9 @@ async def execute_resume_pipeline(args):
         "errors": []
     }
 
-    journal = RecoveryJournal(args.journal_path)
+    journal = journal_override or RecoveryJournal(getattr(args, "journal_path", None))
 
-    if args.cdp_endpoint:
+    if getattr(args, "cdp_endpoint", None):
         endpoint = args.cdp_endpoint
         status = "OK"
     else:
@@ -556,16 +613,16 @@ async def execute_resume_pipeline(args):
         result["errors"].append(f"CDP discovery failed: {status}")
         return result
 
-    if not args.prompt or not args.prompt.strip():
+    prompt_text = getattr(args, "prompt", "").strip() if getattr(args, "prompt", None) else ""
+    if not prompt_text:
         result["status"] = "ERROR_EMPTY_PROMPT"
         result["errors"].append("Prompt text cannot be empty.")
         return result
 
-    prompt_text = args.prompt.strip()
     prompt_hash = hash_text(prompt_text)
 
     try:
-        client = QualifiedAntigravityClient(endpoint=endpoint, timeout=args.timeout)
+        client = client_override or QualifiedAntigravityClient(endpoint=endpoint, timeout=getattr(args, "timeout", 30))
         _, qual_status = await client.connect_and_qualify()
         if qual_status != "APP_PAGE_QUALIFIED":
             result["status"] = qual_status
@@ -576,7 +633,7 @@ async def execute_resume_pipeline(args):
             convos = await client.list_conversations()
 
             target = None
-            if args.conversation_id:
+            if getattr(args, "conversation_id", None):
                 val_target_uuid = validate_uuid(args.conversation_id)
                 matches = [c for c in convos if c.get("uuid") and c.get("uuid") == val_target_uuid]
                 if not matches:
@@ -584,7 +641,7 @@ async def execute_resume_pipeline(args):
                     result["errors"].append(f"Conversation UUID '{args.conversation_id}' not found in active UI.")
                     return result
                 target = matches[0]
-            elif args.title:
+            elif getattr(args, "title", None):
                 matches = [c for c in convos if (c.get("title") or "").strip() == args.title.strip()]
                 if len(matches) == 0:
                     result["status"] = "CONVERSATION_NOT_FOUND"
@@ -614,7 +671,7 @@ async def execute_resume_pipeline(args):
                 "title_hash": hash_text(target.get("title")),
                 "isExecutingInSidebar": target.get("isExecutingInSidebar")
             }
-            if args.verbose_private_data:
+            if getattr(args, "verbose_private_data", False):
                 target_display["title"] = target.get("title")
             result["target_conversation"] = target_display
 
@@ -632,7 +689,7 @@ async def execute_resume_pipeline(args):
             comp_state = await client.inspect_composer_state()
             if not comp_state.get("found"):
                 result["status"] = "COMPOSER_NOT_FOUND"
-                result["errors"].append("Lexical composer [data-lexical-editor='true'] not found.")
+                result["errors"].append("Lexical composer [data-lexical-editor='true'] not found in main pane.")
                 return result
             result["phases"]["1_composer_located"] = True
 
@@ -645,18 +702,26 @@ async def execute_resume_pipeline(args):
             scoped_state["draftPresent"] = comp_state.get("draftPresent", False)
 
             latest_rec, j_status = journal.get_latest_record(target["uuid"])
+            
+            # Forward reconcile unconfirmed prior attempts if DOM evidence supports it
+            latest_rec, was_reconciled = reconcile_existing_attempt(
+                journal, target["uuid"], latest_rec, scoped_state, prompt_hash
+            )
+
+            is_first_attempt = (latest_rec is None and j_status == "NOT_FOUND")
+
             decision_code, decision_reason = evaluate_recovery_permission(
                 latest_record=latest_rec,
                 live_dom_state=scoped_state,
                 prompt_hash=prompt_hash,
                 journal_status=j_status,
-                is_first_attempt=False
+                is_first_attempt=is_first_attempt
             )
             result["recovery_decision"] = {"code": decision_code, "reason": decision_reason}
 
-            if not args.send:
+            if not getattr(args, "send", False):
                 dry_run_type = "READ_ONLY"
-                if args.probe_composer_write:
+                if getattr(args, "probe_composer_write", False):
                     if scoped_state.get("draftPresent"):
                         result["status"] = "COMPOSER_DRAFT_PRESENT"
                         result["errors"].append("Composer contains unsubmitted user draft. Probe refused.")
@@ -673,9 +738,17 @@ async def execute_resume_pipeline(args):
                 else:
                     result["status"] = "DRY_RUN_READ_ONLY_SUCCESS"
 
+                # Verified navigation restore
                 if original_uuid and original_uuid != target.get("uuid"):
-                    await client.switch_conversation_verified(original_uuid)
-                    result["dry_run_navigation_restored"] = True
+                    restore_res = await client.switch_conversation_verified(original_uuid)
+                    if restore_res.get("status") == "CONVERSATION_SWITCH_VERIFIED":
+                        result["dry_run_navigation_restored"] = True
+                    else:
+                        result["status"] = "DRY_RUN_RESTORE_FAILED"
+                        result["dry_run_navigation_restored"] = False
+                        result["errors"].append(f"Failed to restore original active conversation: {restore_res.get('status')}")
+                elif original_uuid is None:
+                    result["dry_run_navigation_restored"] = "NOT_APPLICABLE_NO_PRIOR_ACTIVE"
 
                 result["dry_run_summary"] = {
                     "mode": dry_run_type,
@@ -686,46 +759,50 @@ async def execute_resume_pipeline(args):
                 }
                 return result
 
+            # Production Send Mode: Single-writer exclusive critical region
             if decision_code != DECISION_NEW_ATTEMPT_ALLOWED:
-                if not args.dangerous_manual_override:
-                    result["status"] = decision_code
-                    result["errors"].append(f"Recovery blocked by safety decision ({decision_code}): {decision_reason}")
-                    return result
+                result["status"] = decision_code
+                result["errors"].append(f"Recovery blocked by safety decision ({decision_code}): {decision_reason}")
+                return result
 
-            if comp_state.get("draftPresent") and not args.dangerous_manual_override:
+            if comp_state.get("draftPresent"):
                 result["status"] = "COMPOSER_DRAFT_PRESENT"
                 result["errors"].append("Composer contains unsubmitted user draft. Send refused.")
                 return result
 
-            attempt_rec = journal.start_recovery_attempt(target["uuid"], prompt_text)
-            attempt_id = attempt_rec["attempt_id"]
-            result["recovery_attempt_id"] = attempt_id
+            with journal.exclusive_lock():
+                attempt_rec = journal.start_recovery_attempt(target["uuid"], prompt_text)
+                attempt_id = attempt_rec["attempt_id"]
+                result["recovery_attempt_id"] = attempt_id
 
-            baseline = scoped_state
+                baseline = scoped_state
 
-            await client.clear_composer()
-            await client.insert_prompt_text(prompt_text)
-            result["phases"]["2_text_inserted"] = True
+                await client.clear_composer()
+                await client.insert_prompt_text(prompt_text)
+                result["phases"]["2_text_inserted"] = True
 
-            verified_comp = await client.inspect_composer_state()
-            if hash_text(verified_comp.get("text")) != prompt_hash:
-                journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail="Text insertion verification failed")
-                result["status"] = "TEXT_INSERTION_FAILED"
-                result["errors"].append("Composer text does not match intended prompt.")
-                return result
-            result["phases"]["3_text_verified"] = True
+                verified_comp = await client.inspect_composer_state()
+                if hash_text(verified_comp.get("text")) != prompt_hash:
+                    journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail="Text insertion verification failed")
+                    result["status"] = "TEXT_INSERTION_FAILED"
+                    result["errors"].append("Composer text does not match intended prompt.")
+                    return result
+                result["phases"]["3_text_verified"] = True
 
-            journal.transition_state(target["uuid"], attempt_id, STATE_SUBMISSION_ATTEMPTED)
+                # Durably persist SUBMISSION_ATTEMPTED before irreversible dispatch
+                journal.transition_state(target["uuid"], attempt_id, STATE_SUBMISSION_ATTEMPTED)
 
-            dispatch_res = await client.dispatch_submission_input()
-            if not dispatch_res.get("dispatched"):
-                journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail="Input dispatch failed")
-                result["status"] = "SEND_INPUT_DISPATCH_FAILED"
-                result["errors"].append("Failed to dispatch send button or Enter key.")
-                return result
-            result["phases"]["4_send_input_dispatched"] = True
+                dispatch_res = await client.dispatch_submission_input()
+                if not dispatch_res.get("dispatched"):
+                    journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail="Input dispatch failed")
+                    result["status"] = "SEND_INPUT_DISPATCH_FAILED"
+                    result["errors"].append("Failed to dispatch send button or Enter key.")
+                    return result
+                result["phases"]["4_send_input_dispatched"] = True
 
-            turn_res = await client.wait_for_user_and_assistant_turn(target["uuid"], prompt_hash, baseline, timeout=args.timeout)
+            turn_res = await client.wait_for_user_and_assistant_turn(
+                target["uuid"], prompt_hash, baseline, timeout=getattr(args, "timeout", 30), external_error_hook=external_error_hook
+            )
             
             if turn_res.get("user_message_observed"):
                 result["phases"]["5_user_message_observed"] = True
@@ -750,6 +827,9 @@ async def execute_resume_pipeline(args):
                 result["status"] = "DISPATCHED_UNCONFIRMED"
                 result["errors"].append("Send input was dispatched, but DOM confirmation timed out. Resend strictly blocked.")
 
+    except JournalDurabilityError as jde:
+        result["status"] = "JOURNAL_DURABILITY_FAILED"
+        result["errors"].append(str(jde))
     except Exception as e:
         result["status"] = "EXCEPTION"
         result["errors"].append(str(e))
@@ -763,7 +843,6 @@ def main():
     parser.add_argument("--prompt", default=DEFAULT_RESUME_PROMPT, help="Resume prompt text")
     parser.add_argument("--send", action="store_true", help="Execute real submission (default: DRY RUN)")
     parser.add_argument("--probe-composer-write", action="store_true", help="Allow dry-run write probe (mutates/cleans composer)")
-    parser.add_argument("--dangerous-manual-override-do-not-use-in-production", dest="dangerous_manual_override", action="store_true", help="Manual test override for duplicate protection")
     parser.add_argument("--cdp-endpoint", help="Custom CDP endpoint URL")
     parser.add_argument("--journal-path", help="Custom recovery journal path")
     parser.add_argument("--timeout", type=int, default=30, help="Operation timeout in seconds")
