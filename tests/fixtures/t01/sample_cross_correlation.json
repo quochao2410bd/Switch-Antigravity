@@ -1,0 +1,26 @@
+{
+  "local_four_way_correlation": {
+    "evidence_class": "VERIFIED_LIVE_RUNTIME",
+    "matching_conversations_count": 9,
+    "total_conversations_count": 9,
+    "sources": [
+      "sqlite_db_filename (%USERPROFILE%\\.gemini\\antigravity\\conversations\\<cascade_id>.db)",
+      "sqlite_trajectory_meta_table (cascade_id column)",
+      "brain_directory (%USERPROFILE%\\.gemini\\antigravity\\brain\\<cascade_id>\\)",
+      "proto_summaries_index (agyhub_summaries_proto.pb Field 17 Subfield 6, REVERSE_ENGINEERED_RUNTIME_MAPPING)"
+    ],
+    "sample_synthetic_correlation": {
+      "cascade_id": "00000000-0000-4000-8000-000000000001",
+      "trajectory_id": "10000000-0000-4000-8000-000000000001",
+      "db_filename_matches_table": true,
+      "brain_dir_exists": true,
+      "proto_index_matches": true
+    }
+  },
+  "active_cdp_correlation": {
+    "evidence_class": "VERIFIED_LIVE_RUNTIME",
+    "eligible_conversation_page_targets_count": 1,
+    "matched_page_targets_count": 1,
+    "sample_active_target_url": "https://127.0.0.1:58861/c/00000000-0000-4000-8000-000000000001?section=90000000-0000-4000-8000-000000000001"
+  }
+}

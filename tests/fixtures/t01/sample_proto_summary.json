@@ -1,0 +1,10 @@
+{
+  "schema_note": "REVERSE_ENGINEERED_RUNTIME_MAPPING from agyhub_summaries_proto.pb",
+  "conversation_id": "00000000-0000-4000-8000-000000000001",
+  "title": "Sample Active Task",
+  "step_count": 100,
+  "trajectory_id": "10000000-0000-4000-8000-000000000001",
+  "workspace_uri": "file:///c:/Users/<USER>/Documents/workspace",
+  "git_branch": "main",
+  "project_id": "90000000-0000-4000-8000-000000000001"
+}

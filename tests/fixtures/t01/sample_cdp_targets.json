@@ -1,0 +1,9 @@
+[
+  {
+    "id": "PAGE_TARGET_0001",
+    "type": "page",
+    "title": "Sample Active Task",
+    "url": "https://127.0.0.1:58861/c/00000000-0000-4000-8000-000000000001?section=90000000-0000-4000-8000-000000000001",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:58859/devtools/page/PAGE_TARGET_0001"
+  }
+]

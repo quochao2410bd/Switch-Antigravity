@@ -1,0 +1,2 @@
+ERROR: logging before google.Init: I0826 12:00:00.000000   99999 http_helpers.go:246] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0xTRACE_SYNTH_001 ResponseID: RESPONSE_SYNTH_001
+ERROR: logging before google.Init: I0826 12:00:01.000000   99999 http_helpers.go:246] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0xTRACE_SYNTH_002 ResponseID: RESPONSE_SYNTH_002
