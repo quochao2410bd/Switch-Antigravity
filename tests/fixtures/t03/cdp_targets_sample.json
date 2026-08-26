@@ -1,0 +1,17 @@
+{
+  "browser": "Chrome/146.0.7680.72",
+  "protocol_version": "1.3",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/2.10.0 Chrome/146.0.7680.72 Electron/41.0.2 Safari/537.36",
+  "devtools_active_port_path": "%APPDATA%\\Antigravity\\DevToolsActivePort",
+  "discovered_targets": [
+    {
+      "description": "",
+      "devtoolsFrontendUrl": "https://chrome-devtools-frontend.appspot.com/serve_rev/@cb10bb07c0a5dac19a421f7cbfd002146e74aaed/inspector.html?ws=127.0.0.1:58859/devtools/page/9D4E5D621CAD31DF70D72A4FD346265F",
+      "id": "9D4E5D621CAD31DF70D72A4FD346265F",
+      "title": "T03",
+      "type": "page",
+      "url": "https://127.0.0.1:58861/c/54fa3d23-64f3-4fb4-b790-02cdd1e92d75",
+      "webSocketDebuggerUrl": "ws://127.0.0.1:58859/devtools/page/9D4E5D621CAD31DF70D72A4FD346265F"
+    }
+  ]
+}

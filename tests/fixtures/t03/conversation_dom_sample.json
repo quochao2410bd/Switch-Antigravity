@@ -1,0 +1,37 @@
+{
+  "sidebar_structure": [
+    {
+      "index": 0,
+      "title": "T03",
+      "href": "/c/54fa3d23-64f3-4fb4-b790-02cdd1e92d75",
+      "uuid": "54fa3d23-64f3-4fb4-b790-02cdd1e92d75",
+      "isActive": true,
+      "isExecuting": true,
+      "buttons": [
+        { "label": "More options", "testid": "conversation-kebab" },
+        { "label": "Pin conversation", "testid": "conversation-pin-button" },
+        { "label": "Stop execution", "testid": null }
+      ]
+    },
+    {
+      "index": 1,
+      "title": "T01",
+      "href": "/c/4674ef3b-d559-4a90-87e2-c30b11f03250",
+      "uuid": "4674ef3b-d559-4a90-87e2-c30b11f03250",
+      "isActive": false,
+      "isExecuting": false,
+      "buttons": [
+        { "label": "More options", "testid": "conversation-kebab" },
+        { "label": "Pin conversation", "testid": "conversation-pin-button" }
+      ]
+    }
+  ],
+  "composer": {
+    "selector": "[data-lexical-editor=\"true\"]",
+    "tag": "DIV",
+    "role": "combobox",
+    "aria_label": "Message input",
+    "send_button_selector": "button[data-testid=\"send-button\"]",
+    "stop_button_selector": "button[aria-label*=\"Stop\"], button[data-testid*=\"stop\"]"
+  }
+}
