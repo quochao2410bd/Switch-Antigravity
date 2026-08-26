@@ -5,12 +5,16 @@ Persistent Recovery Journal for Antigravity Resume Adapter (T03 Prototype)
 Manages crash-recovery state for conversation resume attempts.
 Stores strictly non-sensitive metadata (UUIDs, state, prompt SHA-256, timestamps).
 
-Review Round 5 Hardening:
-- Final send decision and forward reconciliation strictly executed INSIDE the exclusive lock.
-- Cross-process advisory lock with process liveness metadata and safe stale lock recovery.
-- Re-read from disk and re-validate schema immediately after acquiring lock.
-- Post-dispatch state transitions are protected by the same mutation lock to eliminate races.
-- Strict schema validation and durability barriers (fsync failure raises JournalDurabilityError).
+Review Round 6 Hardening:
+- Non-reentrant explicit locking architecture:
+    * Public methods (start_recovery_attempt, transition_state) acquire exclusive lock.
+    * Explicit unlocked methods (_start_recovery_attempt_unlocked, _transition_state_unlocked, _reconcile_unlocked)
+      are strictly used when the lock is already held by execute_resume_pipeline.
+    * No unsafe thread-blind/depth-counter reentrancy bypasses.
+- Tri-state process liveness checker (PROCESS_ALIVE, PROCESS_DEAD_CONFIRMED, PROCESS_LIVENESS_UNKNOWN).
+- PID reuse mitigation via process creation timestamp / identity metadata and lock nonce.
+- Stale locks from dead PIDs reclaimed only after dead status is confirmed; always re-reads journal state.
+- Durability barriers (fsync failure raises JournalDurabilityError).
 """
 
 import contextlib
@@ -19,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import uuid
@@ -69,6 +74,10 @@ DECISION_MANUAL_RECONCILIATION_REQUIRED = "MANUAL_RECONCILIATION_REQUIRED"
 DECISION_BLOCKED_DRAFT_PRESENT = "BLOCKED_DRAFT_PRESENT"
 DECISION_CONCURRENT_LOCK_ACTIVE = "CONCURRENT_LOCK_ACTIVE"
 
+LIVENESS_ALIVE = "PROCESS_ALIVE"
+LIVENESS_DEAD_CONFIRMED = "PROCESS_DEAD_CONFIRMED"
+LIVENESS_UNKNOWN = "PROCESS_LIVENESS_UNKNOWN"
+
 UUID_REGEX = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 SHA256_REGEX = re.compile(r'^[0-9a-fA-F]{64}$')
 
@@ -80,24 +89,100 @@ class JournalSchemaError(ValueError):
     """Raised when the journal content violates strict semantic schema rules."""
     pass
 
-def is_pid_alive(pid):
-    """Check if process ID is currently running on the system."""
+def get_process_start_identity(pid):
+    """
+    Returns a unique identifier or creation timestamp for a process PID to mitigate PID reuse.
+    On Windows, uses GetProcessTimes. On Unix, reads /proc/<pid>/stat.
+    """
     if pid <= 0:
-        return False
+        return None
     if os.name == 'nt':
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if handle == 0:
-            return False
-        kernel32.CloseHandle(handle)
-        return True
+            return None
+        try:
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("dwLowDateTime", ctypes.c_uint), ("dwHighDateTime", ctypes.c_uint)]
+            creation_time = FILETIME()
+            exit_time = FILETIME()
+            kernel_time = FILETIME()
+            user_time = FILETIME()
+            if kernel32.GetProcessTimes(handle, ctypes.byref(creation_time), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                return (creation_time.dwHighDateTime << 32) + creation_time.dwLowDateTime
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            stat_file = f"/proc/{pid}/stat"
+            if os.path.exists(stat_file):
+                with open(stat_file, "r") as f:
+                    parts = f.read().split()
+                    if len(parts) > 21:
+                        return parts[21]
+        except Exception:
+            pass
+        return None
+
+def check_process_liveness(pid, expected_start_identity=None):
+    """
+    Tri-state process liveness checker.
+    Returns:
+      PROCESS_ALIVE - Process is definitely running and start identity matches.
+      PROCESS_DEAD_CONFIRMED - Process does not exist (confirmed dead, safe to reclaim).
+      PROCESS_LIVENESS_UNKNOWN - Cannot determine status (e.g. Access Denied), fail closed.
+    """
+    if pid <= 0:
+        return LIVENESS_DEAD_CONFIRMED
+
+    if os.name == 'nt':
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle == 0:
+            err = kernel32.GetLastError()
+            ERROR_INVALID_PARAMETER = 87
+            ERROR_NOT_FOUND = 1168
+            ERROR_ACCESS_DENIED = 5
+            if err in (ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND):
+                return LIVENESS_DEAD_CONFIRMED
+            elif err == ERROR_ACCESS_DENIED:
+                return LIVENESS_UNKNOWN
+            return LIVENESS_DEAD_CONFIRMED
+
+        try:
+            # Check exit code
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                STILL_ACTIVE = 259
+                if exit_code.value != STILL_ACTIVE:
+                    return LIVENESS_DEAD_CONFIRMED
+
+            # Check PID reuse if start identity was recorded
+            if expected_start_identity is not None:
+                current_start = get_process_start_identity(pid)
+                if current_start is not None and current_start != expected_start_identity:
+                    return LIVENESS_DEAD_CONFIRMED
+
+            return LIVENESS_ALIVE
+        finally:
+            kernel32.CloseHandle(handle)
     else:
         try:
             os.kill(pid, 0)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
+            if expected_start_identity is not None:
+                current_start = get_process_start_identity(pid)
+                if current_start is not None and current_start != expected_start_identity:
+                    return LIVENESS_DEAD_CONFIRMED
+            return LIVENESS_ALIVE
+        except ProcessLookupError:
+            return LIVENESS_DEAD_CONFIRMED
+        except PermissionError:
+            return LIVENESS_UNKNOWN
+        except OSError:
+            return LIVENESS_UNKNOWN
 
 def validate_uuid(convo_uuid):
     if not convo_uuid or not isinstance(convo_uuid, str) or not UUID_REGEX.match(convo_uuid.strip()):
@@ -252,88 +337,52 @@ def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, jou
 
     return DECISION_RECOVERY_STATE_UNKNOWN, f"Unhandled duplicate status '{dom_duplicate_status}'. Fail closed."
 
-def reconcile_existing_attempt(journal, conversation_uuid, latest_record, live_dom_state, prompt_hash):
-    """
-    Safely reconciles an existing unconfirmed attempt forward without mutating backward.
-    Must be called inside the journal exclusive lock when performing state mutations.
-    """
-    if not latest_record or not live_dom_state:
-        return latest_record, False
-
-    attempt_id = latest_record.get("attempt_id")
-    current_state = latest_record.get("state")
-    last_user_hash = live_dom_state.get("lastUserMessageHash")
-    is_turn_active = live_dom_state.get("isMainTurnActive", False)
-
-    reconciled = False
-    if current_state in [STATE_SUBMISSION_ATTEMPTED, STATE_DISPATCHED_UNCONFIRMED]:
-        if last_user_hash == prompt_hash:
-            journal.transition_state(
-                conversation_uuid, attempt_id, STATE_MESSAGE_OBSERVED,
-                detail="Forward reconciled: prompt confirmed in live DOM"
-            )
-            reconciled = True
-            current_state = STATE_MESSAGE_OBSERVED
-
-    if current_state == STATE_MESSAGE_OBSERVED and is_turn_active:
-        journal.transition_state(
-            conversation_uuid, attempt_id, STATE_TURN_STARTED,
-            detail="Forward reconciled: active turn detected in live DOM"
-        )
-        reconciled = True
-
-    updated_rec, _ = journal.get_latest_record(conversation_uuid)
-    return updated_rec, reconciled
-
 class RecoveryJournal:
     def __init__(self, journal_path=None):
         self.journal_path = journal_path or get_default_journal_path()
         self.lock_path = f"{self.journal_path}.lock"
         self._is_corrupted = False
         self._schema_unsupported = False
-        self._lock_depth = 0
 
     @contextlib.contextmanager
     def exclusive_lock(self, timeout=5.0, conversation_uuid=None):
         """
-        Cross-process advisory file lock for the recovery journal.
-        Writes metadata (owner_pid, timestamp, uuid).
-        Safely detects and reclaims stale locks from dead processes.
-        Supports reentrant locking within the same Python thread/process.
+        Non-reentrant cross-process advisory lock.
+        Writes ownership metadata (owner_pid, start_identity, lock_nonce, timestamp, conversation_uuid).
+        Safely detects and reclaims stale locks strictly when owner PID is confirmed dead.
         """
-        if self._lock_depth > 0:
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
-            return
-
         target_dir = os.path.dirname(os.path.abspath(self.lock_path))
         if target_dir:
             os.makedirs(target_dir, exist_ok=True)
         start_time = time.time()
         lock_fd = None
+        current_pid = os.getpid()
+        current_start_id = get_process_start_identity(current_pid)
+        nonce = str(uuid.uuid4())
 
         while time.time() - start_time < timeout:
             try:
                 lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
                 meta = {
-                    "owner_pid": os.getpid(),
+                    "owner_pid": current_pid,
+                    "start_identity": current_start_id,
+                    "lock_nonce": nonce,
                     "created_at": time.time(),
                     "conversation_uuid": conversation_uuid
                 }
                 os.write(lock_fd, json.dumps(meta).encode("utf-8"))
-                self._lock_depth = 1
                 break
             except OSError:
-                # Lock file exists; check if owner PID is alive
+                # Lock file exists; verify owner liveness
                 try:
                     if os.path.exists(self.lock_path):
                         with open(self.lock_path, "r", encoding="utf-8") as f:
                             lock_meta = json.load(f)
                         owner_pid = lock_meta.get("owner_pid")
-                        if owner_pid and not is_pid_alive(owner_pid):
+                        start_id = lock_meta.get("start_identity")
+                        liveness = check_process_liveness(owner_pid, start_id)
+
+                        if liveness == LIVENESS_DEAD_CONFIRMED:
                             try:
                                 os.remove(self.lock_path)
                                 continue
@@ -349,7 +398,6 @@ class RecoveryJournal:
         try:
             yield
         finally:
-            self._lock_depth = 0
             try:
                 os.close(lock_fd)
                 if os.path.exists(self.lock_path):
@@ -433,7 +481,8 @@ class RecoveryJournal:
             return None, status
         return convo_records[-1], status
 
-    def start_recovery_attempt(self, conversation_uuid, prompt_text):
+    # Explicit unlocked methods for use strictly inside with exclusive_lock():
+    def _start_recovery_attempt_unlocked(self, conversation_uuid, prompt_text):
         val_uuid = validate_uuid(conversation_uuid)
         data, status = self._read_raw()
         if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
@@ -463,45 +512,86 @@ class RecoveryJournal:
         self._write_atomic(data)
         return record
 
-    def transition_state(self, conversation_uuid, attempt_id, new_state, failure_stage=None, detail=None):
+    def _transition_state_unlocked(self, conversation_uuid, attempt_id, new_state, failure_stage=None, detail=None):
         val_uuid = validate_uuid(conversation_uuid)
         if new_state not in VALID_STATES:
             raise ValueError(f"Invalid recovery state: {new_state}")
         if failure_stage is not None and failure_stage not in VALID_FAILURE_STAGES:
             raise ValueError(f"Invalid failure stage: {failure_stage}")
 
-        with self.exclusive_lock(conversation_uuid=val_uuid):
-            data, status = self._read_raw()
-            if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
-                raise RuntimeError(f"Cannot transition state: journal is in invalid state '{status}'.")
+        data, status = self._read_raw()
+        if status in ["CORRUPTED", "SCHEMA_INVALID", "SCHEMA_UNSUPPORTED"]:
+            raise RuntimeError(f"Cannot transition state: journal is in invalid state '{status}'.")
 
-            records = data.get("records", {}).get(val_uuid, [])
-            target_record = None
-            for r in reversed(records):
-                if r.get("attempt_id") == attempt_id:
-                    target_record = r
-                    break
+        records = data.get("records", {}).get(val_uuid, [])
+        target_record = None
+        for r in reversed(records):
+            if r.get("attempt_id") == attempt_id:
+                target_record = r
+                break
 
-            if not target_record:
-                raise KeyError(f"Recovery attempt {attempt_id} not found for {val_uuid}")
+        if not target_record:
+            raise KeyError(f"Recovery attempt {attempt_id} not found for {val_uuid}")
 
-            current_state = target_record["state"]
-            allowed = ALLOWED_TRANSITIONS.get(current_state, set())
-            if new_state not in allowed:
-                raise ValueError(
-                    f"Illegal state transition from '{current_state}' to '{new_state}'. "
-                    f"Allowed transitions: {list(allowed)}"
+        current_state = target_record["state"]
+        allowed = ALLOWED_TRANSITIONS.get(current_state, set())
+        if new_state not in allowed:
+            raise ValueError(
+                f"Illegal state transition from '{current_state}' to '{new_state}'. "
+                f"Allowed transitions: {list(allowed)}"
+            )
+
+        now = time.time()
+        target_record["state"] = new_state
+        target_record["updated_at_utc"] = now
+        if failure_stage:
+            target_record["failure_stage"] = failure_stage
+        hist_entry = {"state": new_state, "timestamp": now}
+        if detail:
+            hist_entry["detail"] = detail
+        target_record["history"].append(hist_entry)
+
+        self._write_atomic(data)
+        return target_record
+
+    def _reconcile_existing_attempt_unlocked(self, conversation_uuid, latest_record, live_dom_state, prompt_hash):
+        if not latest_record or not live_dom_state:
+            return latest_record, False
+
+        attempt_id = latest_record.get("attempt_id")
+        current_state = latest_record.get("state")
+        last_user_hash = live_dom_state.get("lastUserMessageHash")
+        is_turn_active = live_dom_state.get("isMainTurnActive", False)
+
+        reconciled = False
+        if current_state in [STATE_SUBMISSION_ATTEMPTED, STATE_DISPATCHED_UNCONFIRMED]:
+            if last_user_hash == prompt_hash:
+                self._transition_state_unlocked(
+                    conversation_uuid, attempt_id, STATE_MESSAGE_OBSERVED,
+                    detail="Forward reconciled: prompt confirmed in live DOM"
                 )
+                reconciled = True
+                current_state = STATE_MESSAGE_OBSERVED
 
-            now = time.time()
-            target_record["state"] = new_state
-            target_record["updated_at_utc"] = now
-            if failure_stage:
-                target_record["failure_stage"] = failure_stage
-            hist_entry = {"state": new_state, "timestamp": now}
-            if detail:
-                hist_entry["detail"] = detail
-            target_record["history"].append(hist_entry)
+        if current_state == STATE_MESSAGE_OBSERVED and is_turn_active:
+            self._transition_state_unlocked(
+                conversation_uuid, attempt_id, STATE_TURN_STARTED,
+                detail="Forward reconciled: active turn detected in live DOM"
+            )
+            reconciled = True
 
-            self._write_atomic(data)
-            return target_record
+        updated_rec, _ = self.get_latest_record(conversation_uuid)
+        return updated_rec, reconciled
+
+    # Public locked methods:
+    def start_recovery_attempt(self, conversation_uuid, prompt_text):
+        with self.exclusive_lock(conversation_uuid=conversation_uuid):
+            return self._start_recovery_attempt_unlocked(conversation_uuid, prompt_text)
+
+    def transition_state(self, conversation_uuid, attempt_id, new_state, failure_stage=None, detail=None):
+        with self.exclusive_lock(conversation_uuid=conversation_uuid):
+            return self._transition_state_unlocked(conversation_uuid, attempt_id, new_state, failure_stage, detail)
+
+    def reconcile_existing_attempt(self, conversation_uuid, latest_record, live_dom_state, prompt_hash):
+        with self.exclusive_lock(conversation_uuid=conversation_uuid):
+            return self._reconcile_existing_attempt_unlocked(conversation_uuid, latest_record, live_dom_state, prompt_hash)

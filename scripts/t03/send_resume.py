@@ -5,13 +5,18 @@ Antigravity Desktop Resume Adapter (T03 Research Prototype)
 Implements safe, deterministic conversation location, duplicate prevention,
 crash-safe recovery journaling, and resume submission via Chrome DevTools Protocol (CDP).
 
-Review Round 5 Hardening:
-- Critical send decision, forward reconciliation, and reservation happen INSIDE the exclusive lock.
-- Second worker re-reads and re-evaluates fresh state from disk after acquiring lock.
-- Target chat container lookup is strictly scoped; absolutely NO fallback to document.body.
-- Composer and Send button actions are strictly scoped to the verified target container.
-- Pre-dispatch revalidation immediately before Enter/Click confirms route, prompt hash, and focus.
-- Zero manual override bypass exposed on supervisor pipeline.
+Review Round 6 Hardening:
+- Structural non-reentrant locking: execute_resume_pipeline explicitly calls unlocked journal
+  methods (_start_recovery_attempt_unlocked, _transition_state_unlocked, _reconcile_existing_attempt_unlocked)
+  strictly inside with journal.exclusive_lock(...).
+- Atomic renderer-side prompt identity verification before click:
+  Normalized composer text is verified to equal expected prompt inside JS before clicking Send.
+  Zero irreversible clicks on mismatched prompt or route.
+- Send control validation: requires exactly 1 verified visible enabled send button inside target root.
+  0 buttons -> SEND_CONTROL_NOT_FOUND; >1 buttons -> SEND_CONTROL_AMBIGUOUS (DO NOT SEND).
+  Enter fallback completely removed from autonomous supervisor safe path.
+- Clear separation of targetRoot, messageContainer, and composerContainer.
+- Re-reads and re-evaluates all state from disk inside lock.
 """
 
 import argparse
@@ -48,7 +53,6 @@ from recovery_journal import (
     DECISION_MANUAL_RECONCILIATION_REQUIRED,
     DECISION_BLOCKED_DRAFT_PRESENT,
     evaluate_recovery_permission,
-    reconcile_existing_attempt,
     validate_uuid,
     hash_prompt
 )
@@ -88,7 +92,7 @@ def discover_cdp_endpoint():
         port = lines[0].strip()
         endpoint = f"http://127.0.0.1:{port}"
         
-        req = urllib.request.Request(f"{endpoint}/json/version", headers={"User-Agent": "SwitchAntigravity-T03/5.0"})
+        req = urllib.request.Request(f"{endpoint}/json/version", headers={"User-Agent": "SwitchAntigravity-T03/6.0"})
         with urllib.request.urlopen(req, timeout=2) as resp:
             ver_data = json.loads(resp.read().decode("utf-8"))
             if "Browser" not in ver_data:
@@ -150,7 +154,7 @@ class QualifiedAntigravityClient:
         self._connection_count += 1
         try:
             url = f"{self.endpoint}/json/list"
-            req = urllib.request.Request(url, headers={"User-Agent": "SwitchAntigravity-T03/5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SwitchAntigravity-T03/6.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 targets = json.loads(resp.read().decode("utf-8"))
         except Exception:
@@ -341,8 +345,8 @@ class QualifiedAntigravityClient:
                 const pathname = window.location.pathname.toLowerCase();
                 const expected = '/c/' + targetUuid.toLowerCase();
                 const isExactMatch = (pathname === expected);
-                const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
-                const composerMounted = !!(mainContainer && mainContainer.querySelector('[data-lexical-editor="true"]'));
+                const targetRoot = document.querySelector('main');
+                const composerMounted = !!(targetRoot && targetRoot.querySelector('[data-lexical-editor="true"]'));
                 return {{
                     isExactMatch: isExactMatch,
                     composerMounted: composerMounted,
@@ -369,14 +373,15 @@ class QualifiedAntigravityClient:
                 return {{ error: "WRONG_CONVERSATION_ACTIVE", currentPathname: pathname }};
             }}
 
-            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
-            if (!mainContainer) {{
-                return {{ error: "TARGET_CHAT_CONTAINER_NOT_FOUND" }};
+            const targetRoot = document.querySelector('main');
+            if (!targetRoot) {{
+                return {{ error: "TARGET_ROOT_NOT_FOUND" }};
             }}
 
-            const articles = Array.from(mainContainer.querySelectorAll('article, [role="article"]'));
+            const messageContainer = targetRoot.querySelector('[data-testid="conversation-messages"]') || targetRoot;
+            const articles = Array.from(messageContainer.querySelectorAll('article, [role="article"]'));
             
-            const mainStopButtons = Array.from(mainContainer.querySelectorAll('button')).filter(b => {{
+            const mainStopButtons = Array.from(targetRoot.querySelectorAll('button')).filter(b => {{
                 if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 const text = (b.textContent || '').toLowerCase();
@@ -465,16 +470,29 @@ class QualifiedAntigravityClient:
                 }}
             }}
 
-            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
-            if (!mainContainer) return {{ found: false, error: "TARGET_CHAT_CONTAINER_NOT_FOUND" }};
+            const targetRoot = document.querySelector('main');
+            if (!targetRoot) return {{ found: false, error: "TARGET_ROOT_NOT_FOUND" }};
 
-            const editors = Array.from(mainContainer.querySelectorAll('[data-lexical-editor="true"]'));
+            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
             if (editors.length === 0) return {{ found: false, error: "COMPOSER_NOT_FOUND" }};
             if (editors.length > 1) return {{ found: false, error: "COMPOSER_AMBIGUOUS", count: editors.length }};
             
             const editor = editors[0];
-            const sendBtn = mainContainer.querySelector('button[data-testid="send-button"], button[aria-label="Send message"]');
-            const stopBtn = Array.from(mainContainer.querySelectorAll('button')).find(b => {{
+            const sendBtns = Array.from(targetRoot.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send message"]')).filter(b => !!b.offsetParent);
+            
+            let sendBtnState = {{ found: false }};
+            if (sendBtns.length === 1) {{{{
+                const b = sendBtns[0];
+                sendBtnState = {{
+                    found: true,
+                    disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+                    label: b.getAttribute('aria-label')
+                }};
+            }}}} else if (sendBtns.length > 1) {{{{
+                sendBtnState = {{ found: false, error: "SEND_CONTROL_AMBIGUOUS", count: sendBtns.length }};
+            }}}}
+
+            const stopBtn = Array.from(targetRoot.querySelectorAll('button')).find(b => {{
                 if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 return label.includes('stop') && !!b.offsetParent;
@@ -488,11 +506,7 @@ class QualifiedAntigravityClient:
                 text: text,
                 draftPresent: text.length > 0,
                 isFocused: document.activeElement === editor,
-                sendButton: sendBtn ? {{
-                    found: true,
-                    disabled: sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true',
-                    label: sendBtn.getAttribute('aria-label')
-                }} : {{ found: false }},
+                sendButton: sendBtnState,
                 stopButton: stopBtn ? {{
                     found: true,
                     label: stopBtn.getAttribute('aria-label')
@@ -508,10 +522,11 @@ class QualifiedAntigravityClient:
         ((targetUuid) => {{
             const pathname = window.location.pathname.toLowerCase();
             if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ focused: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
-            if (!mainContainer) return {{ focused: false, error: "TARGET_CHAT_CONTAINER_NOT_FOUND" }};
-            const editor = mainContainer.querySelector('[data-lexical-editor="true"]');
-            if (!editor) return {{ focused: false, error: "COMPOSER_NOT_FOUND" }};
+            const targetRoot = document.querySelector('main');
+            if (!targetRoot) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
+            if (editors.length !== 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS_OR_MISSING" }};
+            const editor = editors[0];
             editor.focus();
             return {{ focused: (document.activeElement === editor) }};
         }})({json.dumps(val_uuid)})
@@ -540,10 +555,11 @@ class QualifiedAntigravityClient:
         ((targetUuid) => {{
             const pathname = window.location.pathname.toLowerCase();
             if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ focused: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
-            if (!mainContainer) return {{ focused: false, error: "TARGET_CHAT_CONTAINER_NOT_FOUND" }};
-            const editor = mainContainer.querySelector('[data-lexical-editor="true"]');
-            if (!editor) return {{ focused: false, error: "COMPOSER_NOT_FOUND" }};
+            const targetRoot = document.querySelector('main');
+            if (!targetRoot) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
+            if (editors.length !== 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS_OR_MISSING" }};
+            const editor = editors[0];
             editor.focus();
             return {{ focused: (document.activeElement === editor) }};
         }})({json.dumps(val_uuid)})
@@ -555,61 +571,68 @@ class QualifiedAntigravityClient:
         await self.send_command("Input.insertText", {"text": text})
         await asyncio.sleep(0.1)
 
-    async def dispatch_submission_input(self, target_uuid, expected_prompt_hash):
+    async def dispatch_submission_input(self, target_uuid, expected_prompt_text):
+        """
+        Atomic renderer-side verification and send dispatch.
+        Verifies exact route, targetRoot, single composer, matching normalized prompt text,
+        and exactly ONE enabled send button inside renderer BEFORE clicking.
+        Zero irreversible actions on mismatch.
+        """
         val_uuid = validate_uuid(target_uuid)
-        pre_check = await self.evaluate(f"""
-        ((targetUuid) => {{
+        norm_expected = normalize_text(expected_prompt_text)
+
+        dispatch_res = await self.evaluate(f"""
+        ((targetUuid, expectedNormText) => {{
             const pathname = window.location.pathname.toLowerCase();
-            if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ safe: false, error: "ROUTE_MUTATED_BEFORE_DISPATCH" }};
+            if (pathname !== '/c/' + targetUuid.toLowerCase()) {{
+                return {{ safe: false, error: "ROUTE_MUTATED_BEFORE_DISPATCH" }};
+            }}
             
-            const mainContainer = document.querySelector('main [data-testid="conversation-messages"]') || document.querySelector('main');
-            if (!mainContainer) return {{ safe: false, error: "TARGET_CHAT_CONTAINER_NOT_FOUND" }};
+            const targetRoot = document.querySelector('main');
+            if (!targetRoot) {{
+                return {{ safe: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            }}
             
-            const stopBtn = Array.from(mainContainer.querySelectorAll('button')).find(b => {{
+            const stopBtn = Array.from(targetRoot.querySelectorAll('button')).find(b => {{
                 if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 return label.includes('stop') && !!b.offsetParent;
             }});
-            if (stopBtn) return {{ safe: false, error: "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH" }};
+            if (stopBtn) {{
+                return {{ safe: false, error: "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH" }};
+            }}
 
-            const editors = Array.from(mainContainer.querySelectorAll('[data-lexical-editor="true"]'));
-            if (editors.length !== 1) return {{ safe: false, error: "COMPOSER_AMBIGUOUS_OR_MISSING" }};
+            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
+            if (editors.length === 0) return {{ safe: false, error: "COMPOSER_NOT_FOUND" }};
+            if (editors.length > 1) return {{ safe: false, error: "COMPOSER_AMBIGUOUS" }};
             
             const editor = editors[0];
-            const text = (editor.innerText || editor.textContent || '').trim();
-            const sendBtn = mainContainer.querySelector('button[data-testid="send-button"], button[aria-label="Send message"]');
-            const canClick = sendBtn && !(sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true');
+            const rawText = (editor.innerText || editor.textContent || '').trim();
+            const currentNorm = rawText.split(/\\s+/).filter(Boolean).join(' ');
 
-            if (canClick) {{
-                sendBtn.click();
-                return {{ safe: true, dispatched: true, method: "button_click", text: text }};
-            }} else {{
-                editor.focus();
-                const isFocused = (document.activeElement === editor);
-                return {{ safe: true, dispatched: false, needsEnter: true, isFocused: isFocused, text: text }};
+            if (currentNorm !== expectedNormText) {{
+                return {{ safe: false, error: "PROMPT_IDENTITY_MISMATCH", currentText: currentNorm }};
             }}
-        }})({json.dumps(val_uuid)})
+
+            const sendBtns = Array.from(targetRoot.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send message"]')).filter(b => !!b.offsetParent);
+            if (sendBtns.length === 0) return {{ safe: false, error: "SEND_CONTROL_NOT_FOUND" }};
+            if (sendBtns.length > 1) return {{ safe: false, error: "SEND_CONTROL_AMBIGUOUS" }};
+
+            const sendBtn = sendBtns[0];
+            if (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {{
+                return {{ safe: false, error: "SEND_CONTROL_DISABLED" }};
+            }}
+
+            // Pre-dispatch assertions passed; execute atomic click
+            sendBtn.click();
+            return {{ safe: true, dispatched: true, method: "button_click" }};
+        }})({json.dumps(val_uuid)}, {json.dumps(norm_expected)})
         """)
 
-        if not pre_check.get("safe"):
-            return {"dispatched": False, "error": pre_check.get("error")}
+        if not dispatch_res.get("safe"):
+            return {"dispatched": False, "error": dispatch_res.get("error")}
 
-        if hash_text(pre_check.get("text")) != expected_prompt_hash:
-            return {"dispatched": False, "error": "PROMPT_HASH_MUTATED_BEFORE_DISPATCH"}
-
-        if pre_check.get("dispatched"):
-            return {"dispatched": True, "method": "button_click"}
-
-        if not pre_check.get("isFocused"):
-            return {"dispatched": False, "error": "SEND_FOCUS_NOT_VERIFIED"}
-
-        await self.send_command("Input.dispatchKeyEvent", {
-            "type": "keyDown", "windowsVirtualKeyCode": 13, "key": "Enter", "code": "Enter"
-        })
-        await self.send_command("Input.dispatchKeyEvent", {
-            "type": "keyUp", "windowsVirtualKeyCode": 13, "key": "Enter", "code": "Enter"
-        })
-        return {"dispatched": True, "method": "enter_key"}
+        return {"dispatched": True, "method": dispatch_res.get("method", "button_click")}
 
     async def wait_for_user_and_assistant_turn(self, target_uuid, prompt_hash, baseline, timeout=12, external_error_hook=None):
         start = time.time()
@@ -645,11 +668,11 @@ class QualifiedAntigravityClient:
             "elapsed_seconds": round(time.time() - start, 2)
         }
 
-async def execute_resume_pipeline(args, client_override=None, journal_override=None, external_error_hook=None):
+async def execute_resume_pipeline(args, client_override=None, journal_override=None, external_error_hook=None, pre_lock_barrier=None):
     """
     Main execution pipeline for conversation restore and resume submission.
     Guarantees that all authoritative send decisions and forward reconciliations
-    occur strictly inside the exclusive cross-process lock.
+    occur strictly inside the exclusive cross-process lock using explicit unlocked methods.
     """
     result = {
         "status": "INIT",
@@ -821,6 +844,10 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
                 }
                 return result
 
+            # Optional synchronization barrier for deterministic race testing
+            if pre_lock_barrier is not None:
+                await pre_lock_barrier.wait()
+
             # Production Send Mode: Authoritative decision, reconciliation, reservation & dispatch INSIDE LOCK
             with journal.exclusive_lock(conversation_uuid=target["uuid"]):
                 # 1. Re-read fresh journal state from disk
@@ -841,9 +868,9 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
 
                 fresh_scoped_state["draftPresent"] = fresh_comp_state.get("draftPresent", False)
 
-                # 3. Forward reconcile unconfirmed prior attempt if live DOM confirms it
-                latest_rec, was_reconciled = reconcile_existing_attempt(
-                    journal, target["uuid"], latest_rec, fresh_scoped_state, prompt_hash
+                # 3. Forward reconcile unconfirmed prior attempt if live DOM confirms it (explicit unlocked method)
+                latest_rec, was_reconciled = journal._reconcile_existing_attempt_unlocked(
+                    target["uuid"], latest_rec, fresh_scoped_state, prompt_hash
                 )
                 if was_reconciled:
                     latest_rec, j_status = journal.get_latest_record(target["uuid"])
@@ -870,8 +897,8 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
                     result["errors"].append("Composer contains unsubmitted user draft. Send refused.")
                     return result
 
-                # 5. Reserve attempt in NOT_SENT state
-                attempt_rec = journal.start_recovery_attempt(target["uuid"], prompt_text)
+                # 5. Reserve attempt in NOT_SENT state (explicit unlocked method)
+                attempt_rec = journal._start_recovery_attempt_unlocked(target["uuid"], prompt_text)
                 attempt_id = attempt_rec["attempt_id"]
                 result["recovery_attempt_id"] = attempt_id
 
@@ -884,25 +911,25 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
 
                 verified_comp = await client.inspect_composer_state(target["uuid"])
                 if hash_text(verified_comp.get("text")) != prompt_hash:
-                    journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail="Text insertion verification failed")
+                    journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail="Text insertion verification failed")
                     result["status"] = "TEXT_INSERTION_FAILED"
                     result["errors"].append("Composer text does not match intended prompt.")
                     return result
                 result["phases"]["3_text_verified"] = True
 
-                # 7. Durably transition journal to SUBMISSION_ATTEMPTED before dispatch
-                journal.transition_state(target["uuid"], attempt_id, STATE_SUBMISSION_ATTEMPTED)
+                # 7. Durably transition journal to SUBMISSION_ATTEMPTED before dispatch (explicit unlocked method)
+                journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_SUBMISSION_ATTEMPTED)
 
-                # 8. Dispatch input with pre-dispatch revalidation
-                dispatch_res = await client.dispatch_submission_input(target["uuid"], prompt_hash)
+                # 8. Atomic renderer-side dispatch with pre-dispatch revalidation
+                dispatch_res = await client.dispatch_submission_input(target["uuid"], prompt_text)
                 if not dispatch_res.get("dispatched"):
-                    journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail=f"Dispatch failed: {dispatch_res.get('error')}")
+                    journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail=f"Dispatch failed: {dispatch_res.get('error')}")
                     result["status"] = "SEND_INPUT_DISPATCH_FAILED"
                     result["errors"].append(f"Pre-dispatch validation failed: {dispatch_res.get('error')}")
                     return result
                 result["phases"]["4_send_input_dispatched"] = True
 
-            # Outside lock: Observe post-dispatch turns with locked transitions
+            # Outside lock: Observe post-dispatch turns with public locked transitions
             turn_res = await client.wait_for_user_and_assistant_turn(
                 target["uuid"], prompt_hash, baseline, timeout=getattr(args, "timeout", 30), external_error_hook=external_error_hook
             )
