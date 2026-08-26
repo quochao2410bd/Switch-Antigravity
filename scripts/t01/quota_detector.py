@@ -3,233 +3,439 @@ import re
 import sys
 import json
 import time
+import hashlib
 import argparse
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+
+SCHEMA_VERSION = "1.0.0"
 
 INDIVIDUAL_QUOTA_PATTERN = re.compile(
-    r'(?:ERROR: logging before google\.Init:\s+[IE](?P<timestamp>\d{4}\s+[\d:.]+)\s+(?P<pid>\d+)\s+(?P<source>[\w.]+:\d+)\]\s+)?'
-    r'.*?(?:agent executor error:\s+)?(?:calling model:\s+)?'
+    r'(?:ERROR:\s+logging\s+before\s+google\.Init:\s+[IE](?P<timestamp>\d{4}\s+[\d:.]+)\s+(?P<log_thread_id>\d+)\s+(?P<source_location>[\w.]+:\d+)\]\s+)?'
+    r'.*?(?:agent\s+executor\s+error:\s+)?(?:calling\s+model:\s+)?'
     r'RESOURCE_EXHAUSTED\s+\(code\s+429\):\s+'
-    r'Individual quota reached\.\s+Please upgrade your subscription to increase your limits\.\s+'
-    r'Resets in\s+(?P<resets_in>[^.)]+)',
+    r'Individual\s+quota\s+reached\.\s+Please\s+upgrade\s+your\s+subscription\s+to\s+increase\s+your\s+limits\.\s+'
+    r'Resets\s+in\s+(?P<resets_in>[^.)]+)',
     re.IGNORECASE
 )
 
-def create_baseline(log_path: str, ls_pid: Optional[int] = None) -> Dict[str, Any]:
-    if not os.path.exists(log_path):
-        return {
-            "status": "LOG_UNAVAILABLE",
-            "log_path": log_path,
-            "error": f"Log file does not exist: {log_path}",
-            "byte_offset": 0,
-            "file_size": 0,
-            "file_mtime": 0.0,
-            "baseline_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "ls_pid": ls_pid
-        }
-    stat = os.stat(log_path)
+def get_file_identity(file_path: str) -> Dict[str, Any]:
+    stat = os.stat(file_path)
+    ctime_ns = int(getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1e9)))
     return {
-        "status": "BASELINE_INITIALIZED",
-        "log_path": os.path.abspath(log_path),
-        "byte_offset": stat.st_size,
-        "file_size": stat.st_size,
-        "file_mtime": stat.st_mtime,
-        "baseline_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "ls_pid": ls_pid
+        "dev": int(stat.st_dev),
+        "ino": int(stat.st_ino),
+        "ctime_ns": ctime_ns,
+        "size_at_creation": int(stat.st_size)
     }
 
-def poll_new_events(baseline: Dict[str, Any], log_path: Optional[str] = None) -> Dict[str, Any]:
-    target_path = log_path or baseline.get("log_path")
-    if not target_path or not os.path.exists(target_path):
+def create_baseline(
+    log_path: str,
+    ls_pid: Optional[int] = None,
+    supervisor_session_id: Optional[str] = None
+) -> Tuple[Dict[str, Any], int]:
+    canonical_path = os.path.abspath(log_path)
+    if not os.path.exists(canonical_path):
         return {
             "status": "LOG_UNAVAILABLE",
-            "event_scope": "NONE",
-            "current_session_quota_state": "UNKNOWN",
-            "signature_confidence": 0.0,
-            "error": f"Log file unavailable: {target_path}",
-            "cursor": baseline.get("byte_offset", 0)
-        }
+            "schema_version": SCHEMA_VERSION,
+            "canonical_log_path": canonical_path,
+            "error": f"Log file does not exist: {canonical_path}",
+            "committed_byte_offset": 0,
+            "file_size": 0,
+            "file_identity": None,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "language_server_process_id": ls_pid,
+            "supervisor_session_id": supervisor_session_id
+        }, 3
 
     try:
-        stat = os.stat(target_path)
+        identity = get_file_identity(canonical_path)
+        stat = os.stat(canonical_path)
+        return {
+            "status": "BASELINE_INITIALIZED",
+            "schema_version": SCHEMA_VERSION,
+            "canonical_log_path": canonical_path,
+            "committed_byte_offset": stat.st_size,
+            "file_size": stat.st_size,
+            "file_identity": identity,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "language_server_process_id": ls_pid,
+            "supervisor_session_id": supervisor_session_id
+        }, 0
     except Exception as e:
         return {
             "status": "LOG_UNAVAILABLE",
-            "event_scope": "NONE",
-            "current_session_quota_state": "UNKNOWN",
-            "signature_confidence": 0.0,
-            "error": f"Failed to stat log file: {e}",
-            "cursor": baseline.get("byte_offset", 0)
-        }
+            "schema_version": SCHEMA_VERSION,
+            "canonical_log_path": canonical_path,
+            "error": f"Failed inspecting log file: {e}",
+            "committed_byte_offset": 0,
+            "file_size": 0,
+            "file_identity": None,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "language_server_process_id": ls_pid,
+            "supervisor_session_id": supervisor_session_id
+        }, 3
 
-    prev_offset = baseline.get("byte_offset", 0)
+def validate_baseline_schema(
+    baseline: Any,
+    current_log_path: str,
+    current_ls_pid: Optional[int] = None
+) -> Tuple[bool, str]:
+    if not isinstance(baseline, dict):
+        return False, "Baseline must be a valid JSON dictionary"
+
+    if baseline.get("schema_version") != SCHEMA_VERSION:
+        return False, f"Unsupported or missing schema_version: expected {SCHEMA_VERSION}, got {baseline.get('schema_version')}"
+
+    canonical_current = os.path.abspath(current_log_path)
+    baseline_path = baseline.get("canonical_log_path")
+    if not baseline_path or os.path.abspath(baseline_path) != canonical_current:
+        return False, f"Log path mismatch: baseline is for {baseline_path}, current target is {canonical_current}"
+
+    offset = baseline.get("committed_byte_offset")
+    if offset is None or not isinstance(offset, int) or offset < 0:
+        return False, f"Invalid committed_byte_offset: {offset}"
+
+    identity = baseline.get("file_identity")
+    if not isinstance(identity, dict) or "dev" not in identity or "ino" not in identity or "ctime_ns" not in identity:
+        return False, "Missing or malformed file_identity in baseline"
+
+    if current_ls_pid is not None and baseline.get("language_server_process_id") is not None:
+        if baseline["language_server_process_id"] != current_ls_pid:
+            return False, f"Language server process changed from PID {baseline['language_server_process_id']} to {current_ls_pid}"
+
+    return True, "VALID"
+
+def poll_new_events(
+    baseline: Dict[str, Any],
+    log_path: Optional[str] = None,
+    current_ls_pid: Optional[int] = None,
+    include_raw_log: bool = False
+) -> Tuple[Dict[str, Any], int]:
+    target_path = log_path or baseline.get("canonical_log_path")
+    if not target_path or not os.path.exists(target_path):
+        return {
+            "status": "LOG_UNAVAILABLE",
+            "event_poll_status": "LOG_UNAVAILABLE",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "error": f"Log file unavailable: {target_path}",
+            "cursor": baseline.get("committed_byte_offset", 0) if isinstance(baseline, dict) else 0
+        }, 3
+
+    valid, reason = validate_baseline_schema(baseline, target_path, current_ls_pid)
+    if not valid:
+        return {
+            "status": "BASELINE_INVALID",
+            "event_poll_status": "BASELINE_INVALID",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "error": f"Baseline validation failed: {reason}",
+            "rebaseline_required": True,
+            "cursor": 0
+        }, 2
+
+    canonical_target = os.path.abspath(target_path)
+    try:
+        current_identity = get_file_identity(canonical_target)
+        stat = os.stat(canonical_target)
+    except Exception as e:
+        return {
+            "status": "LOG_UNAVAILABLE",
+            "event_poll_status": "LOG_UNAVAILABLE",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "error": f"Failed stat on log file: {e}",
+            "cursor": baseline["committed_byte_offset"]
+        }, 3
+
+    prev_identity = baseline["file_identity"]
+    if (current_identity["dev"] != prev_identity["dev"] or
+        current_identity["ino"] != prev_identity["ino"] or
+        current_identity["ctime_ns"] != prev_identity["ctime_ns"]):
+        return {
+            "status": "BASELINE_INVALID",
+            "event_poll_status": "BASELINE_INVALID",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "error": "Log file replaced with new file identity (rotation or replacement detected)",
+            "rebaseline_required": True,
+            "cursor": stat.st_size
+        }, 2
+
+    prev_offset = baseline["committed_byte_offset"]
     current_size = stat.st_size
 
     if current_size < prev_offset:
         return {
             "status": "BASELINE_INVALID",
-            "event_scope": "NONE",
-            "current_session_quota_state": "UNKNOWN",
+            "event_poll_status": "BASELINE_INVALID",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
             "signature_confidence": 0.0,
-            "error": f"Log file truncated or rotated (previous offset {prev_offset} > current size {current_size})",
+            "error": f"Log file truncated (previous offset {prev_offset} > current size {current_size})",
             "rebaseline_required": True,
             "cursor": current_size
-        }
+        }, 2
 
     if current_size == prev_offset:
         return {
             "status": "NO_NEW_EVENT",
-            "event_scope": "NONE",
-            "current_session_quota_state": "NORMAL",
+            "event_poll_status": "NO_NEW_EVENT",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
             "signature_confidence": 0.0,
             "new_events_count": 0,
             "events": [],
             "cursor": prev_offset
-        }
+        }, 1
 
     try:
-        with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(canonical_target, "rb") as f:
             f.seek(prev_offset)
-            new_chunk = f.read()
+            raw_bytes = f.read()
     except Exception as e:
         return {
             "status": "PARSE_ERROR",
-            "event_scope": "NONE",
-            "current_session_quota_state": "UNKNOWN",
+            "event_poll_status": "PARSE_ERROR",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
             "signature_confidence": 0.0,
-            "error": f"Failed reading new log bytes: {e}",
+            "error": f"Failed reading raw log bytes: {e}",
             "cursor": prev_offset
-        }
+        }, 4
+
+    last_newline_idx = raw_bytes.rfind(b"\n")
+    if last_newline_idx == -1:
+        return {
+            "status": "NO_NEW_EVENT",
+            "event_poll_status": "NO_NEW_EVENT",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "new_events_count": 0,
+            "events": [],
+            "cursor": prev_offset,
+            "trailing_partial_bytes_count": len(raw_bytes)
+        }, 1
+
+    complete_bytes = raw_bytes[:last_newline_idx + 1]
+    new_committed_offset = prev_offset + len(complete_bytes)
 
     matches = []
-    lines = new_chunk.splitlines()
-    for line in lines:
-        m = INDIVIDUAL_QUOTA_PATTERN.search(line)
+    current_byte_pos = prev_offset
+
+    lines_raw = complete_bytes.splitlines(keepends=True)
+    for line_bytes in lines_raw:
+        line_start = current_byte_pos
+        line_end = line_start + len(line_bytes)
+        current_byte_pos = line_end
+
+        line_str = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+        m = INDIVIDUAL_QUOTA_PATTERN.search(line_str)
         if m:
-            matches.append({
-                "timestamp": m.group("timestamp") if "timestamp" in m.groupdict() else None,
-                "pid": m.group("pid") if "pid" in m.groupdict() else None,
-                "source": m.group("source") if "source" in m.groupdict() else None,
+            resets_in = m.group("resets_in").strip() if m.group("resets_in") else None
+            timestamp = m.group("timestamp").strip() if m.group("timestamp") else None
+            log_thread_id = m.group("log_thread_id").strip() if m.group("log_thread_id") else None
+            source_location = m.group("source_location").strip() if m.group("source_location") else None
+
+            canonical_sig = f"{current_identity['ino']}:{line_start}:{line_end}:429:{resets_in}"
+            event_hash = hashlib.sha256(canonical_sig.encode("utf-8")).hexdigest()
+            event_id = f"evt_{current_identity['ino']}_{line_start}_{line_end}_{event_hash[:16]}"
+
+            event_obj = {
+                "event_id": event_id,
+                "event_sha256": event_hash,
                 "code": 429,
-                "resets_in": m.group("resets_in").strip() if "resets_in" in m.groupdict() and m.group("resets_in") else None,
-                "raw_line": line.strip()
-            })
+                "resets_in": resets_in,
+                "log_timestamp": timestamp,
+                "log_thread_id": log_thread_id,
+                "source_location": source_location,
+                "event_start_offset": line_start,
+                "event_end_offset": line_end,
+                "account_attribution": "UNKNOWN_AT_T01_LAYER",
+                "evidence_class": "OBSERVED_FORMAT"
+            }
+            if include_raw_log:
+                event_obj["raw_line"] = line_str
+
+            matches.append(event_obj)
 
     if matches:
         latest = matches[-1]
         return {
             "status": "NEW_CONFIRMED_QUOTA_EVENT",
-            "event_scope": "NEW_SINCE_BASELINE",
+            "event_poll_status": "NEW_CONFIRMED_QUOTA_EVENT",
+            "quota_state_effect": "EXHAUSTED",
             "current_session_quota_state": "CONFIRMED",
             "signature_confidence": 1.0,
+            "account_attribution": "UNKNOWN_AT_T01_LAYER",
             "new_events_count": len(matches),
             "latest_event": latest,
             "resets_in": latest["resets_in"],
-            "cursor": current_size
-        }
+            "events": matches,
+            "cursor": new_committed_offset
+        }, 0
     else:
         return {
             "status": "NO_NEW_EVENT",
-            "event_scope": "NONE",
-            "current_session_quota_state": "NORMAL",
+            "event_poll_status": "NO_NEW_EVENT",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
             "signature_confidence": 0.0,
             "new_events_count": 0,
             "events": [],
-            "cursor": current_size
-        }
+            "cursor": new_committed_offset
+        }, 1
 
-def detect_historical_events(log_path: str) -> Dict[str, Any]:
-    if not os.path.exists(log_path):
+def detect_historical_events(
+    log_path: str,
+    include_raw_log: bool = False
+) -> Tuple[Dict[str, Any], int]:
+    canonical_path = os.path.abspath(log_path)
+    if not os.path.exists(canonical_path):
         return {
             "status": "LOG_UNAVAILABLE",
-            "event_scope": "NONE",
-            "current_session_quota_state": "UNKNOWN",
-            "signature_confidence": 0.0,
-            "error": f"File not found: {log_path}"
-        }
-    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.read()
-    
-    lines = content.splitlines()
+            "error": f"File not found: {canonical_path}",
+            "total_matches": 0
+        }, 3
+
+    try:
+        identity = get_file_identity(canonical_path)
+        with open(canonical_path, "rb") as f:
+            content = f.read()
+    except Exception as e:
+        return {
+            "status": "PARSE_ERROR",
+            "error": f"Failed reading log: {e}",
+            "total_matches": 0
+        }, 4
+
+    lines_raw = content.splitlines(keepends=True)
     matches = []
-    for idx, line in enumerate(lines, 1):
-        m = INDIVIDUAL_QUOTA_PATTERN.search(line)
+    current_pos = 0
+
+    for idx, line_bytes in enumerate(lines_raw, 1):
+        line_start = current_pos
+        line_end = line_start + len(line_bytes)
+        current_pos = line_end
+
+        line_str = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+        m = INDIVIDUAL_QUOTA_PATTERN.search(line_str)
         if m:
-            matches.append({
+            resets_in = m.group("resets_in").strip() if m.group("resets_in") else None
+            timestamp = m.group("timestamp").strip() if m.group("timestamp") else None
+            log_thread_id = m.group("log_thread_id").strip() if m.group("log_thread_id") else None
+            source_location = m.group("source_location").strip() if m.group("source_location") else None
+
+            canonical_sig = f"{identity['ino']}:{line_start}:{line_end}:429:{resets_in}"
+            event_hash = hashlib.sha256(canonical_sig.encode("utf-8")).hexdigest()
+            event_id = f"evt_{identity['ino']}_{line_start}_{line_end}_{event_hash[:16]}"
+
+            event_obj = {
+                "event_id": event_id,
+                "event_sha256": event_hash,
                 "line_number": idx,
-                "timestamp": m.group("timestamp") if "timestamp" in m.groupdict() else None,
-                "pid": m.group("pid") if "pid" in m.groupdict() else None,
-                "source": m.group("source") if "source" in m.groupdict() else None,
                 "code": 429,
-                "resets_in": m.group("resets_in").strip() if "resets_in" in m.groupdict() and m.group("resets_in") else None,
-                "raw_line": line.strip()
-            })
+                "resets_in": resets_in,
+                "log_timestamp": timestamp,
+                "log_thread_id": log_thread_id,
+                "source_location": source_location,
+                "event_start_offset": line_start,
+                "event_end_offset": line_end,
+                "account_attribution": "UNKNOWN_AT_T01_LAYER",
+                "evidence_class": "OBSERVED_FORMAT"
+            }
+            if include_raw_log:
+                event_obj["raw_line"] = line_str
+
+            matches.append(event_obj)
 
     if matches:
         return {
             "status": "HISTORICAL_QUOTA_EVENT_FOUND",
-            "event_scope": "HISTORICAL",
+            "event_poll_status": "HISTORICAL_SCAN_COMPLETE",
+            "quota_state_effect": "UNKNOWN_HISTORICAL",
             "current_session_quota_state": "UNKNOWN_HISTORICAL_ONLY",
             "signature_confidence": 1.0,
             "total_matches": len(matches),
-            "latest_event": matches[-1]
-        }
+            "latest_event": matches[-1],
+            "events": matches
+        }, 0
     else:
         return {
             "status": "NO_HISTORICAL_QUOTA_EVENT",
-            "event_scope": "NONE",
-            "current_session_quota_state": "NORMAL",
+            "event_poll_status": "HISTORICAL_SCAN_COMPLETE",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
             "signature_confidence": 0.0,
-            "total_matches": 0
-        }
+            "total_matches": 0,
+            "events": []
+        }, 1
 
 def main():
-    parser = argparse.ArgumentParser(description="Antigravity Desktop Incremental Quota Detector")
+    parser = argparse.ArgumentParser(description="Antigravity Desktop Robust Incremental Quota Detector")
     parser.add_argument("--file", help="Path to language_server.log", default=None)
     parser.add_argument("--historical", action="store_true", help="Run full historical diagnostic scan")
-    parser.add_argument("--baseline", help="JSON string or file of previous baseline", default=None)
+    parser.add_argument("--baseline", help="JSON string or path to baseline JSON file", default=None)
     parser.add_argument("--init-baseline", action="store_true", help="Initialize and output a fresh baseline at EOF")
+    parser.add_argument("--ls-pid", type=int, help="Language server process PID to bind/enforce", default=None)
+    parser.add_argument("--session-id", help="Supervisor session identifier", default=None)
+    parser.add_argument("--include-raw-log", action="store_true", help="Include raw log lines in diagnostic output")
     args = parser.parse_args()
 
     log_path = args.file or os.path.expandvars(r"%APPDATA%\Antigravity\logs\language_server.log")
 
     if args.init_baseline:
-        base = create_baseline(log_path)
+        base, exit_code = create_baseline(log_path, ls_pid=args.ls_pid, supervisor_session_id=args.session_id)
         print(json.dumps(base, indent=2))
-        sys.exit(0)
+        sys.exit(exit_code)
 
     if args.historical:
-        res = detect_historical_events(log_path)
+        res, exit_code = detect_historical_events(log_path, include_raw_log=args.include_raw_log)
         print(json.dumps(res, indent=2))
-        sys.exit(0 if res.get("status") == "HISTORICAL_QUOTA_EVENT_FOUND" else 1)
+        sys.exit(exit_code)
 
-    if args.baseline:
-        try:
-            if os.path.exists(args.baseline):
-                with open(args.baseline, "r", encoding="utf-8") as bf:
-                    base_dict = json.load(bf)
-            else:
-                base_dict = json.loads(args.baseline)
-        except Exception as e:
-            err_res = {"status": "PARSE_ERROR", "error": f"Invalid baseline input: {e}"}
-            print(json.dumps(err_res, indent=2))
-            sys.exit(4)
-    else:
-        base_dict = {"log_path": log_path, "byte_offset": 0}
+    if not args.baseline:
+        err_res = {
+            "status": "BASELINE_REQUIRED",
+            "event_poll_status": "BASELINE_REQUIRED",
+            "quota_state_effect": "UNCHANGED",
+            "current_session_quota_state": "UNKNOWN_OR_UNCHANGED",
+            "signature_confidence": 0.0,
+            "error": "Incremental polling requires a validated baseline. Use --init-baseline to create one, or --historical for diagnostic scan."
+        }
+        print(json.dumps(err_res, indent=2))
+        sys.exit(5)
 
-    res = poll_new_events(base_dict, log_path)
-    print(json.dumps(res, indent=2))
-
-    if res.get("status") == "NEW_CONFIRMED_QUOTA_EVENT":
-        sys.exit(0)
-    elif res.get("status") == "NO_NEW_EVENT":
-        sys.exit(1)
-    elif res.get("status") == "BASELINE_INVALID":
+    try:
+        if os.path.exists(args.baseline):
+            with open(args.baseline, "r", encoding="utf-8") as bf:
+                base_dict = json.load(bf)
+        else:
+            base_dict = json.loads(args.baseline)
+    except Exception as e:
+        err_res = {
+            "status": "BASELINE_INVALID",
+            "event_poll_status": "BASELINE_INVALID",
+            "error": f"Failed parsing baseline argument: {e}",
+            "rebaseline_required": True
+        }
+        print(json.dumps(err_res, indent=2))
         sys.exit(2)
-    elif res.get("status") == "LOG_UNAVAILABLE":
-        sys.exit(3)
-    else:
-        sys.exit(4)
+
+    res, exit_code = poll_new_events(
+        baseline=base_dict,
+        log_path=log_path,
+        current_ls_pid=args.ls_pid,
+        include_raw_log=args.include_raw_log
+    )
+    print(json.dumps(res, indent=2))
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
