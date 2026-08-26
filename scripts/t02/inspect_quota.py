@@ -3,13 +3,18 @@
 inspect_quota.py
 
 Safe read-only parser and normalizer for AGM (Antigravity Manager) quota output.
-Converts human-oriented table output into a structured, typed AccountQuota schema.
+Converts human-oriented table output into a structured, typed AccountQuota schema
+with rigorous freshness provenance tracking.
 
-Design Rules:
-1. Never interpret missing, null, error, or unknown as 0%.
-2. Distinguish between 0% (confirmed exhausted) and None/Unknown (unfetched/unparseable).
-3. Validate and sanitize email / account references.
-4. Support parsing from stdin, file, or direct CLI execution.
+Core Principles:
+1. PARSED_AT is NEVER treated as proof of quota freshness.
+2. Freshness requires explicit REFRESH_CONFIRMED_AT provenance.
+3. Distinguish clearly between:
+   - PROVEN_FRESH: Proven by an explicit, verified successful refresh within max_age.
+   - STALE_CACHED: Cached data with no recent refresh confirmation.
+   - REFRESH_FAILED: Explicitly recorded refresh failure.
+   - UNKNOWN_UNFETCHED: Quota missing, null, or unparseable.
+4. Never interpret missing, null, error, or unknown as 0%.
 """
 
 from __future__ import annotations
@@ -19,8 +24,17 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Dict, List, Optional
+
+
+class FreshnessState(str, Enum):
+    PROVEN_FRESH = "PROVEN_FRESH"
+    STALE_CACHED = "STALE_CACHED"
+    REFRESH_FAILED = "REFRESH_FAILED"
+    UNKNOWN_UNFETCHED = "UNKNOWN_UNFETCHED"
 
 
 @dataclass
@@ -29,7 +43,7 @@ class ModelQuotaDetail:
     provider: str
     remaining_pct: Optional[int]  # None if unknown / unparseable, 0-100 if integer
     reset_time: Optional[str]
-    freshness_state: str  # "FRESH", "STALE", "UNKNOWN", "ERROR"
+    freshness_state: FreshnessState
 
 
 @dataclass
@@ -43,7 +57,10 @@ class AccountQuotaSummary:
     gemini_flash_pct: Optional[int]
     claude_pct: Optional[int]
     models: Dict[str, ModelQuotaDetail]
-    observed_at_epoch: int
+    parsed_at_epoch: int
+    refresh_confirmed_at_epoch: Optional[int]
+    quota_reset_time: Optional[str]
+    freshness_state: FreshnessState
     source: str  # "AGM_CLI_LIST", "AGM_CLI_INFO", "DB_DIRECT", "MOCK_FIXTURE"
     parse_warnings: List[str]
     eligible: bool
@@ -67,20 +84,26 @@ def parse_percentage_field(val: str) -> Optional[int]:
     return None
 
 
-def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[AccountQuotaSummary]:
+def parse_agm_list(
+    text: str,
+    refresh_provenance: Optional[Dict[str, int]] = None,
+    failed_refreshes: Optional[List[str]] = None,
+    max_freshness_age_sec: int = 300,
+    source_label: str = "AGM_CLI_LIST",
+    now_epoch: Optional[int] = None
+) -> List[AccountQuotaSummary]:
     """
     Parses the standard output of `agm list` or `agm ls`.
-    Expected header:
-    EMAIL                                STATUS         GEM-PRO  GEM-FLASH     CLAUDE
-    ------------------------------------------------------------------------------------
+    Binds parsed accounts to explicit refresh provenance.
     """
-    import time
-    now = int(time.time())
+    now = now_epoch if now_epoch is not None else int(time.time())
+    prov = refresh_provenance or {}
+    fails = set(failed_refreshes or [])
+
     lines = text.strip().splitlines()
     if not lines:
         return []
 
-    # Check for empty state message
     if any("No accounts yet" in line for line in lines):
         return []
 
@@ -95,7 +118,6 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
 
         if "EMAIL" in line and "STATUS" in line:
             header_found = True
-            # Find column offsets if possible
             email_idx = line.find("EMAIL")
             status_idx = line.find("STATUS")
             gp_idx = line.find("GEM-PRO")
@@ -108,37 +130,6 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
         if line_clean.startswith("---") or line_clean.startswith("==="):
             continue
 
-        if not header_found:
-            # If no header found yet, check if line looks like an account row
-            tokens = line_clean.split()
-            if len(tokens) >= 2 and "@" in tokens[0]:
-                email = tokens[0]
-                status_raw = tokens[1] if len(tokens) > 1 else ""
-                # Parse fallback
-                gp = parse_percentage_field(tokens[2]) if len(tokens) > 2 else None
-                gf = parse_percentage_field(tokens[3]) if len(tokens) > 3 else None
-                cl = parse_percentage_field(tokens[4]) if len(tokens) > 4 else None
-                tags = [t.strip() for t in status_raw.split(",") if t.strip()]
-                is_expired = "token-exp" in tags
-                eligible = (not is_expired) and (gp is None or gp > 0 or gf is None or gf > 0 or cl is None or cl > 0)
-                results.append(AccountQuotaSummary(
-                    safe_account_ref=email,
-                    status_tags=tags,
-                    is_active_cli="cli" in tags,
-                    is_active_ide="ide" in tags,
-                    is_token_expired=is_expired,
-                    gemini_pro_pct=gp,
-                    gemini_flash_pct=gf,
-                    claude_pct=cl,
-                    models={},
-                    observed_at_epoch=now,
-                    source=source_label,
-                    parse_warnings=["Parsed without explicit header alignment"],
-                    eligible=eligible
-                ))
-            continue
-
-        # Header was found, parse row
         warnings: List[str] = []
         if col_bounds:
             e_idx, s_idx, gp_idx, gf_idx, cl_idx = col_bounds
@@ -148,7 +139,7 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
             gf_part = line[gf_idx:cl_idx].strip() if len(line) > cl_idx else ""
             cl_part = line[cl_idx:].strip() if len(line) > cl_idx else ""
         else:
-            tokens = line.split()
+            tokens = line_clean.split()
             if len(tokens) < 1 or "@" not in tokens[0]:
                 continue
             email_part = tokens[0]
@@ -158,7 +149,6 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
             cl_part = tokens[4] if len(tokens) > 4 else ""
 
         if "@" not in email_part:
-            # Skip invalid lines
             continue
 
         tags = [t.strip() for t in status_part.split(",") if t.strip()]
@@ -175,10 +165,26 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
         if cl_part and cl_part != "-" and cl_val is None:
             warnings.append(f"Malformed CLAUDE quota string: '{cl_part}'")
 
-        # Determine eligibility: not expired and has some positive quota or unknown quota requiring refresh
-        has_quota = any(v is not None and v > 0 for v in [gp_val, gf_val, cl_val])
-        all_zero = all(v == 0 for v in [gp_val, gf_val, cl_val] if v is not None) and any(v == 0 for v in [gp_val, gf_val, cl_val])
-        eligible = (not is_expired) and (not all_zero)
+        # Determine Freshness Provenance
+        ref_time = prov.get(email_part)
+        if email_part in fails:
+            freshness = FreshnessState.REFRESH_FAILED
+        elif ref_time is not None:
+            age = now - ref_time
+            if age <= max_freshness_age_sec:
+                freshness = FreshnessState.PROVEN_FRESH
+            else:
+                freshness = FreshnessState.STALE_CACHED
+        elif all(v is None for v in [gp_val, gf_val, cl_val]):
+            freshness = FreshnessState.UNKNOWN_UNFETCHED
+        else:
+            freshness = FreshnessState.STALE_CACHED
+
+        all_zero = (
+            any(v == 0 for v in [gp_val, gf_val, cl_val] if v is not None)
+            and all(v == 0 for v in [gp_val, gf_val, cl_val] if v is not None)
+        )
+        eligible = (not is_expired) and (not all_zero) and (freshness == FreshnessState.PROVEN_FRESH)
 
         results.append(AccountQuotaSummary(
             safe_account_ref=email_part,
@@ -190,7 +196,10 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
             gemini_flash_pct=gf_val,
             claude_pct=cl_val,
             models={},
-            observed_at_epoch=now,
+            parsed_at_epoch=now,
+            refresh_confirmed_at_epoch=ref_time,
+            quota_reset_time=None,
+            freshness_state=freshness,
             source=source_label,
             parse_warnings=warnings,
             eligible=eligible
@@ -199,19 +208,17 @@ def parse_agm_list(text: str, source_label: str = "AGM_CLI_LIST") -> List[Accoun
     return results
 
 
-def parse_agm_info(text: str, source_label: str = "AGM_CLI_INFO") -> Optional[AccountQuotaSummary]:
+def parse_agm_info(
+    text: str,
+    refresh_confirmed_at_epoch: Optional[int] = None,
+    max_freshness_age_sec: int = 300,
+    source_label: str = "AGM_CLI_INFO",
+    now_epoch: Optional[int] = None
+) -> Optional[AccountQuotaSummary]:
     """
     Parses output of `agm info <email>`.
-    Example:
-    Account: alice@example.com
-    Token expiry: 2026-08-26T22:30:00+07:00
-
-    PROVIDER     MODEL                                             SCORE  RESET
-    ------------------------------------------------------------------------------------------
-    GOOGLE       gemini-1.5-pro                                      85%  2026-08-27T00:00:00Z
     """
-    import time
-    now = int(time.time())
+    now = now_epoch if now_epoch is not None else int(time.time())
     lines = text.strip().splitlines()
     if not lines:
         return None
@@ -221,6 +228,7 @@ def parse_agm_info(text: str, source_label: str = "AGM_CLI_INFO") -> Optional[Ac
     models: Dict[str, ModelQuotaDetail] = {}
     warnings: List[str] = []
     in_table = False
+    earliest_reset = None
 
     for line in lines:
         line_clean = line.strip()
@@ -243,21 +251,33 @@ def parse_agm_info(text: str, source_label: str = "AGM_CLI_INFO") -> Optional[Ac
                 model = tokens[1]
                 score_str = tokens[2]
                 reset_str = tokens[3] if len(tokens) > 3 else None
+                if reset_str and not earliest_reset:
+                    earliest_reset = reset_str
                 pct = parse_percentage_field(score_str)
                 if pct is None and score_str != "-":
                     warnings.append(f"Malformed score for model {model}: '{score_str}'")
+
+                if refresh_confirmed_at_epoch is not None:
+                    if (now - refresh_confirmed_at_epoch) <= max_freshness_age_sec:
+                        m_fresh = FreshnessState.PROVEN_FRESH
+                    else:
+                        m_fresh = FreshnessState.STALE_CACHED
+                elif pct is None:
+                    m_fresh = FreshnessState.UNKNOWN_UNFETCHED
+                else:
+                    m_fresh = FreshnessState.STALE_CACHED
+
                 models[model] = ModelQuotaDetail(
                     model_name=model,
                     provider=provider,
                     remaining_pct=pct,
                     reset_time=reset_str,
-                    freshness_state="FRESH" if pct is not None else "UNKNOWN"
+                    freshness_state=m_fresh
                 )
 
     if not email:
         return None
 
-    # Calculate model group averages/mins
     gp_pcts = [m.remaining_pct for name, m in models.items() if "gemini" in name.lower() and "pro" in name.lower() and m.remaining_pct is not None]
     gf_pcts = [m.remaining_pct for name, m in models.items() if "gemini" in name.lower() and "flash" in name.lower() and m.remaining_pct is not None]
     cl_pcts = [m.remaining_pct for name, m in models.items() if "claude" in name.lower() and m.remaining_pct is not None]
@@ -266,7 +286,15 @@ def parse_agm_info(text: str, source_label: str = "AGM_CLI_INFO") -> Optional[Ac
     gf_val = min(gf_pcts) if gf_pcts else None
     cl_val = min(cl_pcts) if cl_pcts else None
 
-    eligible = not is_expired and (len(models) == 0 or any(m.remaining_pct is not None and m.remaining_pct > 0 for m in models.values()))
+    if refresh_confirmed_at_epoch is not None:
+        age = now - refresh_confirmed_at_epoch
+        freshness = FreshnessState.PROVEN_FRESH if age <= max_freshness_age_sec else FreshnessState.STALE_CACHED
+    elif len(models) == 0:
+        freshness = FreshnessState.UNKNOWN_UNFETCHED
+    else:
+        freshness = FreshnessState.STALE_CACHED
+
+    eligible = not is_expired and (freshness == FreshnessState.PROVEN_FRESH) and any(m.remaining_pct is not None and m.remaining_pct > 0 for m in models.values())
 
     return AccountQuotaSummary(
         safe_account_ref=email,
@@ -278,7 +306,10 @@ def parse_agm_info(text: str, source_label: str = "AGM_CLI_INFO") -> Optional[Ac
         gemini_flash_pct=gf_val,
         claude_pct=cl_val,
         models=models,
-        observed_at_epoch=now,
+        parsed_at_epoch=now,
+        refresh_confirmed_at_epoch=refresh_confirmed_at_epoch,
+        quota_reset_time=earliest_reset,
+        freshness_state=freshness,
         source=source_label,
         parse_warnings=warnings,
         eligible=eligible
@@ -286,11 +317,19 @@ def parse_agm_info(text: str, source_label: str = "AGM_CLI_INFO") -> Optional[Ac
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inspect and normalize AGM quota output.")
+    parser = argparse.ArgumentParser(description="Inspect and normalize AGM quota output with freshness provenance.")
     parser.add_argument("--file", "-f", help="Read raw AGM output from file")
     parser.add_argument("--mode", "-m", choices=["list", "info", "auto"], default="auto", help="Parsing mode")
-    parser.add_argument("--json", action="store_true", default=True, help="Output JSON format")
+    parser.add_argument("--provenance-json", help="Optional JSON dict mapping email -> refresh_confirmed_at timestamp")
     args = parser.parse_args()
+
+    prov = {}
+    if args.provenance_json:
+        try:
+            prov = json.loads(args.provenance_json)
+        except Exception as e:
+            print(f"Error parsing provenance JSON: {e}", file=sys.stderr)
+            sys.exit(1)
 
     if args.file:
         with open(args.file, "r", encoding="utf-8") as f:
@@ -299,7 +338,6 @@ def main():
         if not sys.stdin.isatty():
             content = sys.stdin.read()
         else:
-            # Try running `agm list`
             try:
                 res = subprocess.run(["agm", "list"], capture_output=True, text=True, check=True)
                 content = res.stdout
@@ -318,7 +356,7 @@ def main():
         res = parse_agm_info(content)
         data = asdict(res) if res else None
     else:
-        res_list = parse_agm_list(content)
+        res_list = parse_agm_list(content, refresh_provenance=prov)
         data = [asdict(r) for r in res_list]
 
     print(json.dumps(data, indent=2))
