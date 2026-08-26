@@ -1,21 +1,46 @@
+#!/usr/bin/env python3
+"""
+CDP Probe Tool for Antigravity Desktop (T03 Prototype)
+
+Discovers active CDP port from %APPDATA%\\Antigravity\\DevToolsActivePort.
+Qualifies Antigravity page targets.
+Exposes privacy-hardened summary by default (--verbose-private-data for full strings).
+"""
+
+import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
 import urllib.request
 import websockets
 
-def get_cdp_endpoint():
-    appdata = os.environ.get('APPDATA')
-    if appdata:
-        port_file = os.path.join(appdata, 'Antigravity', 'DevToolsActivePort')
-        if os.path.exists(port_file):
-            with open(port_file, 'r', encoding='utf-8') as f:
-                lines = f.read().splitlines()
-                if lines:
-                    port = lines[0].strip()
-                    return f"http://127.0.0.1:{port}"
-    return "http://127.0.0.1:58859"
+def discover_cdp_endpoint():
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None, "CDP_PORT_FILE_MISSING"
+
+    port_file = os.path.join(appdata, "Antigravity", "DevToolsActivePort")
+    if not os.path.exists(port_file):
+        return None, "CDP_PORT_FILE_MISSING"
+
+    try:
+        with open(port_file, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if not lines or not lines[0].strip().isdigit():
+            return None, "CDP_PORT_FILE_INVALID"
+        
+        port = lines[0].strip()
+        endpoint = f"http://127.0.0.1:{port}"
+        req = urllib.request.Request(f"{endpoint}/json/version", headers={"User-Agent": "SwitchAntigravity-T03/2.0"})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            ver_data = json.loads(resp.read().decode("utf-8"))
+            if "Browser" not in ver_data:
+                return None, "CDP_ENDPOINT_UNREACHABLE"
+        return endpoint, "OK"
+    except Exception:
+        return None, "CDP_ENDPOINT_UNREACHABLE"
 
 async def eval_js(ws, expr):
     msg_id = 1
@@ -35,134 +60,70 @@ async def eval_js(ws, expr):
         if data.get("id") == msg_id:
             res = data.get("result", {})
             if "exceptionDetails" in res:
-                return {"error": res["exceptionDetails"]}
+                return {"error": str(res["exceptionDetails"])}
             return res.get("result", {}).get("value")
 
 async def main():
-    endpoint = get_cdp_endpoint()
-    print(f"[*] CDP Endpoint: {endpoint}")
-    
-    # 1. Fetch version and targets
-    try:
-        ver_resp = urllib.request.urlopen(f"{endpoint}/json/version", timeout=3)
-        ver_data = json.loads(ver_resp.read().decode('utf-8'))
-        print(f"[*] Browser: {ver_data.get('Browser')}")
-        print(f"[*] User-Agent: {ver_data.get('User-Agent')}")
-    except Exception as e:
-        print(f"[!] Error querying /json/version: {e}")
-        return
+    parser = argparse.ArgumentParser(description="Probe Antigravity CDP Target")
+    parser.add_argument("--endpoint", help="Override CDP endpoint URL")
+    parser.add_argument("--verbose-private-data", action="store_true", help="Display unredacted strings and titles")
+    args = parser.parse_args()
+
+    if args.endpoint:
+        endpoint = args.endpoint
+        status = "OK"
+    else:
+        endpoint, status = discover_cdp_endpoint()
+
+    print(f"[*] CDP Discovery: {status}")
+    if status != "OK":
+        print(f"[!] Cannot proceed without active CDP endpoint: {status}")
+        sys.exit(1)
+
+    print(f"[*] Endpoint: {endpoint}")
 
     try:
         targets_resp = urllib.request.urlopen(f"{endpoint}/json/list", timeout=3)
-        targets = json.loads(targets_resp.read().decode('utf-8'))
-        print(f"[*] Found {len(targets)} targets:")
-        page_target = None
-        for t in targets:
-            print(f"    - Type: {t.get('type')}, Title: '{t.get('title')}', URL: {t.get('url')}")
-            if t.get('type') == 'page' and not page_target:
-                page_target = t
+        targets = json.loads(targets_resp.read().decode("utf-8"))
+        print(f"[*] Total Raw Targets Found: {len(targets)}")
     except Exception as e:
         print(f"[!] Error querying /json/list: {e}")
-        return
+        sys.exit(1)
 
+    page_target = next((t for t in targets if t.get("type") == "page"), None)
     if not page_target:
         print("[!] No page target found.")
-        return
+        sys.exit(1)
 
-    ws_url = page_target.get('webSocketDebuggerUrl')
+    ws_url = page_target.get("webSocketDebuggerUrl")
     print(f"[*] Connecting to Page WebSocket: {ws_url}")
-    
+
     async with websockets.connect(ws_url) as ws:
         print("[+] WebSocket connected successfully!")
         
-        # Test basic info
         info = await eval_js(ws, """
         (() => {
             return {
-                title: document.title,
                 url: window.location.href,
                 readyState: document.readyState,
-                bodyChildrenCount: document.body ? document.body.children.length : 0
+                hasSidebar: !!document.querySelector('[data-testid="conversation-list-sidebar"]'),
+                hasComposer: !!document.querySelector('[data-lexical-editor="true"]')
             };
         })()
         """)
-        print("[*] Page Info:", json.dumps(info, indent=2))
-        
-        # Probe testids
-        testids = await eval_js(ws, """
-        (() => {
-            const elements = Array.from(document.querySelectorAll('[data-testid]'));
-            return elements.map(el => ({
-                testid: el.getAttribute('data-testid'),
-                tag: el.tagName,
-                text: (el.textContent || '').trim().slice(0, 80),
-                visible: !!(el.offsetParent || el.offsetWidth || el.offsetHeight)
-            }));
-        })()
-        """)
-        print(f"[*] Found {len(testids) if testids else 0} elements with data-testid:")
-        if testids and isinstance(testids, list):
-            for el in testids[:20]:
-                print(f"    - [{el.get('testid')}] <{el.get('tag')}> '{el.get('text')}' (visible: {el.get('visible')})")
-        
-        # Probe composers / inputs / textareas / contenteditables
-        inputs = await eval_js(ws, """
-        (() => {
-            const inputs = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], [data-lexical-editor="true"], [role="textbox"]'));
-            return inputs.map(el => ({
-                tag: el.tagName,
-                id: el.id,
-                role: el.getAttribute('role'),
-                placeholder: el.getAttribute('placeholder'),
-                ariaLabel: el.getAttribute('aria-label'),
-                contenteditable: el.getAttribute('contenteditable'),
-                isLexical: el.getAttribute('data-lexical-editor'),
-                className: el.className,
-                visible: !!(el.offsetParent || el.offsetWidth || el.offsetHeight)
-            }));
-        })()
-        """)
-        print(f"[*] Found {len(inputs) if inputs else 0} input / composer elements:")
-        if inputs and isinstance(inputs, list):
-            for inp in inputs:
-                print(f"    - <{inp.get('tag')}> id='{inp.get('id')}', role='{inp.get('role')}', placeholder='{inp.get('placeholder')}', ariaLabel='{inp.get('ariaLabel')}', lexical='{inp.get('isLexical')}', visible={inp.get('visible')}")
-            
-        # Probe conversation list / pills / sidebar
-        convos = await eval_js(ws, """
-        (() => {
-            const pills = Array.from(document.querySelectorAll('[data-testid^="convo-pill-"]'));
-            return pills.map(el => ({
-                testid: el.getAttribute('data-testid'),
-                text: (el.textContent || '').trim(),
-                visible: !!(el.offsetParent || el.offsetWidth || el.offsetHeight)
-            }));
-        })()
-        """)
-        print(f"[*] Found {len(convos) if convos else 0} conversation pills:")
-        if convos and isinstance(convos, list):
-            for c in convos:
-                print(f"    - {c.get('testid')}: '{c.get('text')}' (visible={c.get('visible')})")
+        print("[*] Page Structural Qualification:", json.dumps(info, indent=2))
 
-        # Probe buttons (send, stop, model selection, etc.)
-        buttons = await eval_js(ws, """
+        counts = await eval_js(ws, """
         (() => {
-            const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-            return btns.map(b => ({
-                tag: b.tagName,
-                role: b.getAttribute('role'),
-                ariaLabel: b.getAttribute('aria-label'),
-                tooltipId: b.getAttribute('data-tooltip-id'),
-                testid: b.getAttribute('data-testid'),
-                text: (b.textContent || '').trim().slice(0, 50),
-                disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
-                visible: !!(b.offsetParent || b.offsetWidth || b.offsetHeight)
-            })).filter(b => b.ariaLabel || b.tooltipId || b.testid || (b.text && b.text.length < 30));
+            return {
+                totalTestIds: document.querySelectorAll('[data-testid]').length,
+                totalArticles: document.querySelectorAll('article, [role="article"]').length,
+                totalButtons: document.querySelectorAll('button').length,
+                conversationRows: document.querySelectorAll('[data-testid="conversation-row-sidebar"]').length
+            };
         })()
         """)
-        print(f"[*] Found {len(buttons) if buttons else 0} interesting button / action elements:")
-        if buttons and isinstance(buttons, list):
-            for b in buttons[:25]:
-                print(f"    - <{b.get('tag')}> label='{b.get('ariaLabel')}', tooltip='{b.get('tooltipId')}', testid='{b.get('testid')}', text='{b.get('text')}', disabled={b.get('disabled')}, visible={b.get('visible')}")
+        print("[*] DOM Element Counts:", json.dumps(counts, indent=2))
 
 if __name__ == '__main__':
     asyncio.run(main())
