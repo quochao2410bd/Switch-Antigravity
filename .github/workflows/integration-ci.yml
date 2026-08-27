@@ -35,8 +35,9 @@ jobs:
       - name: Compile all Python
         run: python -m compileall -q scripts
 
-      - name: T01 quota detector tests
-        run: python scripts/t01/test_quota_detector.py
+      - name: T01 integration contract tests
+        working-directory: scripts/integration
+        run: python -m unittest -v test_quota_adapter.py
 
       - name: T02 zero-side-effect trust tests
         run: python scripts/t02/validate_agm_output.py
