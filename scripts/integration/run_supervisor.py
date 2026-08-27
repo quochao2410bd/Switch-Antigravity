@@ -5,9 +5,10 @@ import argparse
 import json
 import os
 
-from supervisor import SupervisorConfig, SwitchSupervisor
+from hardened_supervisor import HardenedSwitchSupervisor
 from production_adapters import ProductionAdapterConfig
 from safe_production_adapters import SafeProductionAdapters
+from supervisor import SupervisorConfig
 
 DEFAULT_PROMPT = """Continue the current task from exactly where you stopped.
 First inspect the current repository state, git status, git diff, recent commits, terminal output and the existing conversation context.
@@ -65,7 +66,7 @@ def main() -> None:
         max_rotation_attempts=args.max_rotation_attempts,
         execute_switch=args.execute_switch,
     ))
-    sup = SwitchSupervisor(cfg, adapters)
+    sup = HardenedSwitchSupervisor(cfg, adapters)
     if args.forever:
         sup.run_forever()
     else:
