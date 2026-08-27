@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +17,7 @@ for rel in ("t01", "t02", "t03"):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from desktop_identity import DesktopRuntimeProbe, pseudonymize_email
 from quota_detector import create_baseline, poll_new_events
 from trusted_agm_runner import TrustedAgmIdentity, execute_trusted_agm
 from refresh_quota_safe import execute_safe_refresh, is_canonical_email, pseudonymize_account
@@ -42,15 +45,11 @@ class ProductionAdapterConfig:
 
 
 class ProductionAdapters:
-    """
-    Concrete bridge from the integration supervisor to accepted T01/T02/T03 modules.
+    """Concrete fail-closed bridge across accepted T01/T02/T03 lanes.
 
-    Important current integration boundary:
-    - Credential-store identity can be independently verified by T02.
-    - Desktop adoption of that credential after a switch remains UNKNOWN.
-    - Therefore desktop_adoption_verifier_available() intentionally returns False.
-      The supervisor will stop BEFORE any credential mutation unless this adapter is
-      later extended with a verified Desktop adoption mechanism.
+    Runtime identity is sourced from the exact running Antigravity language_server
+    through local GetUserStatus.email. Credential Manager is used only for the T02
+    credential switch/verification boundary, never as proof that Desktop adopted it.
     """
 
     def __init__(self, config: ProductionAdapterConfig):
@@ -59,6 +58,61 @@ class ProductionAdapters:
             expected_binary_sha256=config.expected_agm_sha256,
             canonical_executable_path=config.expected_agm_path,
         )
+        self.desktop_probe = DesktopRuntimeProbe()
+        self._last_language_server_pid = int(config.language_server_pid)
+
+    def _cycle_ref(self, event_id: str) -> str:
+        return hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:12]
+
+    def _cycle_journal_path(self, event_id: str) -> str:
+        root, ext = os.path.splitext(self.config.t03_journal_path)
+        return f"{root}.cycle_{self._cycle_ref(event_id)}{ext or '.json'}"
+
+    def _cycle_prompt(self, event_id: str) -> str:
+        return f"{self.config.resume_prompt.rstrip()}\nRecovery cycle: {self._cycle_ref(event_id)}."
+
+    def _observe_desktop_account_private(self) -> Dict[str, Any]:
+        snapshot, status = self.desktop_probe.inspect(self._last_language_server_pid)
+        if snapshot is None:
+            snapshot, status = self.desktop_probe.inspect(None)
+        if snapshot is None:
+            return {"verified": False, "status": status, "account": None, "account_ref": None}
+        try:
+            responses = self.desktop_probe._user_status_fetcher(snapshot)
+        except Exception:
+            return {
+                "verified": False,
+                "status": "DESKTOP_GET_USER_STATUS_FAILED",
+                "account": None,
+                "account_ref": None,
+                "language_server_pid": snapshot.language_server_pid,
+            }
+        emails = set()
+        for response in responses:
+            if not isinstance(response, dict):
+                continue
+            user_status = response.get("userStatus")
+            email = user_status.get("email") if isinstance(user_status, dict) else None
+            if isinstance(email, str) and is_canonical_email(email.strip().lower()):
+                emails.add(email.strip().lower())
+        if len(emails) != 1:
+            return {
+                "verified": False,
+                "status": "DESKTOP_IDENTITY_EMAIL_MISSING" if not emails else "DESKTOP_IDENTITY_AMBIGUOUS",
+                "account": None,
+                "account_ref": None,
+                "language_server_pid": snapshot.language_server_pid,
+            }
+        email = next(iter(emails))
+        self._last_language_server_pid = snapshot.language_server_pid
+        return {
+            "verified": True,
+            "status": "DESKTOP_IDENTITY_OBSERVED",
+            "account": email,
+            "account_ref": pseudonymize_email(email),
+            "language_server_pid": snapshot.language_server_pid,
+            "source": "LANGUAGE_SERVER_GET_USER_STATUS",
+        }
 
     def create_quota_baseline(self, session_id: str, ls_pid: int) -> Dict[str, Any]:
         baseline, _ = create_baseline(self.config.log_path, ls_pid=ls_pid, supervisor_session_id=session_id)
@@ -75,21 +129,16 @@ class ProductionAdapters:
         return result
 
     def current_ls_pid(self) -> int:
-        return int(self.config.language_server_pid)
+        snapshot, _ = self.desktop_probe.inspect(self._last_language_server_pid)
+        if snapshot is None:
+            snapshot, _ = self.desktop_probe.inspect(None)
+        if snapshot is None:
+            return 0
+        self._last_language_server_pid = snapshot.language_server_pid
+        return snapshot.language_server_pid
 
     def get_current_account(self) -> Dict[str, Any]:
-        result = verify_active_account(expected_account=None, introspect_network=True)
-        verified = (
-            result.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
-            and bool(result.raw_detected_email)
-        )
-        return {
-            "verified": verified,
-            "account": result.raw_detected_email if verified else None,
-            "account_ref": pseudonymize_account(result.raw_detected_email) if verified else result.account_ref,
-            "status": result.status.value,
-            "error_code": result.error_code,
-        }
+        return self._observe_desktop_account_private()
 
     def _trusted_list(self) -> Optional[str]:
         res = execute_trusted_agm(["list"], trusted_identity=self.identity, timeout_sec=15)
@@ -101,13 +150,11 @@ class ProductionAdapters:
         first_output = self._trusted_list()
         if first_output is None:
             return []
-
         preliminary = parse_agm_list(
             first_output,
             supervisor_session_id=session_id,
             trusted_identity=self.identity,
         )
-
         evidence_map = {}
         for acc in preliminary:
             email = acc.canonical_account
@@ -121,11 +168,9 @@ class ProductionAdapters:
                 trusted_identity=self.identity,
                 live_network=True,
             )
-
         second_output = self._trusted_list()
         if second_output is None:
             return []
-
         accounts = parse_agm_list(
             second_output,
             refresh_evidence_map=evidence_map,
@@ -157,12 +202,49 @@ class ProductionAdapters:
                 "freshness_state": chosen.freshness_state.value,
             })
             remaining = [a for a in remaining if a.canonical_account != chosen.canonical_account]
-
         return ordered
+
+    def _t03_args(self, event_id: str, send: bool) -> argparse.Namespace:
+        return argparse.Namespace(
+            conversation_id=self.config.conversation_uuid,
+            title=None,
+            prompt=self._cycle_prompt(event_id),
+            send=send,
+            probe_composer_write=False,
+            cdp_endpoint=None,
+            journal_path=self._cycle_journal_path(event_id),
+            timeout=self.config.t03_timeout_sec,
+            json=False,
+            verbose_private_data=False,
+        )
+
+    def _t03_preflight(self, event_id: str) -> Dict[str, Any]:
+        result = asyncio.run(execute_resume_pipeline(self._t03_args(event_id, send=False)))
+        summary = result.get("dry_run_summary") or {}
+        decision = (result.get("recovery_decision") or {}).get("code")
+        target = result.get("target_conversation") or {}
+        exact_uuid = target.get("uuid") == self.config.conversation_uuid and summary.get("target_uuid_verified") == self.config.conversation_uuid
+        ready = (
+            result.get("status") == "DRY_RUN_READ_ONLY_SUCCESS"
+            and exact_uuid
+            and summary.get("draft_present") is False
+            and decision == "NEW_ATTEMPT_ALLOWED"
+        )
+        return {
+            "ready": ready,
+            "status": "TRANSITION_PREFLIGHT_READY" if ready else "TRANSITION_PREFLIGHT_BLOCKED",
+            "t03_status": result.get("status"),
+            "decision": decision,
+            "exact_uuid": exact_uuid,
+            "draft_present": summary.get("draft_present"),
+        }
+
+    def prepare_account_transition(self, event_id: str) -> Dict[str, Any]:
+        return self._t03_preflight(event_id)
 
     def switch_account(self, account: str) -> Dict[str, Any]:
         if not self.config.execute_switch:
-            return {"verified": False, "error_code": "EXECUTION_DISABLED"}
+            return {"verified": False, "safe_to_retry": False, "status": "EXECUTION_DISABLED", "error_code": "EXECUTION_DISABLED"}
         result = execute_safe_switch(
             account,
             target="agy",
@@ -171,44 +253,80 @@ class ProductionAdapters:
             trusted_identity=self.identity,
             private_diagnostic_mode=False,
         )
+        verified = result.get("status") == SwitchOutcome.CREDENTIAL_IDENTITY_VERIFIED.value
         return {
-            "verified": result.get("status") == SwitchOutcome.CREDENTIAL_IDENTITY_VERIFIED.value,
+            "verified": verified,
+            "safe_to_retry": False,
             "account_ref": result.get("account_ref"),
             "status": result.get("status"),
             "error_code": result.get("error_code") or result.get("status"),
         }
 
-    def desktop_adoption_verifier_available(self) -> bool:
-        return False
-
-    def verify_desktop_adoption(self, expected_account_ref: str) -> Dict[str, Any]:
+    def verify_credential_adoption(self, expected_account_ref: str) -> Dict[str, Any]:
+        result = verify_active_account(expected_account=None, introspect_network=True)
+        detected = pseudonymize_account(result.raw_detected_email) if result.raw_detected_email else None
+        verified = (
+            result.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED
+            and detected == expected_account_ref
+        )
         return {
-            "verified": False,
-            "status": "BLOCKED_DESKTOP_ADOPTION_UNVERIFIED",
-            "account_ref": expected_account_ref,
+            "verified": verified,
+            "status": "CREDENTIAL_TARGET_VERIFIED" if verified else result.status.value,
+            "detected_account_ref": detected,
+            "error_code": result.error_code,
         }
 
-    def _t03_args(self, send: bool) -> argparse.Namespace:
-        return argparse.Namespace(
-            conversation_id=self.config.conversation_uuid,
-            title=None,
-            prompt=self.config.resume_prompt,
-            send=send,
-            probe_composer_write=False,
-            cdp_endpoint=None,
-            journal_path=self.config.t03_journal_path,
-            timeout=self.config.t03_timeout_sec,
-            json=False,
-            verbose_private_data=False,
-        )
+    def desktop_adoption_verifier_available(self) -> bool:
+        capability = self.desktop_probe.capability_status(self._last_language_server_pid)
+        return bool(capability.get("available"))
 
-    def resume_conversation(self) -> Dict[str, Any]:
-        return asyncio.run(execute_resume_pipeline(self._t03_args(send=True)))
+    def probe_desktop_adoption(self, expected_account_ref: str) -> Dict[str, Any]:
+        result = self.desktop_probe.probe_identity(expected_account_ref, self._last_language_server_pid)
+        pid = result.get("language_server_pid")
+        if isinstance(pid, int) and pid > 0:
+            self._last_language_server_pid = pid
+        return result
 
-    def probe_resume_progress(self) -> Dict[str, Any]:
-        result = asyncio.run(execute_resume_pipeline(self._t03_args(send=False)))
+    def restart_desktop_for_adoption(self, expected_account_ref: str, old_ls_pid: int) -> Dict[str, Any]:
+        result = self.desktop_probe.restart_and_verify(expected_account_ref, old_ls_pid)
+        pid = result.get("language_server_pid")
+        if result.get("verified") and isinstance(pid, int) and pid > 0:
+            self._last_language_server_pid = pid
+        return result
+
+    def reconcile_desktop_after_restart(self, expected_account_ref: str, old_ls_pid: int) -> Dict[str, Any]:
+        deadline = time.time() + 20.0
+        last_status = "DESKTOP_RESTART_RECONCILIATION_TIMEOUT"
+        while time.time() < deadline:
+            snapshot, status = self.desktop_probe.inspect(None)
+            if snapshot is None:
+                last_status = status
+                time.sleep(0.4)
+                continue
+            if snapshot.language_server_pid == old_ls_pid:
+                last_status = "DESKTOP_OLD_LANGUAGE_SERVER_STILL_ACTIVE"
+                time.sleep(0.4)
+                continue
+            result = self.desktop_probe.probe_identity(expected_account_ref, snapshot.language_server_pid)
+            if result.get("verified"):
+                self._last_language_server_pid = snapshot.language_server_pid
+                return result
+            last_status = result.get("status") or last_status
+            if last_status == "DESKTOP_IDENTITY_MISMATCH":
+                return result
+            time.sleep(0.4)
+        return {"verified": False, "status": last_status}
+
+    def resume_conversation(self, event_id: str) -> Dict[str, Any]:
+        preflight = self._t03_preflight(event_id)
+        if not preflight.get("ready"):
+            return {"status": "POST_TRANSITION_PREFLIGHT_FAILED", "preflight": preflight}
+        return asyncio.run(execute_resume_pipeline(self._t03_args(event_id, send=True)))
+
+    def probe_resume_progress(self, event_id: str) -> Dict[str, Any]:
+        result = asyncio.run(execute_resume_pipeline(self._t03_args(event_id, send=False)))
         decision = (result.get("recovery_decision") or {}).get("code")
-        verified = decision == "TURN_ALREADY_ACTIVE"
+        verified = decision in ("TURN_ALREADY_ACTIVE", "RESUME_ALREADY_OBSERVED")
         return {
             "verified": verified,
             "status": "TURN_PROGRESS_VERIFIED" if verified else "TURN_PROGRESS_NOT_YET_VERIFIED",
