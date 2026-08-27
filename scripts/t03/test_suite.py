@@ -69,7 +69,8 @@ from send_resume import (
     discover_cdp_endpoint,
     execute_resume_pipeline,
     QualifiedAntigravityClient,
-    normalize_text
+    normalize_text,
+    DOM_QUALIFICATION_JS
 )
 
 SYNTHETIC_UUID_1 = "00000000-0000-4000-8000-000000000001"
@@ -694,6 +695,203 @@ class TestT03Round8Final(unittest.TestCase):
         rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
         with self.assertRaises(ValueError):
             self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_MESSAGE_OBSERVED)
+
+    # 23. Legacy MAIN DOM Qualification
+    def test_23_legacy_main_dom_qualifies_successfully(self):
+        """Legacy <main> DOM structure qualifies variant LEGACY_MAIN and succeeds read-only."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            if "qualifyTargetSurface" in expr:
+                return {
+                    "found": True,
+                    "role": "textbox",
+                    "ariaLabel": "Editor",
+                    "text": "",
+                    "draftPresent": False,
+                    "isFocused": False,
+                    "sendButton": {"found": True, "disabled": False, "label": "Send"},
+                    "stopButton": {"found": False}
+                }
+            return {}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_composer_state(SYNTHETIC_UUID_1))
+        self.assertTrue(state.get("found"))
+        self.assertFalse(state.get("draftPresent"))
+
+    # 24. Current Live DIV DOM Qualification
+    def test_24_live_div_dom_qualifies_successfully(self):
+        """Current live DOM with conversation-view and agent-input-box qualifies successfully."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            if "qualifyTargetSurface" in expr:
+                return {
+                    "totalArticles": 2,
+                    "userMessageCount": 1,
+                    "assistantMessageCount": 1,
+                    "userMessages": ["Hello"],
+                    "lastUserMessageText": "Hello",
+                    "lastAssistantMessageText": "Hi",
+                    "hasUnknownRole": False,
+                    "lastMessageIsUnknown": False,
+                    "newQuotaError": False,
+                    "newGenericError": False,
+                    "isMainTurnActive": False,
+                    "mainStopButtonCount": 0,
+                    "isConversationEmptyOrIdle": False
+                }
+            return {}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_scoped_conversation_state(SYNTHETIC_UUID_1, hash_prompt(SYNTHETIC_PROMPT)))
+        self.assertEqual(state.get("totalArticles"), 2)
+        self.assertFalse(state.get("isMainTurnActive"))
+
+    # 25. Zero target root fails closed
+    def test_25_zero_target_root_fails_closed(self):
+        """Zero qualified target root returns TARGET_SURFACE_NOT_FOUND."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"found": False, "error": "TARGET_SURFACE_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_composer_state(SYNTHETIC_UUID_1))
+        self.assertEqual(state.get("error"), "TARGET_SURFACE_NOT_FOUND")
+
+    # 26. Multiple qualified roots fail closed
+    def test_26_multiple_qualified_roots_fail_closed(self):
+        """Multiple target roots return TARGET_SURFACE_AMBIGUOUS."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"found": False, "error": "TARGET_SURFACE_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_composer_state(SYNTHETIC_UUID_1))
+        self.assertEqual(state.get("error"), "TARGET_SURFACE_AMBIGUOUS")
+
+    # 27. Editor outside root fails closed
+    def test_27_editor_outside_root_fails_closed(self):
+        """Editor outside qualified target surface returns COMPOSER_NOT_FOUND."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"found": False, "error": "COMPOSER_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_composer_state(SYNTHETIC_UUID_1))
+        self.assertEqual(state.get("error"), "COMPOSER_NOT_FOUND")
+
+    # 28. Multiple editors fail closed
+    def test_28_multiple_editors_fail_closed(self):
+        """Multiple editors inside target surface return COMPOSER_AMBIGUOUS."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"found": False, "error": "COMPOSER_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_composer_state(SYNTHETIC_UUID_1))
+        self.assertEqual(state.get("error"), "COMPOSER_AMBIGUOUS")
+
+    # 29. Missing message surface fails closed
+    def test_29_missing_message_surface_fails_closed(self):
+        """Missing message container returns MESSAGE_CONTAINER_NOT_FOUND."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"error": "MESSAGE_CONTAINER_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_scoped_conversation_state(SYNTHETIC_UUID_1, hash_prompt(SYNTHETIC_PROMPT)))
+        self.assertEqual(state.get("error"), "MESSAGE_CONTAINER_NOT_FOUND")
+
+    # 30. Multiple message surfaces fail closed
+    def test_30_multiple_message_surfaces_fail_closed(self):
+        """Multiple message containers return MESSAGE_CONTAINER_AMBIGUOUS."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"error": "MESSAGE_CONTAINER_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_evaluate
+        state = asyncio.run(client.inspect_scoped_conversation_state(SYNTHETIC_UUID_1, hash_prompt(SYNTHETIC_PROMPT)))
+        self.assertEqual(state.get("error"), "MESSAGE_CONTAINER_AMBIGUOUS")
+
+    # 31. Send control outside qualified composer surface fails closed
+    def test_31_send_control_outside_composer_surface_fails_closed(self):
+        """Send control outside composer input box returns SEND_CONTROL_NOT_FOUND."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"safe": False, "error": "SEND_CONTROL_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+        res = asyncio.run(client.dispatch_submission_input(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertFalse(res.get("dispatched"))
+        self.assertEqual(res.get("error"), "SEND_CONTROL_NOT_FOUND")
+
+    # 32. Multiple send controls fail closed
+    def test_32_multiple_send_controls_fail_closed(self):
+        """Multiple send controls return SEND_CONTROL_AMBIGUOUS."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"safe": False, "error": "SEND_CONTROL_AMBIGUOUS"}
+        client.evaluate = stub_evaluate
+        res = asyncio.run(client.dispatch_submission_input(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertFalse(res.get("dispatched"))
+        self.assertEqual(res.get("error"), "SEND_CONTROL_AMBIGUOUS")
+
+    # 33. Wrong route fails closed
+    def test_33_wrong_route_fails_closed(self):
+        """Mismatched pathname returns WRONG_CONVERSATION_ACTIVE and 0 dispatches."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"safe": False, "error": "ROUTE_MUTATED_BEFORE_DISPATCH"}
+        client.evaluate = stub_evaluate
+        res = asyncio.run(client.dispatch_submission_input(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertFalse(res.get("dispatched"))
+        self.assertEqual(res.get("error"), "ROUTE_MUTATED_BEFORE_DISPATCH")
+
+    # 34. DOM changes between inspect and clear
+    def test_34_dom_changes_before_clear_aborts_input_commands(self):
+        """DOM target surface disappearing before clear raises RuntimeError with 0 Input commands."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        cmds = []
+        async def stub_send_command(method, params=None):
+            cmds.append(method)
+            return {}
+        client.send_command = stub_send_command
+        async def stub_evaluate(expr):
+            return {"focused": False, "error": "TARGET_SURFACE_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.clear_composer(SYNTHETIC_UUID_1))
+        self.assertIn("TARGET_SURFACE_NOT_FOUND", str(ctx.exception))
+        self.assertEqual(len(cmds), 0)
+
+    # 35. DOM changes between inspect and insert
+    def test_35_dom_changes_before_insert_aborts_input_commands(self):
+        """DOM composer disappearing before insert raises RuntimeError with 0 Input commands."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        cmds = []
+        async def stub_send_command(method, params=None):
+            cmds.append(method)
+            return {}
+        client.send_command = stub_send_command
+        async def stub_evaluate(expr):
+            return {"focused": False, "error": "COMPOSER_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.insert_prompt_text(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertIn("COMPOSER_NOT_FOUND", str(ctx.exception))
+        self.assertEqual(len(cmds), 0)
+
+    # 36. DOM changes between insert verification and dispatch
+    def test_36_dom_changes_before_dispatch_aborts_send(self):
+        """Active stop button appearing before dispatch halts dispatch with 0 dispatches."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"safe": False, "error": "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH"}
+        client.evaluate = stub_evaluate
+        res = asyncio.run(client.dispatch_submission_input(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertFalse(res.get("dispatched"))
+        self.assertEqual(res.get("error"), "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH")
+
+    # 37. Sidebar controls excluded from target conversation surface
+    def test_37_sidebar_controls_excluded_from_target_surface(self):
+        """Elements inside conversation-list-sidebar are excluded from target surface qualification."""
+        self.assertIn('closest(\'[data-testid="conversation-list-sidebar"]\')', DOM_QUALIFICATION_JS)
+        self.assertIn('qualifyTargetSurface', DOM_QUALIFICATION_JS)
+        self.assertIn('qualifyComposerSurface', DOM_QUALIFICATION_JS)
+        self.assertIn('qualifyMessageSurface', DOM_QUALIFICATION_JS)
 
 if __name__ == '__main__':
     unittest.main()

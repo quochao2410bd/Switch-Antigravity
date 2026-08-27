@@ -138,6 +138,102 @@ def correlate_turn_status(dom_state, baseline_state=None, external_error_hook=No
 
     return "NO_ASSISTANT_TURN"
 
+DOM_QUALIFICATION_JS = r"""
+function qualifyTargetSurface(targetUuid) {
+    if (targetUuid) {
+        const pathname = window.location.pathname.toLowerCase();
+        const expected = '/c/' + targetUuid.toLowerCase();
+        if (pathname !== expected) {
+            return { surface: null, error: 'WRONG_CONVERSATION_ACTIVE', currentPathname: pathname };
+        }
+    }
+
+    const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent && !m.closest('[data-testid="conversation-list-sidebar"]'));
+    if (mains.length === 1) {
+        return { surface: mains[0], variant: 'LEGACY_MAIN', error: null };
+    } else if (mains.length > 1) {
+        return { surface: null, error: 'TARGET_SURFACE_AMBIGUOUS', count: mains.length };
+    }
+
+    const convViews = Array.from(document.querySelectorAll('[data-testid="conversation-view"]')).filter(c => !!c.offsetParent && !c.closest('[data-testid="conversation-list-sidebar"]'));
+    if (convViews.length === 1) {
+        return { surface: convViews[0], variant: 'CONVERSATION_VIEW', error: null };
+    } else if (convViews.length > 1) {
+        return { surface: null, error: 'TARGET_SURFACE_AMBIGUOUS', count: convViews.length };
+    }
+
+    return { surface: null, error: 'TARGET_SURFACE_NOT_FOUND' };
+}
+
+function qualifyComposerSurface(targetSurface) {
+    if (!targetSurface) return { editor: null, inputBox: null, sendButton: { found: false }, sendBtnElement: null, error: 'TARGET_SURFACE_NOT_FOUND' };
+
+    const editors = Array.from(targetSurface.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
+    if (editors.length === 0) return { editor: null, error: 'COMPOSER_NOT_FOUND' };
+    if (editors.length > 1) return { editor: null, error: 'COMPOSER_AMBIGUOUS', count: editors.length };
+    const editor = editors[0];
+
+    const inputBox = editor.closest('[data-testid="agent-input-box"], #antigravity\\.agentSidePanelInputBox') || editor.parentElement;
+
+    const sendBtns = Array.from(inputBox.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send message"], button[aria-label*="Send" i]')).filter(b => !!b.offsetParent);
+    let sendBtnState = { found: false };
+    let sendBtnElement = null;
+    if (sendBtns.length === 1) {
+        const b = sendBtns[0];
+        sendBtnElement = b;
+        sendBtnState = {
+            found: true,
+            disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+            label: b.getAttribute('aria-label')
+        };
+    } else if (sendBtns.length > 1) {
+        sendBtnState = { found: false, error: 'SEND_CONTROL_AMBIGUOUS', count: sendBtns.length };
+    }
+
+    return { editor: editor, inputBox: inputBox, sendButton: sendBtnState, sendBtnElement: sendBtnElement, error: null };
+}
+
+function qualifyMessageSurface(targetSurface) {
+    if (!targetSurface) return { container: null, error: 'TARGET_SURFACE_NOT_FOUND' };
+
+    const explicitContainers = Array.from(targetSurface.querySelectorAll('[data-testid="conversation-messages"]')).filter(c => !!c.offsetParent);
+    if (explicitContainers.length === 1) {
+        return { container: explicitContainers[0], error: null };
+    } else if (explicitContainers.length > 1) {
+        return { container: null, error: 'MESSAGE_CONTAINER_AMBIGUOUS', count: explicitContainers.length };
+    }
+
+    const candidateContainers = Array.from(targetSurface.children).filter(c => {
+        if (c.matches('[data-testid="agent-input-box"], #antigravity\\.agentSidePanelInputBox') || c.querySelector('[data-lexical-editor="true"]')) {
+            return false;
+        }
+        return !!c.offsetParent;
+    });
+
+    if (candidateContainers.length === 1) {
+        return { container: candidateContainers[0], error: null };
+    } else if (candidateContainers.length > 1) {
+        return { container: null, error: 'MESSAGE_CONTAINER_AMBIGUOUS', count: candidateContainers.length };
+    }
+
+    return { container: null, error: 'MESSAGE_CONTAINER_NOT_FOUND' };
+}
+
+function qualifyStopControl(targetSurface) {
+    if (!targetSurface) return { found: false };
+    const stopBtn = Array.from(targetSurface.querySelectorAll('button')).find(b => {
+        if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
+        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+        const text = (b.textContent || '').toLowerCase();
+        return (label.includes('stop') || text.includes('stop')) && !!b.offsetParent;
+    });
+    if (stopBtn) {
+        return { found: true, label: stopBtn.getAttribute('aria-label') || 'Stop' };
+    }
+    return { found: false };
+}
+"""
+
 class QualifiedAntigravityClient:
     def __init__(self, endpoint, timeout=30):
         self.endpoint = endpoint
@@ -342,15 +438,17 @@ class QualifiedAntigravityClient:
         while time.time() - start < timeout:
             check = await self.evaluate(f"""
             ((targetUuid) => {{
-                const pathname = window.location.pathname.toLowerCase();
-                const expected = '/c/' + targetUuid.toLowerCase();
-                const isExactMatch = (pathname === expected);
-                const targetRoot = document.querySelector('main');
-                const composerMounted = !!(targetRoot && targetRoot.querySelector('[data-lexical-editor="true"]'));
+                {DOM_QUALIFICATION_JS}
+                const targetRes = qualifyTargetSurface(targetUuid);
+                const compRes = qualifyComposerSurface(targetRes.surface);
+                const isExactMatch = !targetRes.error;
+                const composerMounted = !compRes.error && !!compRes.editor;
                 return {{
                     isExactMatch: isExactMatch,
                     composerMounted: composerMounted,
-                    currentPathname: pathname
+                    currentPathname: window.location.pathname,
+                    targetError: targetRes.error,
+                    composerError: compRes.error
                 }};
             }})({json.dumps(val_uuid)})
             """)
@@ -367,33 +465,22 @@ class QualifiedAntigravityClient:
         val_uuid = validate_uuid(target_uuid)
         script = rf"""
         ((targetUuid, baselineCount) => {{
-            const pathname = window.location.pathname.toLowerCase();
-            const expected = '/c/' + targetUuid.toLowerCase();
-            if (pathname !== expected) {{
-                return {{ error: "WRONG_CONVERSATION_ACTIVE", currentPathname: pathname }};
+            {DOM_QUALIFICATION_JS}
+            const targetRes = qualifyTargetSurface(targetUuid);
+            if (targetRes.error) {{
+                return {{ error: targetRes.error, currentPathname: window.location.pathname }};
             }}
+            const targetSurface = targetRes.surface;
 
-            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
-            if (mains.length === 0) return {{ error: "TARGET_ROOT_NOT_FOUND" }};
-            if (mains.length > 1) return {{ error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
-            const targetRoot = mains[0];
-
-            const messageContainers = Array.from(targetRoot.querySelectorAll('[data-testid="conversation-messages"]')).filter(c => !!c.offsetParent);
-            if (messageContainers.length === 0) {{
-                return {{ error: "MESSAGE_CONTAINER_NOT_FOUND" }};
+            const msgRes = qualifyMessageSurface(targetSurface);
+            if (msgRes.error) {{
+                return {{ error: msgRes.error, count: msgRes.count }};
             }}
-            if (messageContainers.length > 1) {{
-                return {{ error: "MESSAGE_CONTAINER_AMBIGUOUS", count: messageContainers.length }};
-            }}
-            const messageContainer = messageContainers[0];
+            const messageContainer = msgRes.container;
             const articles = Array.from(messageContainer.querySelectorAll('article, [role="article"]'));
             
-            const mainStopButtons = Array.from(targetRoot.querySelectorAll('button')).filter(b => {{
-                if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
-                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                const text = (b.textContent || '').toLowerCase();
-                return (label.includes('stop') || text.includes('stop')) && !!b.offsetParent;
-            }});
+            const stopBtn = qualifyStopControl(targetSurface);
+            const isMainTurnActive = stopBtn.found;
 
             const userMessages = [];
             const assistantMessages = [];
@@ -445,9 +532,9 @@ class QualifiedAntigravityClient:
                 lastMessageIsUnknown: lastMessageIsUnknown,
                 newQuotaError: newQuotaError,
                 newGenericError: newGenericError,
-                isMainTurnActive: mainStopButtons.length > 0,
-                mainStopButtonCount: mainStopButtons.length,
-                isConversationEmptyOrIdle: (articles.length === 0 || (userMessages.length === 0 && !mainStopButtons.length))
+                isMainTurnActive: isMainTurnActive,
+                mainStopButtonCount: isMainTurnActive ? 1 : 0,
+                isConversationEmptyOrIdle: (articles.length === 0 || (userMessages.length === 0 && !isMainTurnActive))
             }};
         }})({json.dumps(val_uuid)}, {baseline_article_count})
         """
@@ -469,43 +556,19 @@ class QualifiedAntigravityClient:
         val_uuid = validate_uuid(target_uuid) if target_uuid else None
         script = f"""
         ((targetUuid) => {{
-            if (targetUuid) {{
-                const pathname = window.location.pathname.toLowerCase();
-                const expected = '/c/' + targetUuid.toLowerCase();
-                if (pathname !== expected) {{
-                    return {{ found: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-                }}
+            {DOM_QUALIFICATION_JS}
+            const targetRes = qualifyTargetSurface(targetUuid);
+            if (targetRes.error) {{
+                return {{ found: false, error: targetRes.error, currentPathname: window.location.pathname }};
             }}
+            const targetSurface = targetRes.surface;
 
-            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
-            if (mains.length === 0) return {{ found: false, error: "TARGET_ROOT_NOT_FOUND" }};
-            if (mains.length > 1) return {{ found: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
-            const targetRoot = mains[0];
-
-            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-            if (editors.length === 0) return {{ found: false, error: "COMPOSER_NOT_FOUND" }};
-            if (editors.length > 1) return {{ found: false, error: "COMPOSER_AMBIGUOUS", count: editors.length }};
-            
-            const editor = editors[0];
-            const sendBtns = Array.from(targetRoot.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send message"]')).filter(b => !!b.offsetParent);
-            
-            let sendBtnState = {{ found: false }};
-            if (sendBtns.length === 1) {{{{
-                const b = sendBtns[0];
-                sendBtnState = {{
-                    found: true,
-                    disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
-                    label: b.getAttribute('aria-label')
-                }};
-            }}}} else if (sendBtns.length > 1) {{{{
-                sendBtnState = {{ found: false, error: "SEND_CONTROL_AMBIGUOUS", count: sendBtns.length }};
-            }}}}
-
-            const stopBtn = Array.from(targetRoot.querySelectorAll('button')).find(b => {{
-                if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
-                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                return label.includes('stop') && !!b.offsetParent;
-            }});
+            const compRes = qualifyComposerSurface(targetSurface);
+            if (compRes.error) {{
+                return {{ found: false, error: compRes.error, count: compRes.count }};
+            }}
+            const editor = compRes.editor;
+            const stopBtn = qualifyStopControl(targetSurface);
 
             const text = (editor.innerText || editor.textContent || '').trim();
             return {{
@@ -515,11 +578,8 @@ class QualifiedAntigravityClient:
                 text: text,
                 draftPresent: text.length > 0,
                 isFocused: document.activeElement === editor,
-                sendButton: sendBtnState,
-                stopButton: stopBtn ? {{
-                    found: true,
-                    label: stopBtn.getAttribute('aria-label')
-                }} : {{ found: false }}
+                sendButton: compRes.sendButton,
+                stopButton: stopBtn
             }};
         }})({json.dumps(val_uuid)})
         """
@@ -529,16 +589,16 @@ class QualifiedAntigravityClient:
         val_uuid = validate_uuid(target_uuid)
         focus_res = await self.evaluate(f"""
         ((targetUuid) => {{
-            const pathname = window.location.pathname.toLowerCase();
-            if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ focused: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
-            if (mains.length === 0) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
-            if (mains.length > 1) return {{ focused: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
-            const targetRoot = mains[0];
-            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-            if (editors.length === 0) return {{ focused: false, error: "COMPOSER_NOT_FOUND" }};
-            if (editors.length > 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS", count: editors.length }};
-            const editor = editors[0];
+            {DOM_QUALIFICATION_JS}
+            const targetRes = qualifyTargetSurface(targetUuid);
+            if (targetRes.error) {{
+                return {{ focused: false, error: targetRes.error }};
+            }}
+            const compRes = qualifyComposerSurface(targetRes.surface);
+            if (compRes.error) {{
+                return {{ focused: false, error: compRes.error }};
+            }}
+            const editor = compRes.editor;
             editor.focus();
             return {{ focused: (document.activeElement === editor) }};
         }})({json.dumps(val_uuid)})
@@ -565,16 +625,16 @@ class QualifiedAntigravityClient:
         val_uuid = validate_uuid(target_uuid)
         focus_res = await self.evaluate(f"""
         ((targetUuid) => {{
-            const pathname = window.location.pathname.toLowerCase();
-            if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ focused: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
-            if (mains.length === 0) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
-            if (mains.length > 1) return {{ focused: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
-            const targetRoot = mains[0];
-            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-            if (editors.length === 0) return {{ focused: false, error: "COMPOSER_NOT_FOUND" }};
-            if (editors.length > 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS", count: editors.length }};
-            const editor = editors[0];
+            {DOM_QUALIFICATION_JS}
+            const targetRes = qualifyTargetSurface(targetUuid);
+            if (targetRes.error) {{
+                return {{ focused: false, error: targetRes.error }};
+            }}
+            const compRes = qualifyComposerSurface(targetRes.surface);
+            if (compRes.error) {{
+                return {{ focused: false, error: compRes.error }};
+            }}
+            const editor = compRes.editor;
             editor.focus();
             return {{ focused: (document.activeElement === editor) }};
         }})({json.dumps(val_uuid)})
@@ -589,7 +649,7 @@ class QualifiedAntigravityClient:
     async def dispatch_submission_input(self, target_uuid, expected_prompt_text):
         """
         Atomic renderer-side verification and send dispatch.
-        Verifies exact route, targetRoot, single composer, matching normalized prompt text,
+        Verifies exact route, targetSurface, single composer, matching normalized prompt text,
         and exactly ONE enabled send button inside renderer BEFORE clicking.
         Zero irreversible actions on mismatch.
         """
@@ -598,30 +658,29 @@ class QualifiedAntigravityClient:
 
         dispatch_res = await self.evaluate(f"""
         ((targetUuid, expectedNormText) => {{
-            const pathname = window.location.pathname.toLowerCase();
-            if (pathname !== '/c/' + targetUuid.toLowerCase()) {{
-                return {{ safe: false, error: "ROUTE_MUTATED_BEFORE_DISPATCH" }};
+            {DOM_QUALIFICATION_JS}
+            const targetRes = qualifyTargetSurface(targetUuid);
+            if (targetRes.error) {{
+                if (targetRes.error === 'WRONG_CONVERSATION_ACTIVE') {{
+                    return {{ safe: false, error: "ROUTE_MUTATED_BEFORE_DISPATCH" }};
+                }}
+                return {{ safe: false, error: targetRes.error }};
             }}
+            const targetSurface = targetRes.surface;
             
-            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
-            if (mains.length === 0) return {{ safe: false, error: "TARGET_ROOT_NOT_FOUND" }};
-            if (mains.length > 1) return {{ safe: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
-            const targetRoot = mains[0];
-            
-            const stopBtn = Array.from(targetRoot.querySelectorAll('button')).find(b => {{
-                if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
-                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                return label.includes('stop') && !!b.offsetParent;
-            }});
-            if (stopBtn) {{
+            const stopBtn = qualifyStopControl(targetSurface);
+            if (stopBtn.found) {{
                 return {{ safe: false, error: "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH" }};
             }}
 
-            const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-            if (editors.length === 0) return {{ safe: false, error: "COMPOSER_NOT_FOUND" }};
-            if (editors.length > 1) return {{ safe: false, error: "COMPOSER_AMBIGUOUS" }};
-            
-            const editor = editors[0];
+            const compRes = qualifyComposerSurface(targetSurface);
+            if (compRes.error) {{
+                return {{ safe: false, error: compRes.error }};
+            }}
+            const editor = compRes.editor;
+            const sendBtnState = compRes.sendButton;
+            const sendBtn = compRes.sendBtnElement;
+
             const rawText = (editor.innerText || editor.textContent || '').trim();
             const currentNorm = rawText.split(/\\s+/).filter(Boolean).join(' ');
 
@@ -629,12 +688,11 @@ class QualifiedAntigravityClient:
                 return {{ safe: false, error: "PROMPT_IDENTITY_MISMATCH", currentText: currentNorm }};
             }}
 
-            const sendBtns = Array.from(targetRoot.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send message"]')).filter(b => !!b.offsetParent);
-            if (sendBtns.length === 0) return {{ safe: false, error: "SEND_CONTROL_NOT_FOUND" }};
-            if (sendBtns.length > 1) return {{ safe: false, error: "SEND_CONTROL_AMBIGUOUS" }};
+            if (!sendBtnState || !sendBtnState.found || !sendBtn) {{
+                return {{ safe: false, error: sendBtnState.error || "SEND_CONTROL_NOT_FOUND" }};
+            }}
 
-            const sendBtn = sendBtns[0];
-            if (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {{
+            if (sendBtnState.disabled) {{
                 return {{ safe: false, error: "SEND_CONTROL_DISABLED" }};
             }}
 
