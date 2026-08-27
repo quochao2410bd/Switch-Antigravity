@@ -6,7 +6,8 @@ import json
 import os
 
 from supervisor import SupervisorConfig, SwitchSupervisor
-from production_adapters import ProductionAdapterConfig, ProductionAdapters
+from production_adapters import ProductionAdapterConfig
+from safe_production_adapters import SafeProductionAdapters
 
 DEFAULT_PROMPT = """Continue the current task from exactly where you stopped.
 First inspect the current repository state, git status, git diff, recent commits, terminal output and the existing conversation context.
@@ -30,7 +31,11 @@ def main() -> None:
     p.add_argument("--max-rotation-attempts", type=int, default=3)
     p.add_argument("--poll-interval-sec", type=float, default=2.0)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
-    p.add_argument("--execute-switch", action="store_true", help="Allow verified AGM credential-store switch. Desktop adoption gate still fails closed until a verifier is integrated.")
+    p.add_argument(
+        "--execute-switch",
+        action="store_true",
+        help="Allow verified AGM credential-store switch. Running Desktop identity is independently verified through language_server GetUserStatus before resume.",
+    )
     p.add_argument("--forever", action="store_true")
     args = p.parse_args()
 
@@ -47,7 +52,7 @@ def main() -> None:
         max_rotation_attempts=args.max_rotation_attempts,
         poll_interval_sec=args.poll_interval_sec,
     )
-    adapters = ProductionAdapters(ProductionAdapterConfig(
+    adapters = SafeProductionAdapters(ProductionAdapterConfig(
         log_path=args.log_path,
         conversation_uuid=args.conversation_uuid,
         expected_agm_sha256=args.expected_agm_sha256,
