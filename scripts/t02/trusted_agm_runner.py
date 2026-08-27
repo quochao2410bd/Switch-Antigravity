@@ -5,12 +5,13 @@ trusted_agm_runner.py
 Shared, security-hardened executor for all Antigravity Manager (AGM) CLI surfaces (Round 7 Architecture).
 
 Enforces strict PRE-EXECUTION binary verification:
-1. Resolves canonical executable path.
-2. Computes observed pre-execution SHA-256.
-3. Validates TrustedAgmIdentity configuration exists and has valid 64-hex format.
-4. Compares observed_sha == expected_sha BEFORE subprocess execution.
-5. If pre-execution validation fails: FAILS CLOSED with ZERO subprocess calls.
-6. If pre-execution passes: executes with bounded timeout and verifies post-execution TOCTOU hash.
+1. Validates TrustedAgmIdentity configuration exists and has valid 64-hex format.
+2. If canonical_executable_path is configured: uses that exact path directly (explicit policy precedence).
+3. If canonical_executable_path is empty/None: uses generic discovery fallback.
+4. Computes observed pre-execution SHA-256 of the exact resolved canonical file.
+5. Compares observed_sha == expected_sha BEFORE subprocess execution.
+6. If pre-execution validation fails: FAILS CLOSED with ZERO subprocess calls.
+7. If pre-execution passes: executes with bounded timeout and verifies post-execution TOCTOU hash.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ INSPECTED_AGM_SOURCE_REVISION = "1d3ce8497e36ffa60c3b4e369168315a7ae4d469"
 class RunnerErrorCode(str, Enum):
     NONE = "NONE"
     AGM_NOT_FOUND = "AGM_NOT_FOUND"
+    CANONICAL_PATH_NOT_FOUND = "CANONICAL_PATH_NOT_FOUND"
     BINARY_IDENTITY_UNCONFIGURED = "BINARY_IDENTITY_UNCONFIGURED"
     BINARY_IDENTITY_CONFIG_INVALID = "BINARY_IDENTITY_CONFIG_INVALID"
     BINARY_IDENTITY_MISMATCH = "BINARY_IDENTITY_MISMATCH"
@@ -117,28 +119,11 @@ def execute_trusted_agm(
     
     GUARANTEE: If trusted_identity is missing, malformed, or mismatches the observed binary,
     ZERO subprocess calls are made.
+
+    Explicit configured canonical_executable_path takes precedence over generic discovery.
     """
     start_t = time.time()
-    resolve_func = injected_resolver or find_canonical_agm_executable
     sha_func = injected_sha_computer or compute_file_sha256
-
-    agm_bin = resolve_func()
-    if not agm_bin:
-        end_t = time.time()
-        return TrustedExecutionResult(
-            success=False,
-            exit_code=1,
-            stdout="",
-            stderr="AGM binary not found on PATH or search locations",
-            error_code=RunnerErrorCode.AGM_NOT_FOUND,
-            canonical_executable_path="none",
-            observed_sha_pre="none",
-            observed_sha_post=None,
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
-            duration_sec=max(0.0, end_t - start_t),
-            command_executed=False
-        )
 
     # 1. Validate Trusted Identity Config is present
     if not trusted_identity or not trusted_identity.expected_binary_sha256 or not trusted_identity.expected_binary_sha256.strip():
@@ -149,7 +134,7 @@ def execute_trusted_agm(
             stdout="",
             stderr="BINARY_IDENTITY_UNCONFIGURED: Missing mandatory expected AGM binary SHA-256",
             error_code=RunnerErrorCode.BINARY_IDENTITY_UNCONFIGURED,
-            canonical_executable_path=agm_bin,
+            canonical_executable_path="none",
             observed_sha_pre="none",
             observed_sha_post=None,
             started_at_epoch=start_t,
@@ -165,9 +150,9 @@ def execute_trusted_agm(
             success=False,
             exit_code=1,
             stdout="",
-            stderr=f"BINARY_IDENTITY_CONFIG_INVALID: Expected SHA is not 64-hex string",
+            stderr="BINARY_IDENTITY_CONFIG_INVALID: Expected SHA is not 64-hex string",
             error_code=RunnerErrorCode.BINARY_IDENTITY_CONFIG_INVALID,
-            canonical_executable_path=agm_bin,
+            canonical_executable_path="none",
             observed_sha_pre="none",
             observed_sha_post=None,
             started_at_epoch=start_t,
@@ -176,24 +161,63 @@ def execute_trusted_agm(
             command_executed=False
         )
 
-    # 2. Compute Observed Pre-Execution SHA-256
-    sha_pre = sha_func(agm_bin)
-    if not sha_pre:
-        end_t = time.time()
-        return TrustedExecutionResult(
-            success=False,
-            exit_code=1,
-            stdout="",
-            stderr="Could not compute pre-execution SHA-256 of target binary",
-            error_code=RunnerErrorCode.BINARY_IDENTITY_UNVERIFIED,
-            canonical_executable_path=agm_bin,
-            observed_sha_pre="UNKNOWN_SHA256",
-            observed_sha_post=None,
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
-            duration_sec=max(0.0, end_t - start_t),
-            command_executed=False
-        )
+    # 2. Determine target binary: Explicit canonical path takes precedence over generic discovery
+    if trusted_identity.canonical_executable_path and trusted_identity.canonical_executable_path.strip():
+        agm_bin = os.path.abspath(trusted_identity.canonical_executable_path.strip())
+        sha_pre = sha_func(agm_bin)
+        if not sha_pre:
+            end_t = time.time()
+            return TrustedExecutionResult(
+                success=False,
+                exit_code=1,
+                stdout="",
+                stderr=f"CANONICAL_PATH_NOT_FOUND: Configured canonical AGM executable not found or unreadable: {agm_bin}",
+                error_code=RunnerErrorCode.CANONICAL_PATH_NOT_FOUND,
+                canonical_executable_path=agm_bin,
+                observed_sha_pre="none",
+                observed_sha_post=None,
+                started_at_epoch=start_t,
+                completed_at_epoch=end_t,
+                duration_sec=max(0.0, end_t - start_t),
+                command_executed=False
+            )
+    else:
+        # Fallback to generic discovery ONLY when no canonical path policy is configured
+        resolve_func = injected_resolver or find_canonical_agm_executable
+        agm_bin = resolve_func()
+        if not agm_bin:
+            end_t = time.time()
+            return TrustedExecutionResult(
+                success=False,
+                exit_code=1,
+                stdout="",
+                stderr="AGM binary not found on PATH or search locations",
+                error_code=RunnerErrorCode.AGM_NOT_FOUND,
+                canonical_executable_path="none",
+                observed_sha_pre="none",
+                observed_sha_post=None,
+                started_at_epoch=start_t,
+                completed_at_epoch=end_t,
+                duration_sec=max(0.0, end_t - start_t),
+                command_executed=False
+            )
+        sha_pre = sha_func(agm_bin)
+        if not sha_pre:
+            end_t = time.time()
+            return TrustedExecutionResult(
+                success=False,
+                exit_code=1,
+                stdout="",
+                stderr="Could not compute pre-execution SHA-256 of target binary",
+                error_code=RunnerErrorCode.BINARY_IDENTITY_UNVERIFIED,
+                canonical_executable_path=agm_bin,
+                observed_sha_pre="UNKNOWN_SHA256",
+                observed_sha_post=None,
+                started_at_epoch=start_t,
+                completed_at_epoch=end_t,
+                duration_sec=max(0.0, end_t - start_t),
+                command_executed=False
+            )
 
     # 3. Compare Observed Pre-Execution SHA against Expected SHA BEFORE Invoking Subprocess
     if sha_pre.lower() != expected_sha_clean:
@@ -202,7 +226,7 @@ def execute_trusted_agm(
             success=False,
             exit_code=1,
             stdout="",
-            stderr=f"BINARY_IDENTITY_MISMATCH: Observed binary SHA does not match expected identity",
+            stderr="BINARY_IDENTITY_MISMATCH: Observed binary SHA does not match expected identity",
             error_code=RunnerErrorCode.BINARY_IDENTITY_MISMATCH,
             canonical_executable_path=agm_bin,
             observed_sha_pre=sha_pre,
@@ -213,28 +237,7 @@ def execute_trusted_agm(
             command_executed=False  # Subprocess NEVER executed!
         )
 
-    # 4. Check Optional Canonical Path Policy Match
-    if trusted_identity.canonical_executable_path:
-        expected_path_norm = os.path.normcase(os.path.abspath(trusted_identity.canonical_executable_path))
-        observed_path_norm = os.path.normcase(os.path.abspath(agm_bin))
-        if expected_path_norm != observed_path_norm:
-            end_t = time.time()
-            return TrustedExecutionResult(
-                success=False,
-                exit_code=1,
-                stdout="",
-                stderr=f"CANONICAL_PATH_MISMATCH: Resolved path differs from configured policy",
-                error_code=RunnerErrorCode.CANONICAL_PATH_MISMATCH,
-                canonical_executable_path=agm_bin,
-                observed_sha_pre=sha_pre,
-                observed_sha_post=None,
-                started_at_epoch=start_t,
-                completed_at_epoch=end_t,
-                duration_sec=max(0.0, end_t - start_t),
-                command_executed=False
-            )
-
-    # 5. ALL PRE-EXECUTION CHECKS PASSED -> Invoke Command
+    # 4. ALL PRE-EXECUTION CHECKS PASSED -> Invoke Command
     argv = [agm_bin] + subcommand_args
     if injected_runner is not None:
         try:
@@ -296,7 +299,7 @@ def execute_trusted_agm(
                 command_executed=True
             )
 
-    # 6. Post-Execution TOCTOU Hash Verification
+    # 5. Post-Execution TOCTOU Hash Verification
     sha_post = sha_func(agm_bin)
     if not sha_post or sha_post.lower() != sha_pre.lower():
         return TrustedExecutionResult(
