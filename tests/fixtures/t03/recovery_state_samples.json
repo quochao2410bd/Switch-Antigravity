@@ -1,0 +1,54 @@
+{
+  "states": {
+    "NOT_SENT": {
+      "description": "Watchdog has not yet sent any resume command.",
+      "resend_allowed": true
+    },
+    "SUBMISSION_ATTEMPTED": {
+      "description": "Watchdog issued CDP send command or keystrokes, but has not yet confirmed DOM change.",
+      "resend_allowed": false,
+      "recovery_action": "POLL_CONVERSATION_MESSAGES_FOR_SIGNATURE"
+    },
+    "MESSAGE_OBSERVED": {
+      "description": "Resume message was confirmed present in conversation history, but assistant has not started.",
+      "resend_allowed": false,
+      "recovery_action": "WAIT_OR_CHECK_QUOTA"
+    },
+    "TURN_STARTED": {
+      "description": "Confirmed assistant turn start (Stop button active, assistant article generated).",
+      "resend_allowed": false,
+      "recovery_action": "TRANSITION_TO_RUNNING"
+    },
+    "TURN_ACTIVE": {
+      "description": "Conversation is currently executing a turn.",
+      "resend_allowed": false,
+      "recovery_action": "ABORT_DUPLICATE_SUBMISSION"
+    },
+    "FAILED": {
+      "description": "Submission failed with definitive unrecoverable error.",
+      "resend_allowed": false,
+      "recovery_action": "ESCALATE_TO_SUPERVISOR"
+    }
+  },
+  "crash_windows": {
+    "A_before_send": {
+      "window": "Crash occurred before send command was executed.",
+      "resend_allowed": true
+    },
+    "B_after_send_before_record": {
+      "window": "Crash occurred immediately after send command was executed before watchdog state was updated.",
+      "resend_allowed": false,
+      "recovery_strategy": "Check conversation history for matching resume signature before attempting resend."
+    },
+    "C_after_user_msg_appears": {
+      "window": "User message is visible in conversation DOM, assistant has not generated yet.",
+      "resend_allowed": false,
+      "recovery_strategy": "Wait for turn start; do not send duplicate prompt."
+    },
+    "D_after_assistant_generation_starts": {
+      "window": "Assistant generation is active (Stop button visible).",
+      "resend_allowed": false,
+      "recovery_strategy": "Mark TURN_ACTIVE / RUNNING; do not send duplicate prompt."
+    }
+  }
+}
