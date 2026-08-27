@@ -342,44 +342,74 @@ class TestT03Round8Final(unittest.TestCase):
         self.assertEqual(res["status"], "MESSAGE_CONTAINER_AMBIGUOUS")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-    # 8. Multiple target roots before clear aborts mutation
-    def test_08_multiple_target_roots_before_clear_aborts_mutation(self):
-        """>1 visible main roots before clear_composer prevents composer mutation."""
-        mock_client = MockAntigravityClient()
-        mock_client.composer_state["text"] = "DoNotTouchThisDraft"
+    # 8. Real QualifiedAntigravityClient.clear_composer() with DOM Ambiguity
+    def test_08_real_qualified_client_clear_composer_ambiguity(self):
+        """Call ACTUAL QualifiedAntigravityClient.clear_composer() with stubs.
+        TARGET_ROOT_AMBIGUOUS and COMPOSER_AMBIGUOUS raise RuntimeError and execute 0 Input.dispatchKeyEvent commands."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        dispatched_commands = []
+        async def stub_send_command(method, params=None):
+            dispatched_commands.append((method, params))
+            return {}
+        client.send_command = stub_send_command
 
-        async def failing_clear(uuid):
-            raise RuntimeError("Could not focus composer: TARGET_ROOT_AMBIGUOUS")
-        mock_client.clear_override = failing_clear
+        # Subcase A: TARGET_ROOT_AMBIGUOUS
+        async def stub_eval_target_ambiguous(expr):
+            return {"focused": False, "error": "TARGET_ROOT_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_eval_target_ambiguous
 
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "EXCEPTION")
-        self.assertEqual(mock_client.composer_state["text"], "DoNotTouchThisDraft")
-        self.assertEqual(mock_client.dispatch_count, 0)
+        with self.assertRaises(RuntimeError) as ctx_a:
+            asyncio.run(client.clear_composer(SYNTHETIC_UUID_1))
+        self.assertIn("TARGET_ROOT_AMBIGUOUS", str(ctx_a.exception))
+        self.assertEqual(len(dispatched_commands), 0)
 
-    # 9. Multiple target roots before insert aborts mutation
-    def test_09_multiple_target_roots_before_insert_aborts_mutation(self):
-        """>1 visible main roots before insert_prompt_text prevents text insertion."""
-        mock_client = MockAntigravityClient()
-        mock_client.composer_state["text"] = ""
+        # Subcase B: COMPOSER_AMBIGUOUS
+        async def stub_eval_composer_ambiguous(expr):
+            return {"focused": False, "error": "COMPOSER_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_eval_composer_ambiguous
 
-        async def failing_insert(uuid, text):
-            raise RuntimeError("Could not focus composer: TARGET_ROOT_AMBIGUOUS")
-        mock_client.insert_override = failing_insert
+        with self.assertRaises(RuntimeError) as ctx_b:
+            asyncio.run(client.clear_composer(SYNTHETIC_UUID_1))
+        self.assertIn("COMPOSER_AMBIGUOUS", str(ctx_b.exception))
+        self.assertEqual(len(dispatched_commands), 0)
 
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "EXCEPTION")
-        self.assertEqual(mock_client.dispatch_count, 0)
+    # 9. Real QualifiedAntigravityClient.insert_prompt_text() with DOM Ambiguity & Wrong Route
+    def test_09_real_qualified_client_insert_prompt_text_ambiguity(self):
+        """Call ACTUAL QualifiedAntigravityClient.insert_prompt_text() with stubs.
+        TARGET_ROOT_AMBIGUOUS, COMPOSER_AMBIGUOUS, and WRONG_CONVERSATION_ACTIVE raise RuntimeError and execute 0 Input.insertText commands."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        inserted_commands = []
+        async def stub_send_command(method, params=None):
+            inserted_commands.append((method, params))
+            return {}
+        client.send_command = stub_send_command
+
+        # Subcase A: TARGET_ROOT_AMBIGUOUS
+        async def stub_eval_target_ambiguous(expr):
+            return {"focused": False, "error": "TARGET_ROOT_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_eval_target_ambiguous
+        with self.assertRaises(RuntimeError) as ctx_a:
+            asyncio.run(client.insert_prompt_text(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertIn("TARGET_ROOT_AMBIGUOUS", str(ctx_a.exception))
+        self.assertEqual(len(inserted_commands), 0)
+
+        # Subcase B: COMPOSER_AMBIGUOUS
+        async def stub_eval_composer_ambiguous(expr):
+            return {"focused": False, "error": "COMPOSER_AMBIGUOUS", "count": 2}
+        client.evaluate = stub_eval_composer_ambiguous
+        with self.assertRaises(RuntimeError) as ctx_b:
+            asyncio.run(client.insert_prompt_text(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertIn("COMPOSER_AMBIGUOUS", str(ctx_b.exception))
+        self.assertEqual(len(inserted_commands), 0)
+
+        # Subcase C: WRONG_CONVERSATION_ACTIVE
+        async def stub_eval_wrong_route(expr):
+            return {"focused": False, "error": "WRONG_CONVERSATION_ACTIVE"}
+        client.evaluate = stub_eval_wrong_route
+        with self.assertRaises(RuntimeError) as ctx_c:
+            asyncio.run(client.insert_prompt_text(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertIn("WRONG_CONVERSATION_ACTIVE", str(ctx_c.exception))
+        self.assertEqual(len(inserted_commands), 0)
 
     # 10. Real send mode requires explicit UUID
     def test_10_real_send_requires_explicit_uuid(self):
@@ -414,11 +444,18 @@ class TestT03Round8Final(unittest.TestCase):
         )
         res3 = asyncio.run(execute_resume_pipeline(args_valid, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res3["status"], "TURN_STARTED")
-    # 11. Real dispatch exception recovery test across two invocations
+        self.assertEqual(mock_client.dispatch_count, 1)
+
+    # 11. Real dispatch exception recovery test across two invocations with attempt counter
     def test_11_dispatch_exception_recovery_two_invocations(self):
-        """Invocation 1 hits dispatch exception -> FAILED+POST_IRREVERSIBLE_UNKNOWN. Invocation 2 blocks resend."""
+        """Invocation 1 hits dispatch exception -> FAILED+POST_IRREVERSIBLE_UNKNOWN (dispatch_attempt_count=1).
+        Invocation 2 blocks resend -> MANUAL_RECONCILIATION_REQUIRED, dispatch_attempt_count STILL 1."""
         mock_client = MockAntigravityClient()
+        dispatch_attempt_count = 0
+
         def failing_dispatch(uuid, prompt):
+            nonlocal dispatch_attempt_count
+            dispatch_attempt_count += 1
             raise ConnectionResetError("CDP WebSocket disconnected during dispatch frame")
         mock_client.dispatch_override = failing_dispatch
 
@@ -428,24 +465,50 @@ class TestT03Round8Final(unittest.TestCase):
             journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
         )
 
+        # Invocation 1: Hits dispatch exception
         res1 = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res1["status"], "SEND_INPUT_DISPATCH_EXCEPTION")
+        self.assertEqual(dispatch_attempt_count, 1)
         latest1, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
         self.assertEqual(latest1["state"], STATE_FAILED)
         self.assertEqual(latest1["failure_stage"], "POST_IRREVERSIBLE_UNKNOWN")
 
-        # Second attempt against same journal state fails closed without dispatch
+        # Invocation 2: Second attempt against same journal state fails closed without calling dispatch
         res2 = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res2["status"], "MANUAL_RECONCILIATION_REQUIRED")
-        self.assertEqual(mock_client.dispatch_count, 0)
+        self.assertEqual(dispatch_attempt_count, 1, "Second invocation must NOT call dispatch_submission_input")
 
-    # 12. Post-dispatch concurrency race test between workers
+    # 12. Real Synchronized Post-Dispatch Concurrency Test
     def test_12_post_dispatch_concurrency_race(self):
-        """Worker A dispatches and completes post-turn transitions; concurrent Worker B cannot overwrite or double-dispatch."""
-        test_j = os.path.join(self.test_dir, "post_dispatch_race.json")
+        """Deterministic post-dispatch race:
+        1. Worker A obtains permission, dispatches exactly once, releases send lock, enters wait_for_user_and_assistant_turn.
+        2. Worker A is explicitly PAUSED before completing MESSAGE_OBSERVED/TURN_STARTED transition.
+        3. Worker B starts against SAME UUID, prompt, and journal while Worker A is paused.
+        4. Worker B inspects fresh journal state in SUBMISSION_ATTEMPTED and halts (0 dispatches, 0 new attempts).
+        5. Worker A resumes and completes post-turn transition to TURN_STARTED.
+        Asserts: TOTAL dispatch calls = 1, exactly ONE recovery attempt_id exists, Worker B does not create second attempt, final state belongs to A."""
+        test_j = os.path.join(self.test_dir, "post_dispatch_sync_race.json")
         journal_a = RecoveryJournal(test_j)
         journal_b = RecoveryJournal(test_j)
-        shared_client = MockAntigravityClient()
+
+        a_dispatched_event = asyncio.Event()
+        a_resume_event = asyncio.Event()
+        b_finished_event = asyncio.Event()
+
+        class SynchronizedMockClientA(MockAntigravityClient):
+            async def dispatch_submission_input(self, target_uuid, expected_prompt_text):
+                res = await super().dispatch_submission_input(target_uuid, expected_prompt_text)
+                return res
+
+            async def wait_for_user_and_assistant_turn(self, target_uuid, prompt_hash, baseline, timeout=12, external_error_hook=None):
+                # Lock is already released before entering wait_for_user_and_assistant_turn
+                a_dispatched_event.set()
+                # Pause Worker A until Worker B has completely evaluated journal state and finished
+                await a_resume_event.wait()
+                return await super().wait_for_user_and_assistant_turn(target_uuid, prompt_hash, baseline, timeout, external_error_hook)
+
+        client_a = SynchronizedMockClientA()
+        client_b = MockAntigravityClient()
 
         args = argparse.Namespace(
             conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
@@ -453,17 +516,39 @@ class TestT03Round8Final(unittest.TestCase):
             journal_path=test_j, timeout=5, json=False, verbose_private_data=False
         )
 
-        async def run_concurrent():
-            task_a = asyncio.create_task(execute_resume_pipeline(args, client_override=shared_client, journal_override=journal_a))
-            await asyncio.sleep(0.05)
-            task_b = asyncio.create_task(execute_resume_pipeline(args, client_override=shared_client, journal_override=journal_b))
-            res_a, res_b = await asyncio.gather(task_a, task_b)
+        async def run_synchronized_race():
+            # 1. Start Worker A
+            task_a = asyncio.create_task(execute_resume_pipeline(args, client_override=client_a, journal_override=journal_a))
+
+            # 2. Wait until Worker A dispatches and releases send lock
+            await a_dispatched_event.wait()
+
+            # 3. Start Worker B while Worker A is paused
+            task_b = asyncio.create_task(execute_resume_pipeline(args, client_override=client_b, journal_override=journal_b))
+            res_b = await task_b
+            b_finished_event.set()
+
+            # 4. Resume Worker A
+            a_resume_event.set()
+            res_a = await task_a
+
             return res_a, res_b
 
-        res_a, res_b = asyncio.run(run_concurrent())
-        self.assertEqual(shared_client.dispatch_count, 1)
-        latest, _ = journal_a.get_latest_record(SYNTHETIC_UUID_1)
-        self.assertEqual(latest["state"], STATE_TURN_STARTED)
+        res_a, res_b = asyncio.run(run_synchronized_race())
+
+        # Assertions
+        self.assertEqual(client_a.dispatch_count, 1, "Worker A must have dispatched exactly once")
+        self.assertEqual(client_b.dispatch_count, 0, "Worker B must NOT dispatch")
+        self.assertEqual(res_a["status"], "TURN_STARTED")
+        self.assertEqual(res_b["status"], "PREVIOUS_SUBMISSION_UNCONFIRMED")
+
+        # Check journal state & attempts
+        raw_data, _ = journal_a._read_raw()
+        records = raw_data.get("records", {}).get(SYNTHETIC_UUID_1, [])
+        self.assertEqual(len(records), 1, "Exactly ONE recovery attempt_id must exist in journal")
+        self.assertEqual(records[0]["attempt_id"], res_a["recovery_attempt_id"])
+        self.assertIsNone(res_b["recovery_attempt_id"], "Worker B must NOT create a new attempt_id")
+        self.assertEqual(records[0]["state"], STATE_TURN_STARTED, "Final state must progress forward to TURN_STARTED")
 
     # 13. Pre-click validation failure transitions to PRE_IRREVERSIBLE
     def test_13_pre_click_validation_failure_allows_pre_irreversible(self):
