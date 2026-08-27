@@ -134,6 +134,202 @@ class T02SupervisorContractTests(unittest.TestCase):
         self.assertEqual(result["status"], SwitchOutcome.WILDCARD_REJECTED.value)
         self.assertEqual(calls, [])
 
+    # =========================================================================
+    # Explicit Canonical Path Policy Precedence Tests (Items 4-10)
+    # =========================================================================
+
+    def test_explicit_canonical_path_wins_over_conflicting_temp_binary(self):
+        """Item 4: Configured canonical path is used even when generic discovery would return Temp binary."""
+        canonical_approved_path = os.path.abspath("C:/approved/.local/bin/agm.exe")
+        temp_unapproved_path = os.path.abspath("C:/Temp/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        def fake_sha_computer(path):
+            if os.path.abspath(path) == canonical_approved_path:
+                return VALID_SHA
+            if os.path.abspath(path) == temp_unapproved_path:
+                return OTHER_SHA
+            return None
+
+        # Generic resolver returns Temp binary with wrong SHA
+        def fake_resolver():
+            return temp_unapproved_path
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=canonical_approved_path,
+            ),
+            injected_runner=runner,
+            injected_resolver=fake_resolver,
+            injected_sha_computer=fake_sha_computer,
+        )
+        self.assertTrue(result.command_executed)
+        self.assertTrue(result.success)
+        self.assertEqual(result.canonical_executable_path, canonical_approved_path)
+        self.assertEqual(result.observed_sha_pre, VALID_SHA)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], canonical_approved_path)
+
+    def test_explicit_canonical_path_wins_over_conflicting_path_binary(self):
+        """Item 5: Explicit configured path wins over stale binary found on PATH."""
+        canonical_approved_path = os.path.abspath("C:/Users/user/.local/bin/agm.exe")
+        stale_path_binary = os.path.abspath("C:/stale/bin/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        def fake_sha_computer(path):
+            if os.path.abspath(path) == canonical_approved_path:
+                return VALID_SHA
+            return OTHER_SHA
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=canonical_approved_path,
+            ),
+            injected_runner=runner,
+            injected_resolver=lambda: stale_path_binary,
+            injected_sha_computer=fake_sha_computer,
+        )
+        self.assertTrue(result.command_executed)
+        self.assertEqual(result.canonical_executable_path, canonical_approved_path)
+        self.assertEqual(calls[0][0], canonical_approved_path)
+
+    def test_missing_configured_canonical_path_fails_closed_zero_subprocesses(self):
+        """Item 6: Missing configured path fails closed with zero subprocess calls and no fallback to generic resolver."""
+        missing_canonical_path = os.path.abspath("C:/approved/.local/bin/missing_agm.exe")
+        temp_binary_path = os.path.abspath("C:/Temp/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        def fake_sha_computer(path):
+            # Missing path returns None
+            if os.path.abspath(path) == missing_canonical_path:
+                return None
+            return VALID_SHA
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=missing_canonical_path,
+            ),
+            injected_runner=runner,
+            injected_resolver=lambda: temp_binary_path,  # Must NOT fall back to this!
+            injected_sha_computer=fake_sha_computer,
+        )
+        self.assertFalse(result.command_executed)
+        self.assertEqual(result.error_code, RunnerErrorCode.CANONICAL_PATH_NOT_FOUND)
+        self.assertEqual(calls, [])
+
+    def test_wrong_hash_at_configured_canonical_path_executes_zero_subprocesses(self):
+        """Item 7: Configured path exists but has wrong hash -> BINARY_IDENTITY_MISMATCH, zero subprocess calls."""
+        canonical_path = os.path.abspath("C:/approved/.local/bin/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=canonical_path,
+            ),
+            injected_runner=runner,
+            injected_sha_computer=lambda path: OTHER_SHA,
+        )
+        self.assertFalse(result.command_executed)
+        self.assertEqual(result.error_code, RunnerErrorCode.BINARY_IDENTITY_MISMATCH)
+        self.assertEqual(calls, [])
+
+    def test_correct_canonical_path_and_correct_hash_executes_successfully(self):
+        """Item 8: Configured path exists and SHA matches -> executes once with exact canonical path."""
+        canonical_path = os.path.abspath("C:/approved/.local/bin/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=canonical_path,
+            ),
+            injected_runner=runner,
+            injected_sha_computer=lambda path: VALID_SHA,
+        )
+        self.assertTrue(result.command_executed)
+        self.assertTrue(result.success)
+        self.assertEqual(result.observed_sha_pre, VALID_SHA)
+        self.assertEqual(result.observed_sha_post, VALID_SHA)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], canonical_path)
+
+    def test_no_canonical_path_policy_falls_back_to_generic_discovery(self):
+        """Item 9: When canonical_executable_path is None, generic discovery is used."""
+        discovered_path = os.path.abspath("C:/discovered/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=None,
+            ),
+            injected_runner=runner,
+            injected_resolver=lambda: discovered_path,
+            injected_sha_computer=lambda path: VALID_SHA,
+        )
+        self.assertTrue(result.command_executed)
+        self.assertEqual(result.canonical_executable_path, discovered_path)
+        self.assertEqual(calls[0][0], discovered_path)
+
+    def test_injected_generic_resolver_never_invoked_when_canonical_path_set(self):
+        """Item 10: Injected resolver raising AssertionError is never invoked when explicit path is set."""
+        canonical_path = os.path.abspath("C:/approved/.local/bin/agm.exe")
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return 0, "ok", ""
+
+        def explosive_resolver():
+            raise AssertionError("CRITICAL VIOLATION: Generic resolver must never be invoked when canonical path is configured!")
+
+        result = execute_trusted_agm(
+            ["list"],
+            trusted_identity=TrustedAgmIdentity(
+                expected_binary_sha256=VALID_SHA,
+                canonical_executable_path=canonical_path,
+            ),
+            injected_runner=runner,
+            injected_resolver=explosive_resolver,
+            injected_sha_computer=lambda path: VALID_SHA,
+        )
+        self.assertTrue(result.command_executed)
+        self.assertEqual(result.canonical_executable_path, canonical_path)
+
 
 if __name__ == "__main__":
     unittest.main()
