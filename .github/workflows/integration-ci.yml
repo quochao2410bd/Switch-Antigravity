@@ -49,4 +49,4 @@ jobs:
 
       - name: Supervisor integration tests
         working-directory: scripts/integration
-        run: python -m unittest -v test_supervisor.py test_desktop_identity.py test_safe_production_adapters.py
+        run: python -m unittest -v test_supervisor.py test_hardened_supervisor.py test_desktop_identity.py test_safe_production_adapters.py
