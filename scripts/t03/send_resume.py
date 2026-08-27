@@ -148,49 +148,105 @@ function qualifyTargetSurface(targetUuid) {
         }
     }
 
+    const candidateElements = new Set();
+    const candidateVariants = new Map();
+
     const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent && !m.closest('[data-testid="conversation-list-sidebar"]'));
-    if (mains.length === 1) {
-        return { surface: mains[0], variant: 'LEGACY_MAIN', error: null };
-    } else if (mains.length > 1) {
-        return { surface: null, error: 'TARGET_SURFACE_AMBIGUOUS', count: mains.length };
+    for (const m of mains) {
+        candidateElements.add(m);
+        candidateVariants.set(m, 'LEGACY_MAIN');
     }
 
     const convViews = Array.from(document.querySelectorAll('[data-testid="conversation-view"]')).filter(c => !!c.offsetParent && !c.closest('[data-testid="conversation-list-sidebar"]'));
-    if (convViews.length === 1) {
-        return { surface: convViews[0], variant: 'CONVERSATION_VIEW', error: null };
-    } else if (convViews.length > 1) {
-        return { surface: null, error: 'TARGET_SURFACE_AMBIGUOUS', count: convViews.length };
+    for (const cv of convViews) {
+        candidateElements.add(cv);
+        if (!candidateVariants.has(cv)) {
+            candidateVariants.set(cv, 'CONVERSATION_VIEW');
+        }
     }
 
-    return { surface: null, error: 'TARGET_SURFACE_NOT_FOUND' };
+    if (candidateElements.size === 0) {
+        return { surface: null, error: 'TARGET_SURFACE_NOT_FOUND' };
+    }
+    if (candidateElements.size > 1) {
+        return { surface: null, error: 'TARGET_SURFACE_AMBIGUOUS', count: candidateElements.size };
+    }
+
+    const targetSurface = Array.from(candidateElements)[0];
+    return { surface: targetSurface, variant: candidateVariants.get(targetSurface), error: null };
 }
 
 function qualifyComposerSurface(targetSurface) {
     if (!targetSurface) return { editor: null, inputBox: null, sendButton: { found: false }, sendBtnElement: null, error: 'TARGET_SURFACE_NOT_FOUND' };
 
-    const editors = Array.from(targetSurface.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-    if (editors.length === 0) return { editor: null, error: 'COMPOSER_NOT_FOUND' };
-    if (editors.length > 1) return { editor: null, error: 'COMPOSER_AMBIGUOUS', count: editors.length };
-    const editor = editors[0];
+    const rawInputBoxes = new Set();
+    const explicitTestIdBoxes = Array.from(targetSurface.querySelectorAll('[data-testid="agent-input-box"]')).filter(b => !!b.offsetParent);
+    for (const b of explicitTestIdBoxes) rawInputBoxes.add(b);
 
-    const inputBox = editor.closest('[data-testid="agent-input-box"], #antigravity\\.agentSidePanelInputBox') || editor.parentElement;
+    const explicitIdBoxes = Array.from(targetSurface.querySelectorAll('#antigravity\\.agentSidePanelInputBox')).filter(b => !!b.offsetParent);
+    for (const b of explicitIdBoxes) rawInputBoxes.add(b);
 
-    const sendBtns = Array.from(inputBox.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send message"], button[aria-label*="Send" i]')).filter(b => !!b.offsetParent);
+    if (rawInputBoxes.size === 0) {
+        return { editor: null, inputBox: null, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_SURFACE_NOT_FOUND' };
+    }
+
+    // Filter out ancestor containers if an inner candidate container is nested inside it
+    const allBoxArray = Array.from(rawInputBoxes);
+    const leafInputBoxes = allBoxArray.filter(box => {
+        return !allBoxArray.some(other => other !== box && box.contains(other));
+    });
+
+    if (leafInputBoxes.length === 0) {
+        return { editor: null, inputBox: null, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_SURFACE_NOT_FOUND' };
+    }
+    if (leafInputBoxes.length > 1) {
+        return { editor: null, inputBox: null, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_SURFACE_AMBIGUOUS', count: leafInputBoxes.length };
+    }
+
+    const inputBox = leafInputBoxes[0];
+
+    const targetEditors = Array.from(targetSurface.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
+    if (targetEditors.length === 0) return { editor: null, inputBox: inputBox, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_NOT_FOUND' };
+    if (targetEditors.length > 1) return { editor: null, inputBox: inputBox, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_AMBIGUOUS', count: targetEditors.length };
+    const targetEditor = targetEditors[0];
+
+    const boxEditors = Array.from(inputBox.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
+    if (boxEditors.length === 0) {
+        return { editor: null, inputBox: inputBox, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_NOT_FOUND' };
+    }
+    if (boxEditors.length > 1) {
+        return { editor: null, inputBox: inputBox, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_AMBIGUOUS', count: boxEditors.length };
+    }
+    const boxEditor = boxEditors[0];
+
+    if (targetEditor !== boxEditor) {
+        return { editor: null, inputBox: inputBox, sendButton: { found: false }, sendBtnElement: null, error: 'COMPOSER_AMBIGUOUS' };
+    }
+
+    const sendBtnCandidates = new Set();
+    const testIdSendBtns = Array.from(inputBox.querySelectorAll('button[data-testid="send-button"]')).filter(b => !!b.offsetParent);
+    for (const b of testIdSendBtns) sendBtnCandidates.add(b);
+
+    const ariaSendBtns = Array.from(inputBox.querySelectorAll('button[aria-label="Send message"]')).filter(b => !!b.offsetParent);
+    for (const b of ariaSendBtns) sendBtnCandidates.add(b);
+
     let sendBtnState = { found: false };
     let sendBtnElement = null;
-    if (sendBtns.length === 1) {
-        const b = sendBtns[0];
+    if (sendBtnCandidates.size === 0) {
+        sendBtnState = { found: false, error: 'SEND_CONTROL_NOT_FOUND' };
+    } else if (sendBtnCandidates.size > 1) {
+        sendBtnState = { found: false, error: 'SEND_CONTROL_AMBIGUOUS', count: sendBtnCandidates.size };
+    } else {
+        const b = Array.from(sendBtnCandidates)[0];
         sendBtnElement = b;
         sendBtnState = {
             found: true,
             disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
-            label: b.getAttribute('aria-label')
+            label: b.getAttribute('aria-label') || 'Send'
         };
-    } else if (sendBtns.length > 1) {
-        sendBtnState = { found: false, error: 'SEND_CONTROL_AMBIGUOUS', count: sendBtns.length };
     }
 
-    return { editor: editor, inputBox: inputBox, sendButton: sendBtnState, sendBtnElement: sendBtnElement, error: null };
+    return { editor: boxEditor, inputBox: inputBox, sendButton: sendBtnState, sendBtnElement: sendBtnElement, error: null };
 }
 
 function qualifyMessageSurface(targetSurface) {
@@ -198,22 +254,23 @@ function qualifyMessageSurface(targetSurface) {
 
     const explicitContainers = Array.from(targetSurface.querySelectorAll('[data-testid="conversation-messages"]')).filter(c => !!c.offsetParent);
     if (explicitContainers.length === 1) {
-        return { container: explicitContainers[0], error: null };
+        return { container: explicitContainers[0], variant: 'EXPLICIT_DATA_TESTID', error: null };
     } else if (explicitContainers.length > 1) {
         return { container: null, error: 'MESSAGE_CONTAINER_AMBIGUOUS', count: explicitContainers.length };
     }
 
-    const candidateContainers = Array.from(targetSurface.children).filter(c => {
-        if (c.matches('[data-testid="agent-input-box"], #antigravity\\.agentSidePanelInputBox') || c.querySelector('[data-lexical-editor="true"]')) {
-            return false;
-        }
-        return !!c.offsetParent;
+    const structuralCandidates = Array.from(targetSurface.children).filter(c => {
+        if (!c.offsetParent) return false;
+        if (c.matches('[data-testid="agent-input-box"], #antigravity\\.agentSidePanelInputBox')) return false;
+        if (c.querySelector('[data-lexical-editor="true"]')) return false;
+        const articleCount = c.querySelectorAll('article, [role="article"]').length;
+        return articleCount >= 1;
     });
 
-    if (candidateContainers.length === 1) {
-        return { container: candidateContainers[0], error: null };
-    } else if (candidateContainers.length > 1) {
-        return { container: null, error: 'MESSAGE_CONTAINER_AMBIGUOUS', count: candidateContainers.length };
+    if (structuralCandidates.length === 1) {
+        return { container: structuralCandidates[0], variant: 'LIVE_STRUCTURAL_DIRECT_CHILD', error: null };
+    } else if (structuralCandidates.length > 1) {
+        return { container: null, error: 'MESSAGE_CONTAINER_AMBIGUOUS', count: structuralCandidates.length };
     }
 
     return { container: null, error: 'MESSAGE_CONTAINER_NOT_FOUND' };
