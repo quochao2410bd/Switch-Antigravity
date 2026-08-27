@@ -16,6 +16,7 @@ STATE_SCHEMA_VERSION = 1
 class EventStage(str, Enum):
     DETECTED = "DETECTED"
     DISCOVERING = "DISCOVERING"
+    CHECKPOINTING = "CHECKPOINTING"
     SWITCHING = "SWITCHING"
     VERIFYING_DESKTOP = "VERIFYING_DESKTOP"
     REBASELINING = "REBASELINING"
@@ -71,6 +72,7 @@ class AdapterContract(Protocol):
     def current_ls_pid(self) -> int: ...
     def get_current_account(self) -> Dict[str, Any]: ...
     def discover_candidates(self, session_id: str, current_account: str) -> List[Dict[str, Any]]: ...
+    def prepare_account_transition(self) -> Dict[str, Any]: ...
     def switch_account(self, account: str) -> Dict[str, Any]: ...
     def desktop_adoption_verifier_available(self) -> bool: ...
     def verify_desktop_adoption(self, expected_account_ref: str) -> Dict[str, Any]: ...
@@ -252,8 +254,20 @@ class SwitchSupervisor:
                     self.store.save(state)
                     return {"status": event["last_status"], "event": self._sanitized_event_summary(event)}
                 event["candidate_account_ref"] = selected["account_ref"]
-                event["stage"] = EventStage.SWITCHING.value
+                event["stage"] = EventStage.CHECKPOINTING.value
                 event["last_status"] = "CANDIDATE_SELECTED"
+                self.store.save(state)
+                continue
+
+            if stage == EventStage.CHECKPOINTING:
+                prep = self.adapters.prepare_account_transition()
+                if not prep.get("ready"):
+                    event["last_status"] = prep.get("status") or "BLOCKED_TRANSITION_PREFLIGHT_FAILED"
+                    event["stage"] = EventStage.FAILED_SAFE.value
+                    self.store.save(state)
+                    return {"status": event["last_status"], "event": self._sanitized_event_summary(event)}
+                event["stage"] = EventStage.SWITCHING.value
+                event["last_status"] = "TRANSITION_PREFLIGHT_VERIFIED"
                 self.store.save(state)
                 continue
 
@@ -293,6 +307,8 @@ class SwitchSupervisor:
                 adoption = self.adapters.verify_desktop_adoption(event["candidate_account_ref"])
                 if not adoption.get("verified"):
                     event["last_status"] = adoption.get("status") or "BLOCKED_DESKTOP_ADOPTION_UNVERIFIED"
+                    if adoption.get("terminal"):
+                        event["stage"] = EventStage.FAILED_SAFE.value
                     self.store.save(state)
                     return {"status": event["last_status"], "event": self._sanitized_event_summary(event)}
                 event["stage"] = EventStage.REBASELINING.value
