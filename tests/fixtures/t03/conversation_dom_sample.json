@@ -1,0 +1,19 @@
+{
+  "target_uuid": "00000000-0000-4000-8000-000000000001",
+  "pathname": "/c/00000000-0000-4000-8000-000000000001",
+  "articles": [
+    {
+      "author": "user",
+      "text": "Initial task request",
+      "hash": "c807b5e0a6d2c418659178bb04b3cf61cf94e9f3b5ad829ad20a0684a86cecf3"
+    },
+    {
+      "author": "assistant",
+      "text": "Task progress report and execution steps",
+      "hash": "b2f6dc4b5f9a6566b6cb6f7b159fef15bbcf5940026a79811562d9fb488f72c0"
+    }
+  ],
+  "isMainTurnActive": false,
+  "mainStopButtonCount": 0,
+  "sidebarExecutingConversationsCount": 0
+}

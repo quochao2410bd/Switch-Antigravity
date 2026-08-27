@@ -1,0 +1,52 @@
+name: Integration CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - integration/supervisor-v1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependency
+        run: python -m pip install --disable-pip-version-check websockets
+
+      - name: Compile all Python
+        run: python -m compileall -q scripts
+
+      - name: T01 Windows integration contract tests
+        if: runner.os == 'Windows'
+        working-directory: scripts/integration
+        run: python -m unittest -v test_quota_adapter.py
+
+      - name: T02 supervisor trust contract tests
+        working-directory: scripts/integration
+        run: python -m unittest -v test_t02_contract.py
+
+      - name: T03 recovery journal and resume tests
+        run: python scripts/t03/test_suite.py
+
+      - name: Supervisor integration tests
+        working-directory: scripts/integration
+        run: python -m unittest -v test_supervisor.py test_hardened_supervisor.py test_desktop_identity.py test_safe_production_adapters.py

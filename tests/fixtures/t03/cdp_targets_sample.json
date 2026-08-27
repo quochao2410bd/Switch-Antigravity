@@ -1,0 +1,11 @@
+[
+  {
+    "description": "",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:58859/devtools/page/00000000000000000000000000000001",
+    "id": "00000000000000000000000000000001",
+    "title": "Synthetic Conversation A",
+    "type": "page",
+    "url": "https://127.0.0.1:58861/c/00000000-0000-4000-8000-000000000001",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:58859/devtools/page/00000000000000000000000000000001"
+  }
+]
