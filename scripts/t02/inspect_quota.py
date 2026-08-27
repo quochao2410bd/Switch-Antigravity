@@ -2,21 +2,22 @@
 """
 inspect_quota.py
 
-Safe read-only parser and normalizer for AGM quota output (Round 4 Architecture).
+Safe read-only parser and normalizer for AGM quota output (Round 6 Architecture).
 
-Core Trust Principles:
-1. Deserialized JSON Cannot Choose Its Own Trust Class (Critical Item 1):
-   - All deserialized dicts/JSON start strictly as UNTRUSTED_DESERIALIZED.
-   - Only valid HMAC-SHA256 verification elevates to SIGNED_DESERIALIZED.
-2. Production Supervisor API Has No Test-Weakening Flags (Item 12):
-   - validate_refresh_evidence_supervisor strictly requires LIVE_REFRESH_EXECUTION and PROCESS_LOCAL/SIGNED_DESERIALIZED.
-3. Exact Argv Equality (Item 3):
-   - Validates [canonical_executable_path, "refresh", canonical_account] element-by-element. No suffix matching.
-4. Binary Identity Binding (Item 4):
-   - Checks binary_sha256 and source_revision_inspected.
-5. Strict Table Schema Enforcement (Item 6):
-   - List mode: EMAIL, STATUS, GEM-PRO, GEM-FLASH, CLAUDE in exact order.
-   - Info mode: PROVIDER, MODEL, SCORE, RESET in exact order.
+Key Architectural Trust Improvements:
+1. Mandatory Independent Expected Binary SHA-256 (Critical Item 1 & 2):
+   - Supervisor validation strictly REQUIRES a valid 64-hex expected_binary_sha256.
+   - Missing hash -> BINARY_IDENTITY_UNCONFIGURED -> STALE_CACHED.
+   - Malformed hash -> BINARY_IDENTITY_CONFIG_INVALID -> STALE_CACHED.
+   - Mismatched hash -> BINARY_IDENTITY_MISMATCH -> STALE_CACHED.
+2. Complete Parser Path Threading with TrustedAgmIdentity (Critical Item 2):
+   - parse_agm_list() and parse_agm_info() accept TrustedAgmIdentity.
+   - If trusted identity is missing or unconfigured, evidence fails closed and account is NOT eligible.
+3. Separation of Internal Canonical Email and Safe Public Reference (Item 7 & 11):
+   - AccountQuotaSummary contains canonical_account (internal) and account_ref (pseudonymous).
+   - SanitizedAccountQuotaDTO exposes ONLY account_ref in default logs/DTOs.
+4. Process-Local TCB Model (Item 3 & 4):
+   - Supervisor process is the trusted TCB; attestation protects against accidental module misuse.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from refresh_quota_safe import (
     RefreshResult,
     TransportTrustClass,
     is_canonical_email,
+    pseudonymize_account,
     verify_evidence_signature,
     verify_live_execution_attestation,
 )
@@ -59,6 +61,14 @@ class FormatSupportState(str, Enum):
 
 
 @dataclass
+class TrustedAgmIdentity:
+    """Trusted administrative identity configuration for AGM executable (Item 2)."""
+    expected_binary_sha256: str
+    canonical_executable_path: Optional[str] = None
+    inspected_source_revision: str = INSPECTED_AGM_SOURCE_REVISION
+
+
+@dataclass
 class ModelQuotaDetail:
     model_name: str
     provider: str
@@ -68,8 +78,30 @@ class ModelQuotaDetail:
 
 
 @dataclass
+class SanitizedAccountQuotaDTO:
+    """Safe supervisor DTO exposing ONLY pseudonymous account_ref (Item 7 & 11)."""
+    account_ref: str
+    status_tags: List[str]
+    is_active_cli: bool
+    is_active_ide: bool
+    is_token_expired: bool
+    gemini_pro_pct: Optional[int]
+    gemini_flash_pct: Optional[int]
+    claude_pct: Optional[int]
+    parsed_at_epoch: float
+    refresh_confirmed_at_epoch: Optional[float]
+    quota_reset_time: Optional[str]
+    freshness_state: str
+    format_support: str
+    source: str
+    parse_warnings: List[str]
+    eligible: bool
+
+
+@dataclass
 class AccountQuotaSummary:
-    safe_account_ref: str
+    canonical_account: str
+    account_ref: str
     status_tags: List[str]
     is_active_cli: bool
     is_active_ide: bool
@@ -86,6 +118,27 @@ class AccountQuotaSummary:
     source: str
     parse_warnings: List[str]
     eligible: bool
+
+    def to_sanitized_dto(self) -> SanitizedAccountQuotaDTO:
+        """Converts to safe supervisor DTO containing zero raw emails."""
+        return SanitizedAccountQuotaDTO(
+            account_ref=self.account_ref,
+            status_tags=self.status_tags,
+            is_active_cli=self.is_active_cli,
+            is_active_ide=self.is_active_ide,
+            is_token_expired=self.is_token_expired,
+            gemini_pro_pct=self.gemini_pro_pct,
+            gemini_flash_pct=self.gemini_flash_pct,
+            claude_pct=self.claude_pct,
+            parsed_at_epoch=self.parsed_at_epoch,
+            refresh_confirmed_at_epoch=self.refresh_confirmed_at_epoch,
+            quota_reset_time=self.quota_reset_time,
+            freshness_state=self.freshness_state.value,
+            format_support=self.format_support.value,
+            source=self.source,
+            parse_warnings=self.parse_warnings,
+            eligible=self.eligible
+        )
 
 
 def parse_percentage_field(val: str) -> Optional[int]:
@@ -112,9 +165,7 @@ def deserialize_evidence_payload(
 ) -> Tuple[Optional[RefreshEvidence], List[str]]:
     """
     Safely deserializes a JSON/dict payload.
-    CRITICAL SECURITY INVARIANT:
     All deserialized payloads are initialized as UNTRUSTED_DESERIALIZED regardless of fields.
-    Only successful HMAC verification elevates transport_trust to SIGNED_DESERIALIZED.
     """
     warnings: List[str] = []
     try:
@@ -136,6 +187,7 @@ def deserialize_evidence_payload(
             supervisor_session_id=payload.get("supervisor_session_id", ""),
             source_origin=orig_enum,
             transport_trust=TransportTrustClass.UNTRUSTED_DESERIALIZED,  # Forced untrusted!
+            attestation=None,
             hmac_signature=payload.get("hmac_signature"),
             error_summary=payload.get("error_summary")
         )
@@ -189,7 +241,7 @@ def _validate_refresh_evidence_internal(
     elif evidence.source_origin == EvidenceSourceOrigin.DRY_RUN:
         return FreshnessState.STALE_CACHED, None, ["Dry-run evidence cannot establish freshness"]
     elif evidence.source_origin == EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION:
-        # Sealed Process-Local Attestation Verification (Item 3 & 4)
+        # Process-Local Attestation Verification (TCB misuse guard)
         if evidence.transport_trust == TransportTrustClass.PROCESS_LOCAL:
             if not verify_live_execution_attestation(evidence.attestation, canonical_account, evidence.binary_sha256):
                 return FreshnessState.STALE_CACHED, None, [
@@ -218,7 +270,17 @@ def _validate_refresh_evidence_internal(
             f"Exact argv mismatch (expected {expected_argv}, got {evidence.argv})"
         ]
 
-    # 5. Binary Identity & Independent Expected Hash Verification (Critical Item 1 & 2)
+    # 5. Mandatory Independent Expected Binary Identity Binding (Critical Item 1 & 2)
+    if not expected_binary_sha256 or not expected_binary_sha256.strip():
+        return FreshnessState.STALE_CACHED, None, [
+            "BINARY_IDENTITY_UNCONFIGURED: Missing mandatory expected AGM binary SHA-256 configuration; failing closed"
+        ]
+    expected_sha_clean = expected_binary_sha256.strip()
+    if not re.match(r"^[0-9a-fA-F]{64}$", expected_sha_clean):
+        return FreshnessState.STALE_CACHED, None, [
+            f"BINARY_IDENTITY_CONFIG_INVALID: Expected AGM binary SHA-256 '{expected_binary_sha256}' is not a valid 64-hex string"
+        ]
+
     if not evidence.canonical_executable_path or evidence.canonical_executable_path == "none":
         return FreshnessState.STALE_CACHED, None, ["Refresh evidence lacks valid canonical executable path"]
     if not evidence.binary_sha256 or evidence.binary_sha256 == "UNKNOWN_SHA256":
@@ -227,11 +289,10 @@ def _validate_refresh_evidence_internal(
         return FreshnessState.STALE_CACHED, None, [
             f"AGM source revision mismatch (expected '{INSPECTED_AGM_SOURCE_REVISION}', got '{evidence.source_revision_inspected}')"
         ]
-    if expected_binary_sha256 is not None:
-        if evidence.binary_sha256.lower() != expected_binary_sha256.lower():
-            return FreshnessState.STALE_CACHED, None, [
-                f"BINARY_IDENTITY_MISMATCH: Observed binary SHA-256 '{evidence.binary_sha256}' does not match expected '{expected_binary_sha256}'"
-            ]
+    if evidence.binary_sha256.lower() != expected_sha_clean.lower():
+        return FreshnessState.STALE_CACHED, None, [
+            f"BINARY_IDENTITY_MISMATCH: Observed binary SHA-256 '{evidence.binary_sha256}' does not match expected '{expected_sha_clean}'"
+        ]
 
     # 6. Mandatory Session ID Check
     if not expected_session_id or not expected_session_id.strip():
@@ -289,7 +350,7 @@ def validate_refresh_evidence_supervisor(
 ) -> Tuple[FreshnessState, Optional[float], List[str]]:
     """
     Production supervisor validation entry point.
-    NO TEST-WEAKENING FLAGS EXPOSED (Item 12).
+    Requires mandatory expected_binary_sha256. NO TEST-WEAKENING FLAGS EXPOSED.
     """
     return _validate_refresh_evidence_internal(
         evidence=evidence,
@@ -335,16 +396,19 @@ def parse_agm_list(
     max_freshness_age_sec: float = 300.0,
     source_label: str = "AGM_CLI_LIST",
     supervisor_session_id: Optional[str] = None,
+    trusted_identity: Optional[TrustedAgmIdentity] = None,
+    expected_binary_sha256: Optional[str] = None,
     session_secret: Optional[str] = None,
     lenient_parser: bool = False,
     now_epoch: Optional[float] = None,
     _test_mode_allow_synthetic: bool = False
 ) -> List[AccountQuotaSummary]:
     """
-    Parses `agm list` output with strict table header validation.
+    Parses `agm list` output with strict table header validation and trusted binary identity binding.
     """
     now = now_epoch if now_epoch is not None else time.time()
     ev_map = refresh_evidence_map or {}
+    expected_sha = (trusted_identity.expected_binary_sha256 if trusted_identity else expected_binary_sha256)
 
     lines = text.strip().splitlines()
     if not lines or any("No accounts yet" in line for line in lines):
@@ -371,7 +435,8 @@ def parse_agm_list(
     if (not header_found or format_state == FormatSupportState.FORMAT_UNSUPPORTED) and not lenient_parser:
         return [
             AccountQuotaSummary(
-                safe_account_ref="UNKNOWN_UNSUPPORTED_SCHEMA",
+                canonical_account="unknown@unsupported.schema",
+                account_ref="acc_unsupported_schema",
                 status_tags=[],
                 is_active_cli=False,
                 is_active_ide=False,
@@ -434,7 +499,6 @@ def parse_agm_list(
         if cl_part and cl_part != "-" and cl_val is None:
             warnings.append(f"Malformed CLAUDE quota string: '{cl_part}'")
 
-        # Validate Refresh Evidence
         if raw_unvalidated_timestamps and email_part in raw_unvalidated_timestamps:
             warnings.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
             freshness = FreshnessState.STALE_CACHED
@@ -445,8 +509,9 @@ def parse_agm_list(
                 ev_map[email_part],
                 canonical_account=email_part,
                 now_epoch=now,
-                max_freshness_age_sec=max_freshness_age_sec,
                 expected_session_id=supervisor_session_id or "",
+                expected_binary_sha256=expected_sha,
+                max_freshness_age_sec=max_freshness_age_sec,
                 session_secret=session_secret
             )
             warnings.extend(ev_warn)
@@ -469,7 +534,8 @@ def parse_agm_list(
         )
 
         results.append(AccountQuotaSummary(
-            safe_account_ref=email_part,
+            canonical_account=email_part,
+            account_ref=pseudonymize_account(email_part),
             status_tags=tags,
             is_active_cli="cli" in tags,
             is_active_ide="ide" in tags,
@@ -498,15 +564,18 @@ def parse_agm_info(
     max_freshness_age_sec: float = 300.0,
     source_label: str = "AGM_CLI_INFO",
     supervisor_session_id: Optional[str] = None,
+    trusted_identity: Optional[TrustedAgmIdentity] = None,
+    expected_binary_sha256: Optional[str] = None,
     session_secret: Optional[str] = None,
     now_epoch: Optional[float] = None,
     _test_mode_allow_synthetic: bool = False
 ) -> Optional[AccountQuotaSummary]:
     """
     Parses `agm info <email>` output with STRICT table header verification (Item 6).
-    Enforces exact column order: PROVIDER, MODEL, SCORE, RESET.
+    Enforces exact column order: PROVIDER, MODEL, SCORE, RESET and trusted binary binding.
     """
     now = now_epoch if now_epoch is not None else time.time()
+    expected_sha = (trusted_identity.expected_binary_sha256 if trusted_identity else expected_binary_sha256)
     lines = text.strip().splitlines()
     if not lines:
         return None
@@ -529,7 +598,6 @@ def parse_agm_info(
         elif "No quota data" in line_clean:
             warnings.append("No quota data recorded in store")
         elif "PROVIDER" in line:
-            # Strict column header check (Item 6)
             tokens = line_clean.split()
             if tokens == ["PROVIDER", "MODEL", "SCORE", "RESET"]:
                 header_found = True
@@ -569,7 +637,6 @@ def parse_agm_info(
     if not header_found:
         warnings.append("AGM info output missing or deviated from expected table header schema; fail closed")
 
-    # Validate provenance
     if raw_unvalidated_timestamp is not None:
         warnings.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
         freshness = FreshnessState.STALE_CACHED
@@ -580,8 +647,9 @@ def parse_agm_info(
             refresh_evidence,
             canonical_account=email,
             now_epoch=now,
-            max_freshness_age_sec=max_freshness_age_sec,
             expected_session_id=supervisor_session_id or "",
+            expected_binary_sha256=expected_sha,
+            max_freshness_age_sec=max_freshness_age_sec,
             session_secret=session_secret
         )
         warnings.extend(ev_warn)
@@ -611,7 +679,8 @@ def parse_agm_info(
     )
 
     return AccountQuotaSummary(
-        safe_account_ref=email,
+        canonical_account=email,
+        account_ref=pseudonymize_account(email),
         status_tags=["token-exp"] if is_expired else [],
         is_active_cli=False,
         is_active_ide=False,
@@ -636,7 +705,9 @@ def main():
     parser.add_argument("--file", "-f", help="Read raw AGM output from file")
     parser.add_argument("--mode", "-m", choices=["list", "info", "auto"], default="auto", help="Parsing mode")
     parser.add_argument("--session-id", help="Mandatory supervisor session ID for production validation")
+    parser.add_argument("--expected-binary-sha256", help="Mandatory expected binary SHA-256 for strict binding")
     parser.add_argument("--provenance-json", help="Optional JSON dict of RefreshEvidence mapping email -> record")
+    parser.add_argument("--private-diagnostic-mode", action="store_true", help="Expose raw emails in diagnostic output")
     parser.add_argument("--research-lenient-parser", action="store_true", help="Enable research fallback tokenization")
     args = parser.parse_args()
 
@@ -676,18 +747,26 @@ def main():
             content,
             refresh_evidence=first_ev,
             supervisor_session_id=args.session_id,
+            expected_binary_sha256=args.expected_binary_sha256,
             session_secret=session_secret
         )
-        data = asdict(res) if res else None
+        if res:
+            data = asdict(res) if args.private_diagnostic_mode else asdict(res.to_sanitized_dto())
+        else:
+            data = None
     else:
         res_list = parse_agm_list(
             content,
             refresh_evidence_map=ev_map,
             supervisor_session_id=args.session_id,
+            expected_binary_sha256=args.expected_binary_sha256,
             session_secret=session_secret,
             lenient_parser=args.research_lenient_parser
         )
-        data = [asdict(r) for r in res_list]
+        if args.private_diagnostic_mode:
+            data = [asdict(r) for r in res_list]
+        else:
+            data = [asdict(r.to_sanitized_dto()) for r in res_list]
 
     print(json.dumps(data, indent=2))
 

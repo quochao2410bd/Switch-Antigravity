@@ -2,7 +2,7 @@
 """
 verify_active_account.py
 
-Windows Credential Store verification probe for Antigravity on Windows (Round 4 Architecture).
+Windows Credential Store verification probe for Antigravity on Windows (Round 6 Architecture).
 
 Key Guarantees:
 1. Structured Credential Envelope (Item 7):
@@ -10,10 +10,9 @@ Key Guarantees:
    - Found but empty/zero-length blob -> CREDENTIAL_TOKEN_FIELDS_MISSING (found=True, credential_present=True).
    - Win32 5 -> CREDENTIAL_STORE_ACCESS_DENIED.
    - Non-zero return code -> POWERSHELL_PROCESS_FAILED.
-2. Default Account Pseudonymization & Redaction (Item 8):
-   - Default output emits pseudonymous account references (acc_<hash>).
-   - Raw emails and token fingerprints are strictly isolated to private_diagnostic_mode.
-   - Raw OAuth tokens are NEVER emitted under any circumstance.
+2. Sanitized Supervisor Output Contract (Item 6 & 11):
+   - Default output DTO contains NO raw_expected_account, NO raw_detected_email, and NO token_fingerprint.
+   - Only pseudonymous account_ref is emitted by default.
 """
 
 from __future__ import annotations
@@ -29,6 +28,9 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Callable, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from refresh_quota_safe import pseudonymize_account
 
 
 class CredentialVerificationStatus(str, Enum):
@@ -50,7 +52,7 @@ class CredentialVerificationStatus(str, Enum):
 
 @dataclass
 class SanitizedVerificationOutput:
-    """Safe supervisor DTO containing zero raw emails or fingerprints (Item 10)."""
+    """Safe supervisor DTO containing zero raw emails or fingerprints (Item 6 & 11)."""
     account_ref: Optional[str]
     status: str
     credential_present: bool
@@ -101,21 +103,13 @@ class VerificationResult:
         return d
 
 
-def pseudonymize_account(account: Optional[str]) -> Optional[str]:
-    """Generates a stable local pseudonymous identifier (acc_<sha256_prefix>)."""
-    if not account:
-        return None
-    h = hashlib.sha256(account.strip().lower().encode("utf-8")).hexdigest()[:12]
-    return f"acc_{h}"
-
-
 def parse_credential_envelope_output(
     returncode: int,
     stdout: str,
     stderr: str
 ) -> Tuple[Optional[dict], Optional[CredentialVerificationStatus], Optional[str]]:
     """
-    Parses PowerShell output returning a structured envelope (Item 7).
+    Parses PowerShell output returning a structured envelope.
     """
     if returncode != 0:
         err_msg = stderr.strip() or stdout.strip() or f"Process exited with code {returncode}"
@@ -145,7 +139,6 @@ def parse_credential_envelope_output(
         else:
             return None, CredentialVerificationStatus.CREDENTIAL_STORE_READ_ERROR, f"Win32 error reading vault: {win32_code}"
 
-    # Target was found (found == True)
     if blob_len == 0 or not blob_utf8.strip():
         return {}, CredentialVerificationStatus.CREDENTIAL_TOKEN_FIELDS_MISSING, "Vault target exists but contains zero-length blob"
 
@@ -384,26 +377,6 @@ def verify_active_account(
     )
 
 
-def format_verification_output(res: VerificationResult, private_diagnostic: bool = False) -> dict:
-    """Formats verification result with default pseudonymization and privacy redaction."""
-    d = {
-        "account_ref": res.account_ref,
-        "status": res.status.value,
-        "credential_present": res.credential_present,
-        "evidence_rank": res.evidence_rank,
-        "matches_expected": res.matches_expected,
-        "scope": res.scope,
-        "desktop_adoption_status": res.desktop_adoption_status,
-        "verification_source": res.verification_source,
-        "details": res.details
-    }
-    if private_diagnostic:
-        d["raw_expected_account"] = res.raw_expected_account
-        d["raw_detected_email"] = res.raw_detected_email
-        d["token_fingerprint"] = res.token_fingerprint
-    return d
-
-
 def main():
     parser = argparse.ArgumentParser(description="Independently verify Windows Credential Manager identity.")
     parser.add_argument("--expected", "-e", help="Expected canonical email address to verify against")
@@ -412,8 +385,11 @@ def main():
     args = parser.parse_args()
 
     res = verify_active_account(args.expected, introspect_network=args.network)
-    out = format_verification_output(res, private_diagnostic=args.private_diagnostic_mode)
-    print(json.dumps(out, indent=2))
+    if args.private_diagnostic_mode:
+        print(json.dumps(res.to_private_diagnostic_dict(), indent=2))
+    else:
+        print(json.dumps(asdict(res.to_sanitized_dto()), indent=2))
+
     if res.status == CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED:
         sys.exit(0)
     elif res.status == CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED:

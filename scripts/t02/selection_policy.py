@@ -2,23 +2,22 @@
 """
 selection_policy.py
 
-Deterministic account selection engine for Switch-Antigravity watchdog.
+Thin supervisor decision policy for Switch-Antigravity watchdog (Round 6 Architecture).
 
-Guarantees & Model-Specific Routing:
-1. Explicit ModelGroup Enum & Validation (Item 15):
-   - GEMINI_PRO = "gemini-pro"
-   - GEMINI_FLASH = "gemini-flash"
-   - CLAUDE = "claude"
-   - Unknown/typo model groups (e.g. 'gemni-pro', 'foo') fail closed -> TerminalState.FAILED_SAFE.
-2. Target model group is strictly authoritative:
-   - For 'gemini-pro': Pro=0, Flash=90 is REJECTED.
-   - For 'gemini-pro': Pro=None, Flash=100 is BLOCKED_QUOTA_UNKNOWN (no cross-model inference).
-   - For 'gemini-flash': Pro=0, Flash=90 is ELIGIBLE.
-3. Stale cached quota is NEVER eligible without validated RefreshEvidence.
-4. Never repeatedly choose the same exhausted account.
-5. Max rotation limit enforcement (-> FAILED_SAFE).
-6. Cooldown failure penalties.
-7. Deterministic tie-breaking: Max Quota -> Min Failures -> Lexicographical ref.
+Architectural Role & Scope (Items 8 & 10):
+1. NOT A MULTI-ACCOUNT MANAGER:
+   - AGM is the authoritative multi-account manager (storage, encrypted tokens, OAuth, aliases, switch).
+   - selection_policy.py is ONLY a thin fail-closed decision evaluator for candidate accounts
+     already managed by AGM and parsed by inspect_quota.py.
+2. Purpose of Thin Policy (Item 9 & 10):
+   - Bridges gaps where AGM built-in auto-switch cannot be directly used by the autonomous watchdog:
+     a. Enforces target-specific scope ('agy' Credential Store only; never switches all surfaces).
+     b. Enforces strict per-model quota thresholds (Gemini Pro vs Flash, without broad model matching).
+     c. Enforces supervisor-level bounded rotation attempts and cooldown failure penalties.
+     d. Requires cryptographic freshness provenance before selecting an account.
+3. Privacy Contract (Items 7 & 11):
+   - Decision logs and evaluated candidate tables expose ONLY pseudonymous account_ref (acc_<hash>).
+   - selected_account (canonical email) is returned strictly for internal orchestration to invoke 'agm switch'.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from inspect_quota import AccountQuotaSummary, FormatSupportState, FreshnessState
-from refresh_quota_safe import is_canonical_email
+from refresh_quota_safe import is_canonical_email, pseudonymize_account
 
 
 class ModelGroup(str, Enum):
@@ -72,11 +71,22 @@ class SelectionConfig:
 
 @dataclass
 class SelectionResult:
-    selected_account: Optional[str]
+    selected_account: Optional[str]        # Internal canonical email for switch invocation
+    selected_account_ref: Optional[str]    # Safe pseudonymous ref for supervisor logging
     terminal_state: TerminalState
     decision_reason: str
     evaluated_candidates: List[Dict[str, any]]
     rotation_count: int
+
+    def to_sanitized_dto(self) -> dict:
+        """Sanitized representation guaranteed free of raw emails in decision metadata."""
+        return {
+            "selected_account_ref": self.selected_account_ref,
+            "terminal_state": self.terminal_state.value,
+            "decision_reason": self.decision_reason,
+            "evaluated_candidates": self.evaluated_candidates,
+            "rotation_count": self.rotation_count
+        }
 
 
 class AccountSelector:
@@ -106,27 +116,27 @@ class AccountSelector:
     def select_next_account(
         self,
         accounts: List[AccountQuotaSummary],
-        current_active_ref: Optional[str] = None,
+        current_active_account: Optional[str] = None,
         now: Optional[float] = None
     ) -> SelectionResult:
         t = now if now is not None else time.time()
 
-        # Item 15: Validate target model group against ModelGroup enum (Fail closed on unknown/typos)
         try:
             validated_model = ModelGroup(self.config.target_model_group.lower().strip())
         except (ValueError, AttributeError):
             return SelectionResult(
                 selected_account=None,
+                selected_account_ref=None,
                 terminal_state=TerminalState.FAILED_SAFE,
                 decision_reason=f"INVALID_MODEL_GROUP: '{self.config.target_model_group}' is not a supported ModelGroup enum",
                 evaluated_candidates=[],
                 rotation_count=self.rotation_attempts
             )
 
-        # Check maximum rotation limit first
         if self.rotation_attempts >= self.config.max_rotation_attempts:
             return SelectionResult(
                 selected_account=None,
+                selected_account_ref=None,
                 terminal_state=TerminalState.FAILED_SAFE,
                 decision_reason=f"Exceeded maximum rotation attempts ({self.rotation_attempts}/{self.config.max_rotation_attempts})",
                 evaluated_candidates=[],
@@ -136,16 +146,17 @@ class AccountSelector:
         if not accounts:
             return SelectionResult(
                 selected_account=None,
+                selected_account_ref=None,
                 terminal_state=TerminalState.BLOCKED_NO_ACCOUNT,
                 decision_reason="No stored accounts found in account store",
                 evaluated_candidates=[],
                 rotation_count=self.rotation_attempts
             )
 
-        # Check if table schema is unsupported
         if any(acc.format_support == FormatSupportState.FORMAT_UNSUPPORTED for acc in accounts):
             return SelectionResult(
                 selected_account=None,
+                selected_account_ref=None,
                 terminal_state=TerminalState.FAILED_SAFE,
                 decision_reason="AGM output schema is unsupported. Failing closed.",
                 evaluated_candidates=[],
@@ -157,12 +168,12 @@ class AccountSelector:
         has_stale_or_unknown_account = False
 
         for acc in accounts:
-            ref = acc.safe_account_ref
+            c_acc = acc.canonical_account
+            ref = acc.account_ref
             penalty = self.penalties.get(ref, AccountPenaltyState(account_ref=ref))
-            is_current = bool(current_active_ref and ref.lower() == current_active_ref.lower())
+            is_current = bool(current_active_account and c_acc.lower() == current_active_account.lower())
             is_in_cooldown = bool(penalty.cooldown_until_epoch > t)
 
-            # Model-Specific Quota Evaluation (Item 11 & 15)
             if validated_model == ModelGroup.GEMINI_FLASH:
                 score = acc.gemini_flash_pct
             elif validated_model == ModelGroup.CLAUDE:
@@ -173,7 +184,7 @@ class AccountSelector:
             eval_entry = {
                 "account_ref": ref,
                 "target_model_group": validated_model.value,
-                "is_canonical_email": is_canonical_email(ref),
+                "is_canonical_email": is_canonical_email(c_acc),
                 "is_current": is_current,
                 "is_expired": acc.is_token_expired,
                 "in_cooldown": is_in_cooldown,
@@ -184,8 +195,7 @@ class AccountSelector:
                 "status": "REJECTED"
             }
 
-            # Filter rules
-            if not is_canonical_email(ref):
+            if not is_canonical_email(c_acc):
                 eval_entry["reject_reason"] = "Account reference is not a canonical email"
             elif acc.is_token_expired:
                 eval_entry["reject_reason"] = "Token is expired"
@@ -216,32 +226,31 @@ class AccountSelector:
             if has_stale_or_unknown_account:
                 return SelectionResult(
                     selected_account=None,
+                    selected_account_ref=None,
                     terminal_state=TerminalState.BLOCKED_QUOTA_UNKNOWN,
-                    decision_reason=f"All potential candidate accounts have stale/unknown quota for model group '{validated_model.value}'; live refresh required",
+                    decision_reason=f"All candidate accounts have stale/unknown quota for model group '{validated_model.value}'; live refresh required",
                     evaluated_candidates=evaluated,
                     rotation_count=self.rotation_attempts
                 )
             return SelectionResult(
                 selected_account=None,
+                selected_account_ref=None,
                 terminal_state=TerminalState.BLOCKED_NO_ACCOUNT,
                 decision_reason=f"No eligible accounts remaining with sufficient quota (>= {self.config.min_quota_pct}%) for '{validated_model.value}'",
                 evaluated_candidates=evaluated,
                 rotation_count=self.rotation_attempts
             )
 
-        # Deterministic sorting:
-        # 1. Quota score descending (-score)
-        # 2. Failure count ascending (failure_count)
-        # 3. Account reference lexicographical ascending (ref)
-        eligible_candidates.sort(key=lambda item: (-item[1], item[2], item[0].safe_account_ref))
+        eligible_candidates.sort(key=lambda item: (-item[1], item[2], item[0].canonical_account))
 
-        winner = eligible_candidates[0][0].safe_account_ref
+        winner_acc = eligible_candidates[0][0]
         winner_score = eligible_candidates[0][1]
 
         return SelectionResult(
-            selected_account=winner,
+            selected_account=winner_acc.canonical_account,
+            selected_account_ref=winner_acc.account_ref,
             terminal_state=TerminalState.NONE,
-            decision_reason=f"Selected {winner} with {winner_score}% quota for model group '{validated_model.value}'",
+            decision_reason=f"Selected account {winner_acc.account_ref} with {winner_score}% quota for model group '{validated_model.value}'",
             evaluated_candidates=evaluated,
             rotation_count=self.rotation_attempts
         )

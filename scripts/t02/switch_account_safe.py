@@ -2,7 +2,7 @@
 """
 switch_account_safe.py
 
-Hardened, safety-first wrapper around AGM account switching for Switch-Antigravity (Round 4).
+Hardened, safety-first wrapper around AGM account switching for Switch-Antigravity (Round 6).
 
 Safety Constraints & Outcome Model:
 1. Strict Scope: Target restricted exclusively to 'agy' (Credential Store only).
@@ -22,16 +22,15 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict
 from enum import Enum
 from typing import Callable, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from refresh_quota_safe import find_canonical_agm_executable, is_canonical_email
+from refresh_quota_safe import find_canonical_agm_executable, is_canonical_email, pseudonymize_account
 from verify_active_account import (
     CredentialVerificationStatus,
     VerificationResult,
-    format_verification_output,
-    pseudonymize_account,
     verify_active_account,
 )
 
@@ -117,7 +116,7 @@ def execute_safe_switch(
         }
         if private_diagnostic_mode:
             out["raw_target_account"] = account
-            out["pre_switch_state"] = format_verification_output(pre_verification, private_diagnostic=True)
+            out["pre_switch_state"] = pre_verification.to_private_diagnostic_dict()
         return out
 
     get_bin = executable_resolver or find_canonical_agm_executable
@@ -215,7 +214,7 @@ def execute_safe_switch(
         out["agm_exit_code"] = exit_code
         out["agm_stdout"] = stdout.strip()
         out["agm_stderr"] = stderr.strip()
-        out["post_switch_state"] = format_verification_output(post_verification, private_diagnostic=True)
+        out["post_switch_state"] = post_verification.to_private_diagnostic_dict()
     return out
 
 

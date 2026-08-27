@@ -2,20 +2,21 @@
 """
 refresh_quota_safe.py
 
-Production contract and safe executor for AGM quota refresh operations (Round 5 Architecture).
+Production contract and safe executor for AGM quota refresh operations (Round 6 Architecture).
 
-Key Architectural Trust Improvements:
-1. Sealed Process-Local Capability Attestation (Critical Item 3 & 4):
-   - LiveExecutionAttestation is generated ONLY by the sealed executor using an ephemeral module secret.
-   - Manual typed forgery of RefreshEvidence without valid attestation is rejected.
-2. Independent Expected Binary Identity Binding (Critical Item 1 & 2):
-   - Validates observed_binary_sha256 against expected_binary_sha256 / trusted registry.
-   - Syntactically valid but non-matching SHA-256 fails closed.
-3. Pre/Post Execution TOCTOU Mitigation (Item 9):
-   - Hashes binary immediately before and after execution; mismatch fails closed.
-4. Sealed Live vs Test Executor Separation (Critical Item 2):
-   - _execute_live_refresh_sealed mints LIVE_REFRESH_EXECUTION with attestation.
-   - execute_refresh_for_test is structurally restricted to SYNTHETIC_TEST_EVIDENCE.
+Key Architectural & Privacy Guarantees:
+1. Thin Safety Adapter (Item 8):
+   - AGM is the sole multi-account manager (account DB, tokens, OAuth, aliases, switch).
+   - T02 provides safe invocation, binary validation, and result normalization.
+2. Sanitized Refresh Output Contract (Item 6 & 11):
+   - Default CLI/supervisor output uses SanitizedRefreshEvidenceDTO (pseudonymous account_ref only).
+   - Raw emails, capability tokens, session secrets, and process streams are strictly isolated behind --private-diagnostic-mode.
+3. Process-Local TCB Model (Item 3 & 4):
+   - The main supervisor Python process is the Trusted Computing Base (TCB).
+   - LiveExecutionAttestation acts as a misuse/accidental-call guard within the supervisor.
+4. Clean Production Live Origin (Item 5):
+   - Production live path executes real binary with pre/post TOCTOU hashing without test injection hooks.
+   - Test execution uses execute_refresh_for_test() minting SYNTHETIC_TEST_EVIDENCE.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 # Inspected upstream commit revision for AGM
 INSPECTED_AGM_SOURCE_REVISION = "1d3ce8497e36ffa60c3b4e369168315a7ae4d469"
 
-# Module-private ephemeral secret for process-local capability attestation (Item 3 & 4)
+# Module-private ephemeral secret for process-local capability attestation (TCB guard)
 _EXECUTOR_ATTESTATION_SECRET: str = secrets.token_hex(32)
 _SUPERVISOR_SESSION_NONCE: str = secrets.token_hex(16)
 
@@ -67,13 +68,27 @@ class RefreshResult(str, Enum):
 
 @dataclass
 class LiveExecutionAttestation:
-    """Process-local capability attestation issued ONLY by sealed executor."""
+    """Process-local capability attestation (misuse guard within supervisor TCB)."""
     session_nonce: str
     execution_nonce: str
     account: str
     binary_sha256: str
     issued_at: float
     capability_token: str
+
+
+@dataclass
+class SanitizedRefreshEvidenceDTO:
+    """Safe supervisor DTO containing zero raw emails or tokens (Item 6)."""
+    account_ref: str
+    result: str
+    exit_code: int
+    started_at_epoch: float
+    completed_at_epoch: float
+    duration_sec: float
+    source_origin: str
+    transport_trust: str
+    error_class: Optional[str] = None
 
 
 @dataclass
@@ -93,6 +108,38 @@ class RefreshEvidence:
     attestation: Optional[LiveExecutionAttestation] = None
     hmac_signature: Optional[str] = None
     error_summary: Optional[str] = None
+
+    def to_sanitized_dto(self) -> SanitizedRefreshEvidenceDTO:
+        """Converts to safe supervisor DTO guaranteed free of raw emails or capability tokens."""
+        return SanitizedRefreshEvidenceDTO(
+            account_ref=pseudonymize_account(self.canonical_account),
+            result=self.result.value,
+            exit_code=self.exit_code,
+            started_at_epoch=self.started_at_epoch,
+            completed_at_epoch=self.completed_at_epoch,
+            duration_sec=max(0.0, self.completed_at_epoch - self.started_at_epoch),
+            source_origin=self.source_origin.value,
+            transport_trust=self.transport_trust.value,
+            error_class=self.error_summary
+        )
+
+    def to_private_diagnostic_dict(self) -> dict:
+        """Explicit diagnostic extraction including raw accounts and internal provenance."""
+        d = asdict(self)
+        d["result"] = self.result.value
+        d["source_origin"] = self.source_origin.value
+        d["transport_trust"] = self.transport_trust.value
+        if self.attestation:
+            d["attestation"] = asdict(self.attestation)
+        return d
+
+
+def pseudonymize_account(account: Optional[str]) -> str:
+    """Generates a stable local pseudonymous identifier (acc_<sha256_prefix>)."""
+    if not account:
+        return "acc_none"
+    h = hashlib.sha256(account.strip().lower().encode("utf-8")).hexdigest()[:12]
+    return f"acc_{h}"
 
 
 def compute_file_sha256(filepath: str) -> Optional[str]:
@@ -114,7 +161,7 @@ def issue_live_execution_attestation(
     binary_sha256: str,
     issued_at: float
 ) -> LiveExecutionAttestation:
-    """Issues an unforgeable process-local attestation capability."""
+    """Issues a process-local attestation capability."""
     exec_nonce = str(uuid.uuid4())
     payload = f"{_SUPERVISOR_SESSION_NONCE}|{exec_nonce}|{account.lower()}|{binary_sha256}|{issued_at:.4f}"
     cap_token = hmac.new(_EXECUTOR_ATTESTATION_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -133,14 +180,14 @@ def verify_live_execution_attestation(
     expected_account: str,
     expected_binary_sha256: str
 ) -> bool:
-    """Verifies that an attestation capability was legitimately minted by this process executor."""
+    """Verifies that an attestation capability was issued within this supervisor process."""
     if not attestation:
         return False
     if attestation.session_nonce != _SUPERVISOR_SESSION_NONCE:
         return False
     if attestation.account != expected_account.lower():
         return False
-    if attestation.binary_sha256 != expected_binary_sha256:
+    if attestation.binary_sha256.lower() != expected_binary_sha256.lower():
         return False
 
     payload = f"{attestation.session_nonce}|{attestation.execution_nonce}|{attestation.account}|{attestation.binary_sha256}|{attestation.issued_at:.4f}"
@@ -210,26 +257,20 @@ def classify_refresh_failure(stdout: str, stderr: str, exit_code: int) -> Tuple[
     return RefreshResult.REFRESH_FAILED_UNKNOWN, f"Unknown refresh failure (exit code {exit_code})"
 
 
-# Private low-level execution hook for sealed testing without live network (Item 8)
-_PRIVATE_SUBPROCESS_EXECUTOR_HOOK: Optional[Callable[[List[str], int], Tuple[int, str, str]]] = None
-
-
 def _execute_live_refresh_sealed(
     account: str,
     supervisor_session_id: str,
-    timeout_sec: int = 15,
-    _custom_binary_path: Optional[str] = None,
-    clock: Optional[Callable[[], float]] = None
+    timeout_sec: int = 15
 ) -> RefreshEvidence:
     """
-    Sealed production live refresh execution (Round 5).
+    Clean production live refresh execution (Round 6).
     Performs pre/post TOCTOU hashing and mints LiveExecutionAttestation.
+    Zero test injection hooks in production path.
     """
-    get_time = clock or time.time
-    start_t = get_time()
-    agm_bin = _custom_binary_path or find_canonical_agm_executable()
+    start_t = time.time()
+    agm_bin = find_canonical_agm_executable()
     if not agm_bin:
-        end_t = get_time()
+        end_t = time.time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path="none",
@@ -246,9 +287,9 @@ def _execute_live_refresh_sealed(
             error_summary="AGM binary not found on PATH or search locations"
         )
 
-    sha_pre = compute_file_sha256(agm_bin) if os.path.isfile(agm_bin) else "MOCK_SEALED_SHA256"
-    if not sha_pre or sha_pre == "UNKNOWN_SHA256":
-        end_t = get_time()
+    sha_pre = compute_file_sha256(agm_bin)
+    if not sha_pre:
+        end_t = time.time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path=agm_bin,
@@ -268,16 +309,13 @@ def _execute_live_refresh_sealed(
     argv = [agm_bin, "refresh", account]
 
     try:
-        if _PRIVATE_SUBPROCESS_EXECUTOR_HOOK is not None:
-            proc_code, proc_out, proc_err = _PRIVATE_SUBPROCESS_EXECUTOR_HOOK(argv, timeout_sec)
-        else:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec)
-            proc_code = proc.returncode
-            proc_out = proc.stdout
-            proc_err = proc.stderr
-        end_t = get_time()
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec)
+        proc_code = proc.returncode
+        proc_out = proc.stdout
+        proc_err = proc.stderr
+        end_t = time.time()
     except subprocess.TimeoutExpired:
-        end_t = get_time()
+        end_t = time.time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path=agm_bin,
@@ -294,7 +332,7 @@ def _execute_live_refresh_sealed(
             error_summary=f"Refresh timed out after {timeout_sec}s"
         )
     except Exception as e:
-        end_t = get_time()
+        end_t = time.time()
         return RefreshEvidence(
             canonical_account=account,
             canonical_executable_path=agm_bin,
@@ -311,7 +349,7 @@ def _execute_live_refresh_sealed(
             error_summary=f"Process execution error: {e}"
         )
 
-    sha_post = compute_file_sha256(agm_bin) if os.path.isfile(agm_bin) else sha_pre
+    sha_post = compute_file_sha256(agm_bin)
     if sha_pre != sha_post:
         return RefreshEvidence(
             canonical_account=account,
@@ -571,6 +609,7 @@ def main():
     parser.add_argument("account", help="Canonical email of account to refresh")
     parser.add_argument("--session-id", required=True, help="Mandatory supervisor session ID")
     parser.add_argument("--live", action="store_true", help="Execute live network refresh against AGM")
+    parser.add_argument("--private-diagnostic-mode", action="store_true", help="Include raw email and internal provenance")
     args = parser.parse_args()
 
     evidence = execute_safe_refresh(
@@ -578,7 +617,11 @@ def main():
         args.session_id,
         live_network=args.live
     )
-    print(json.dumps(asdict(evidence), indent=2))
+    if args.private_diagnostic_mode:
+        print(json.dumps(evidence.to_private_diagnostic_dict(), indent=2))
+    else:
+        print(json.dumps(asdict(evidence.to_sanitized_dto()), indent=2))
+
     sys.exit(0 if evidence.result == RefreshResult.REFRESH_SUCCEEDED else (3 if evidence.result == RefreshResult.DRY_RUN else 1))
 
 
