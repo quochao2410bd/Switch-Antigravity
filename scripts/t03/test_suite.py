@@ -69,7 +69,8 @@ from send_resume import (
     discover_cdp_endpoint,
     execute_resume_pipeline,
     QualifiedAntigravityClient,
-    normalize_text
+    normalize_text,
+    DOM_QUALIFICATION_JS
 )
 
 SYNTHETIC_UUID_1 = "00000000-0000-4000-8000-000000000001"
@@ -694,6 +695,500 @@ class TestT03Round8Final(unittest.TestCase):
         rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
         with self.assertRaises(ValueError):
             self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_MESSAGE_OBSERVED)
+
+    # -------------------------------------------------------------------------
+    # REAL JS DOM CONTRACT TESTS (Executed directly in Node.js against DOM_QUALIFICATION_JS)
+    # -------------------------------------------------------------------------
+
+    def _eval_dom_contract(self, dom_setup_js, target_uuid=SYNTHETIC_UUID_1, pathname=None):
+        """
+        Executes DOM_QUALIFICATION_JS in Node.js with a minimal synthetic DOM environment.
+        Returns the parsed JSON evaluation result without mocking or stubbing evaluate().
+        """
+        curr_pathname = pathname if pathname is not None else f"/c/{target_uuid}"
+        runner_script = f"""
+class Node {{
+    constructor(tagName, id = '', className = '', attrs = {{}}) {{
+        this.tagName = tagName.toUpperCase();
+        this.id = id;
+        this.className = className;
+        this.attributes = Object.assign({{}}, attrs);
+        if (id) this.attributes.id = id;
+        this.children = [];
+        this.parentElement = null;
+        this.offsetParent = {{}};
+        this.textContent = '';
+        this.innerText = '';
+        this.disabled = false;
+    }}
+    getAttribute(name) {{
+        return this.attributes[name] !== undefined ? this.attributes[name] : null;
+    }}
+    setAttribute(name, val) {{
+        this.attributes[name] = String(val);
+    }}
+    appendChild(child) {{
+        child.parentElement = this;
+        this.children.push(child);
+        return child;
+    }}
+    contains(other) {{
+        let curr = other;
+        while (curr) {{
+            if (curr === this) return true;
+            curr = curr.parentElement;
+        }}
+        return false;
+    }}
+    closest(selector) {{
+        let curr = this;
+        while (curr && curr.tagName) {{
+            if (curr.matches(selector)) return curr;
+            curr = curr.parentElement;
+        }}
+        return null;
+    }}
+    matches(selector) {{
+        const selList = selector.split(',').map(s => s.trim());
+        for (const sel of selList) {{
+            if (sel === 'main' && this.tagName === 'MAIN') return true;
+            if (sel === 'article' && this.tagName === 'ARTICLE') return true;
+            if (sel === 'button' && this.tagName === 'BUTTON') return true;
+            if (sel === '[data-lexical-editor="true"]' && this.attributes['data-lexical-editor'] === 'true') return true;
+            if (sel === '[data-testid="conversation-view"]' && this.attributes['data-testid'] === 'conversation-view') return true;
+            if (sel === '[data-testid="conversation-messages"]' && this.attributes['data-testid'] === 'conversation-messages') return true;
+            if (sel === '[data-testid="agent-input-box"]' && this.attributes['data-testid'] === 'agent-input-box') return true;
+            if (sel === '#antigravity\\\\.agentSidePanelInputBox' && (this.id === 'antigravity.agentSidePanelInputBox' || this.attributes.id === 'antigravity.agentSidePanelInputBox')) return true;
+            if (sel === 'button[data-testid="send-button"]' && this.tagName === 'BUTTON' && this.attributes['data-testid'] === 'send-button') return true;
+            if (sel === 'button[aria-label="Send message"]' && this.tagName === 'BUTTON' && this.attributes['aria-label'] === 'Send message') return true;
+            if (sel === '[data-testid="conversation-list-sidebar"]' && this.attributes['data-testid'] === 'conversation-list-sidebar') return true;
+            if (sel === '[role="article"]' && this.attributes['role'] === 'article') return true;
+        }}
+        return false;
+    }}
+    querySelectorAll(selector) {{
+        const matches = [];
+        const traverse = (node) => {{
+            for (const child of node.children) {{
+                if (child.matches(selector)) matches.push(child);
+                traverse(child);
+            }}
+        }};
+        traverse(this);
+        return matches;
+    }}
+    querySelector(selector) {{
+        const res = this.querySelectorAll(selector);
+        return res.length > 0 ? res[0] : null;
+    }}
+}}
+
+global.document = {{
+    body: new Node('body'),
+    querySelectorAll: (sel) => global.document.body.querySelectorAll(sel),
+    querySelector: (sel) => global.document.body.querySelector(sel)
+}};
+global.window = {{
+    location: {{ pathname: {json.dumps(curr_pathname)} }}
+}};
+
+{DOM_QUALIFICATION_JS}
+
+// Setup user DOM
+{dom_setup_js}
+
+// Execute production functions
+const targetRes = qualifyTargetSurface({json.dumps(target_uuid)});
+let compRes = {{ error: 'TARGET_NOT_QUALIFIED' }};
+let msgRes = {{ error: 'TARGET_NOT_QUALIFIED' }};
+let stopRes = {{ found: false }};
+
+if (!targetRes.error && targetRes.surface) {{
+    compRes = qualifyComposerSurface(targetRes.surface);
+    msgRes = qualifyMessageSurface(targetRes.surface);
+    stopRes = qualifyStopControl(targetRes.surface);
+}}
+
+const output = {{
+    targetRes: {{ variant: targetRes.variant, error: targetRes.error }},
+    compRes: {{ error: compRes.error, sendButton: compRes.sendButton }},
+    msgRes: {{ variant: msgRes.variant, error: msgRes.error }},
+    stopRes: stopRes
+}};
+
+console.log(JSON.stringify(output));
+"""
+        import subprocess
+        proc = subprocess.run(["node", "-e", runner_script], capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Node DOM evaluation failed: {proc.stderr}")
+        return json.loads(proc.stdout)
+
+    # 23. Real JS DOM: Legacy Main only
+    def test_23_real_js_dom_legacy_main_only(self):
+        """Case 1: LEGACY MAIN only qualifies variant LEGACY_MAIN."""
+        setup_js = """
+        const m = document.body.appendChild(new Node('main'));
+        const ib = m.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'data-testid': 'send-button' }));
+        const mb = m.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-messages' }));
+        mb.appendChild(new Node('article'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["targetRes"]["error"])
+        self.assertEqual(res["targetRes"]["variant"], "LEGACY_MAIN")
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertIsNone(res["msgRes"]["error"])
+
+    # 24. Real JS DOM: Current conversation-view only
+    def test_24_real_js_dom_current_conversation_view_only(self):
+        """Case 2: CURRENT conversation-view only qualifies variant CONVERSATION_VIEW."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const mb = cv.appendChild(new Node('div'));
+        mb.appendChild(new Node('article'));
+        const ib = cv.appendChild(new Node('div', 'antigravity.agentSidePanelInputBox'));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'aria-label': 'Send message' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["targetRes"]["error"])
+        self.assertEqual(res["targetRes"]["variant"], "CONVERSATION_VIEW")
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertIsNone(res["msgRes"]["error"])
+
+    # 25. Real JS DOM: Same element matches both main and conversation-view
+    def test_25_real_js_dom_same_element_matches_both_deduplicates(self):
+        """Case 3: Same element matches both main and conversation-view -> deduplicated to 1 target."""
+        setup_js = """
+        const m = document.body.appendChild(new Node('main', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = m.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'data-testid': 'send-button' }));
+        const mb = m.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-messages' }));
+        mb.appendChild(new Node('article'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["targetRes"]["error"])
+        self.assertEqual(res["targetRes"]["variant"], "LEGACY_MAIN")
+
+    # 26. Real JS DOM: Distinct main + distinct conversation-view fails ambiguous
+    def test_26_real_js_dom_distinct_main_and_conv_view_fails_ambiguous(self):
+        """Case 4: Distinct main + distinct conversation-view -> TARGET_SURFACE_AMBIGUOUS."""
+        setup_js = """
+        document.body.appendChild(new Node('main'));
+        document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["targetRes"]["error"], "TARGET_SURFACE_AMBIGUOUS")
+
+    # 27. Real JS DOM: Zero target surfaces
+    def test_27_real_js_dom_zero_target_surfaces_fails_closed(self):
+        """Case 5: Zero target surfaces -> TARGET_SURFACE_NOT_FOUND."""
+        setup_js = """
+        document.body.appendChild(new Node('div', '', 'regular-container'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["targetRes"]["error"], "TARGET_SURFACE_NOT_FOUND")
+
+    # 28. Real JS DOM: Unique target + zero explicit input boxes
+    def test_28_real_js_dom_zero_explicit_input_boxes_fails_closed(self):
+        """Case 6: Unique target + zero explicit input boxes -> COMPOSER_SURFACE_NOT_FOUND."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        cv.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' })); // Editor without explicit input box
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["targetRes"]["error"])
+        self.assertEqual(res["compRes"]["error"], "COMPOSER_SURFACE_NOT_FOUND")
+
+    # 29. Real JS DOM: Unique target + two distinct input boxes
+    def test_29_real_js_dom_two_distinct_input_boxes_fails_ambiguous(self):
+        """Case 7: Unique target + two distinct input boxes -> COMPOSER_SURFACE_AMBIGUOUS."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        cv.appendChild(new Node('div', 'antigravity.agentSidePanelInputBox'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["targetRes"]["error"])
+        self.assertEqual(res["compRes"]["error"], "COMPOSER_SURFACE_AMBIGUOUS")
+
+    # 30. Real JS DOM: One input box + one editor succeeds
+    def test_30_real_js_dom_one_input_box_one_editor_succeeds(self):
+        """Case 8: One input box + one editor -> success."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'data-testid': 'send-button' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertTrue(res["compRes"]["sendButton"]["found"])
+
+    # 31. Real JS DOM: Editor outside explicit input box fails closed
+    def test_31_real_js_dom_editor_outside_input_box_fails_closed(self):
+        """Case 9: Editor exists outside explicit input box only -> COMPOSER_NOT_FOUND."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' })); // empty box
+        cv.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' })); // outside box
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["compRes"]["error"], "COMPOSER_NOT_FOUND")
+
+    # 32. Real JS DOM: One input box + two editors fails ambiguous
+    def test_32_real_js_dom_one_input_box_two_editors_fails_ambiguous(self):
+        """Case 10: One input box + two editors -> COMPOSER_AMBIGUOUS."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["compRes"]["error"], "COMPOSER_AMBIGUOUS")
+
+    # 33. Real JS DOM: Explicit conversation-messages container succeeds
+    def test_33_real_js_dom_explicit_conversation_messages_succeeds(self):
+        """Case 11: Explicit conversation-messages container -> success."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const mb = cv.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-messages' }));
+        mb.appendChild(new Node('article'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["msgRes"]["error"])
+        self.assertEqual(res["msgRes"]["variant"], "EXPLICIT_DATA_TESTID")
+
+    # 34. Real JS DOM: Live structural message variant succeeds
+    def test_34_real_js_dom_live_structural_message_variant_succeeds(self):
+        """Case 12: Live structural variant (direct child, no editor, >=1 article) -> success."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const mb = cv.appendChild(new Node('div')); // direct child
+        mb.appendChild(new Node('article'));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["msgRes"]["error"])
+        self.assertEqual(res["msgRes"]["variant"], "LIVE_STRUCTURAL_DIRECT_CHILD")
+
+    # 35. Real JS DOM: Two structural message candidates fails ambiguous
+    def test_35_real_js_dom_two_structural_message_candidates_fails_ambiguous(self):
+        """Case 13: Two structural message candidates -> MESSAGE_CONTAINER_AMBIGUOUS."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const mb1 = cv.appendChild(new Node('div'));
+        mb1.appendChild(new Node('article'));
+        const mb2 = cv.appendChild(new Node('div'));
+        mb2.appendChild(new Node('article'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["msgRes"]["error"], "MESSAGE_CONTAINER_AMBIGUOUS")
+
+    # 36. Real JS DOM: Visible banner direct child with 0 articles does not qualify
+    def test_36_real_js_dom_banner_direct_child_zero_articles_does_not_qualify(self):
+        """Case 14: Visible banner direct child with 0 articles MUST NOT qualify as message surface."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const banner = cv.appendChild(new Node('div', '', 'announcement-banner')); // 0 articles
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["msgRes"]["error"], "MESSAGE_CONTAINER_NOT_FOUND")
+
+    # 37. Real JS DOM: Random panel direct child with 0 articles does not qualify
+    def test_37_real_js_dom_random_panel_zero_articles_does_not_qualify(self):
+        """Case 15: Random panel direct child with 0 articles MUST NOT qualify."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        cv.appendChild(new Node('div', '', 'side-controls'));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["msgRes"]["error"], "MESSAGE_CONTAINER_NOT_FOUND")
+
+    # 38. Real JS DOM: Zero message variant fails closed
+    def test_38_real_js_dom_zero_message_variant_fails_closed(self):
+        """Case 16: Zero message variant -> MESSAGE_CONTAINER_NOT_FOUND."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["msgRes"]["error"], "MESSAGE_CONTAINER_NOT_FOUND")
+
+    # 39. Real JS DOM: One exact data-testid send button succeeds
+    def test_39_real_js_dom_one_exact_testid_send_button_succeeds(self):
+        """Case 17: One exact data-testid send button -> success."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'data-testid': 'send-button' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertTrue(res["compRes"]["sendButton"]["found"])
+
+    # 40. Real JS DOM: One exact aria-label Send message button succeeds
+    def test_40_real_js_dom_one_exact_aria_label_send_button_succeeds(self):
+        """Case 18: One exact aria-label='Send message' button -> success."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'aria-label': 'Send message' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertTrue(res["compRes"]["sendButton"]["found"])
+
+    # 41. Real JS DOM: Same button matching both testid and aria-label deduplicates
+    def test_41_real_js_dom_same_send_button_both_selectors_deduplicates(self):
+        """Case 19: Same button matches both data-testid and aria-label -> deduplicated to 1."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'data-testid': 'send-button', 'aria-label': 'Send message' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertTrue(res["compRes"]["sendButton"]["found"])
+
+    # 42. Real JS DOM: Two distinct supported send buttons fails ambiguous
+    def test_42_real_js_dom_two_distinct_send_buttons_fails_ambiguous(self):
+        """Case 20: Two distinct supported send buttons -> SEND_CONTROL_AMBIGUOUS."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'data-testid': 'send-button' }));
+        ib.appendChild(new Node('button', '', '', { 'aria-label': 'Send message' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertIsNone(res["compRes"]["error"])
+        self.assertEqual(res["compRes"]["sendButton"]["error"], "SEND_CONTROL_AMBIGUOUS")
+
+    # 43. Real JS DOM: Button with aria-label="Send feedback" must not qualify
+    def test_43_real_js_dom_send_feedback_button_does_not_qualify(self):
+        """Case 21: Button aria-label='Send feedback' MUST NOT qualify as send control."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'aria-label': 'Send feedback' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["compRes"]["sendButton"]["error"], "SEND_CONTROL_NOT_FOUND")
+
+    # 44. Real JS DOM: Button with aria-label="Send to..." must not qualify
+    def test_44_real_js_dom_send_to_button_does_not_qualify(self):
+        """Case 22: Button aria-label='Send to...' MUST NOT qualify."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        ib.appendChild(new Node('button', '', '', { 'aria-label': 'Send to email' }));
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["compRes"]["sendButton"]["error"], "SEND_CONTROL_NOT_FOUND")
+
+    # 45. Real JS DOM: Supported send button outside input box fails closed
+    def test_45_real_js_dom_send_button_outside_input_box_fails_closed(self):
+        """Case 23: Supported send button outside input box -> SEND_CONTROL_NOT_FOUND."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        const ib = cv.appendChild(new Node('div', '', '', { 'data-testid': 'agent-input-box' }));
+        ib.appendChild(new Node('div', '', '', { 'data-lexical-editor': 'true' }));
+        cv.appendChild(new Node('button', '', '', { 'data-testid': 'send-button' })); // outside ib
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["compRes"]["sendButton"]["error"], "SEND_CONTROL_NOT_FOUND")
+
+    # 46. Real JS DOM: Sidebar target and controls excluded
+    def test_46_real_js_dom_sidebar_target_and_controls_excluded(self):
+        """Case 24: Elements inside conversation-list-sidebar are completely excluded."""
+        setup_js = """
+        const sb = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-list-sidebar' }));
+        sb.appendChild(new Node('main')); // sidebar main
+        sb.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' })); // sidebar conv view
+        """
+        res = self._eval_dom_contract(setup_js)
+        self.assertEqual(res["targetRes"]["error"], "TARGET_SURFACE_NOT_FOUND")
+
+    # 47. Real JS DOM: Wrong route fails closed
+    def test_47_real_js_dom_wrong_route_fails_closed(self):
+        """Case 25: Mismatched pathname returns WRONG_CONVERSATION_ACTIVE."""
+        setup_js = """
+        const cv = document.body.appendChild(new Node('div', '', '', { 'data-testid': 'conversation-view' }));
+        """
+        res = self._eval_dom_contract(setup_js, pathname="/c/wrong-uuid-0000-0000")
+        self.assertEqual(res["targetRes"]["error"], "WRONG_CONVERSATION_ACTIVE")
+
+    # 48. Production mutation check: Unsupported root before clear
+    def test_48_production_unsupported_root_before_clear_aborts(self):
+        """DOM target surface disappearing before clear raises RuntimeError with 0 Input commands."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        cmds = []
+        async def stub_send_command(method, params=None):
+            cmds.append(method)
+            return {}
+        client.send_command = stub_send_command
+        async def stub_evaluate(expr):
+            return {"focused": False, "error": "TARGET_SURFACE_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.clear_composer(SYNTHETIC_UUID_1))
+        self.assertIn("TARGET_SURFACE_NOT_FOUND", str(ctx.exception))
+        self.assertEqual(len(cmds), 0)
+
+    # 49. Production mutation check: Input box disappears before insert
+    def test_49_production_input_box_disappears_before_insert_aborts(self):
+        """DOM composer disappearing before insert raises RuntimeError with 0 Input commands."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        cmds = []
+        async def stub_send_command(method, params=None):
+            cmds.append(method)
+            return {}
+        client.send_command = stub_send_command
+        async def stub_evaluate(expr):
+            return {"focused": False, "error": "COMPOSER_SURFACE_NOT_FOUND"}
+        client.evaluate = stub_evaluate
+
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.insert_prompt_text(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertIn("COMPOSER_SURFACE_NOT_FOUND", str(ctx.exception))
+        self.assertEqual(len(cmds), 0)
+
+    # 50. Production mutation check: Send button becomes ambiguous before dispatch
+    def test_50_production_send_button_ambiguous_before_dispatch_aborts(self):
+        """Send button becoming ambiguous before dispatch halts dispatch with 0 dispatches."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"safe": False, "error": "SEND_CONTROL_AMBIGUOUS"}
+        client.evaluate = stub_evaluate
+        res = asyncio.run(client.dispatch_submission_input(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertFalse(res.get("dispatched"))
+        self.assertEqual(res.get("error"), "SEND_CONTROL_AMBIGUOUS")
+
+    # 51. Production mutation check: Active turn detected before dispatch
+    def test_51_production_active_turn_before_dispatch_aborts(self):
+        """Active stop button appearing before dispatch halts dispatch with 0 dispatches."""
+        client = QualifiedAntigravityClient(endpoint="http://127.0.0.1:58859")
+        async def stub_evaluate(expr):
+            return {"safe": False, "error": "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH"}
+        client.evaluate = stub_evaluate
+        res = asyncio.run(client.dispatch_submission_input(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT))
+        self.assertFalse(res.get("dispatched"))
+        self.assertEqual(res.get("error"), "TURN_ALREADY_ACTIVE_BEFORE_DISPATCH")
 
 if __name__ == '__main__':
     unittest.main()
