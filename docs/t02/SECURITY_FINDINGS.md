@@ -1,33 +1,30 @@
-# T02 Security Audit and Findings: AGM Integration (Zero-Trust Round 6 Final Closure)
+# T02 Security Audit and Findings: AGM Integration (Zero-Trust Round 7 Final Closure)
 
 ## 1. Threat Model & TCB Trust Boundaries
 
-### 1.1 Process-Local TCB Model (Items 3 & 4)
+### 1.1 Process-Local TCB Model
 - **Same-Process Supervisor Modules:** The entire supervisor Python process is within the Trusted Computing Base (TCB). Same-process modules are trusted.
 - **Accidental Misuse Defense:** `LiveExecutionAttestation` prevents accidental caller construction of `LIVE_REFRESH_EXECUTION` within the supervisor without passing through the sealed executor.
 - **Cross-Process Serialized Boundary:** Any JSON/dict payload arriving from outside the supervisor process is treated as `UNTRUSTED_DESERIALIZED`. It can only establish `SIGNED_DESERIALIZED` via HMAC-SHA256 verification using `$env:AGM_SESSION_SECRET`.
 
-### 1.2 Binary Identity Binding & TOCTOU Defense (Items 1, 2, 5)
-- **Mandatory Expected Binary SHA-256:** Independent verification against `expected_binary_sha256`. Missing, malformed, or mismatched hashes fail closed (`STALE_CACHED`).
-- **TOCTOU Mutation Check:** Hashes executable immediately before and after execution; mutation fails closed (`BINARY_CHANGED_DURING_EXECUTION`).
-- **Clean Production Live Path:** No test hooks or mock execution injected into production live refresh path.
+### 1.2 Pre-Execution Binary Trust Gate (Critical Items 1 & 3)
+- **Pre-Execution Check:** `TrustedAgmRunner` validates `expected_binary_sha256` BEFORE any subprocess call.
+- **Execution Invariant:** If the binary is missing, identity unconfigured, format invalid, or hash mismatched, `SUBPROCESS_CALL_COUNT == 0` (DO NOT EXECUTE).
+- **Post-Execution TOCTOU Mutation Check:** Re-hashes binary immediately after subprocess termination.
 
 ---
 
-## 2. Privacy & Data Minimization Contract (Items 6, 7, 11)
+## 2. Privacy & Data Minimization Contract (Critical Items 6, 7, 8, 9, 10)
 
-- **Sanitized Default DTOs:** All supervisor-facing DTOs (`SanitizedRefreshEvidenceDTO`, `SanitizedAccountQuotaDTO`, `SanitizedVerificationOutput`) emit ONLY stable pseudonymous `account_ref` (`acc_<hash>`).
-- **Internal Orchestration:** Canonical email addresses exist strictly within in-memory structures to invoke `agm switch <email> --target agy`.
-- **Zero Raw Secret Exposure:** Raw OAuth tokens (`access_token`, `refresh_token`), capability tokens, and HMAC secrets are NEVER emitted or logged by default.
+- **Sanitized Default DTOs:** All supervisor-facing DTOs (`SanitizedRefreshEvidenceDTO`, `SanitizedAccountQuotaDTO`, `SanitizedVerificationOutput`, `switch_account_safe` default output) emit ONLY stable pseudonymous `account_ref` (`acc_<hash>`) and normalized error/warning codes.
+- **Zero Free-Text Leaks:** `error_code` and `sanitized_warnings` use static predefined enums/codes. No raw emails, paths, bearer headers, tokens, command lines, or stderr traces exist in default output.
+- **Invalid Account Input Protection:** Invalid account strings are NEVER echoed raw outside private diagnostic mode.
+- **Adversarial Test Verification:** The adversarial privacy test matrix proves 100% absence of sensitive tokens/markers in all default JSON outputs.
 
 ---
 
-## 3. Host Credential Incident Status & Closure Boundaries (Item 12)
+## 3. Closure Boundaries & Honest Unknowns (Item 12)
 
-- **Status:** `HOST_CREDENTIAL_RESTORATION = UNKNOWN`.
-- Historical byte-for-byte token payload equality prior to synthetic testing cannot be proven without historical secret storage.
-- All unit tests are globally trapped with verified tripwires (`OS_CRED_READ_CALLS = 0`, `OS_CRED_WRITE_CALLS = 0`, `LIVE_AGM_CALLS = 0`, `LIVE_GOOGLE_HTTP_CALLS = 0`).
-- Cross-agent boundaries remain explicitly `UNKNOWN`:
-  - `BINARY_SOURCE_EQUIVALENCE = UNKNOWN` (unless explicit `expected_binary_sha256` configured).
-  - `LIVE_DESKTOP_A_TO_B_ADOPTION = UNKNOWN`.
-  - `HOST_CREDENTIAL_RESTORATION = UNKNOWN`.
+- `BINARY_SOURCE_EQUIVALENCE = UNKNOWN / ADMIN_CONFIGURED` (A configured SHA proves match against an approved binary, but does NOT by itself prove reproducible build from upstream commit `1d3ce8497e36ffa60c3b4e369168315a7ae4d469`).
+- `LIVE_DESKTOP_A_TO_B_ADOPTION = UNKNOWN` (Requires T01/T03 runtime coordination).
+- `HOST_CREDENTIAL_RESTORATION = UNKNOWN` (Zero historical secret storage; zero unmocked host side-effects).

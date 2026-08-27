@@ -2,20 +2,22 @@
 """
 refresh_quota_safe.py
 
-Production contract and safe executor for AGM quota refresh operations (Round 6 Architecture).
+Production contract and safe executor for AGM quota refresh operations (Round 7 Architecture).
 
 Key Architectural & Privacy Guarantees:
-1. Thin Safety Adapter (Item 8):
-   - AGM is the sole multi-account manager (account DB, tokens, OAuth, aliases, switch).
-   - T02 provides safe invocation, binary validation, and result normalization.
-2. Sanitized Refresh Output Contract (Item 6 & 11):
+1. Pre-Execution Binary Trust Gate (Critical Item 1 & 2):
+   - All live executions go through TrustedAgmRunner.
+   - Expected binary SHA-256 is validated BEFORE any subprocess execution.
+   - Mismatched or unconfigured binary results in ZERO subprocess calls.
+2. Sanitized Refresh Output Contract (Critical Item 6 & 11):
    - Default CLI/supervisor output uses SanitizedRefreshEvidenceDTO (pseudonymous account_ref only).
+   - error_code contains ONLY safe normalized enums/codes (NO free-text exceptions, emails, or paths).
    - Raw emails, capability tokens, session secrets, and process streams are strictly isolated behind --private-diagnostic-mode.
-3. Process-Local TCB Model (Item 3 & 4):
+3. Process-Local TCB Model (Items 3 & 4):
    - The main supervisor Python process is the Trusted Computing Base (TCB).
    - LiveExecutionAttestation acts as a misuse/accidental-call guard within the supervisor.
 4. Clean Production Live Origin (Item 5):
-   - Production live path executes real binary with pre/post TOCTOU hashing without test injection hooks.
+   - Production live path executes real binary via TrustedAgmRunner without test injection hooks.
    - Test execution uses execute_refresh_for_test() minting SYNTHETIC_TEST_EVIDENCE.
 """
 
@@ -27,8 +29,6 @@ import hmac
 import json
 import os
 import secrets
-import shutil
-import subprocess
 import sys
 import time
 import uuid
@@ -36,8 +36,16 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-# Inspected upstream commit revision for AGM
-INSPECTED_AGM_SOURCE_REVISION = "1d3ce8497e36ffa60c3b4e369168315a7ae4d469"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from trusted_agm_runner import (
+    INSPECTED_AGM_SOURCE_REVISION,
+    RunnerErrorCode,
+    TrustedAgmIdentity,
+    TrustedExecutionResult,
+    compute_file_sha256,
+    execute_trusted_agm,
+    find_canonical_agm_executable,
+)
 
 # Module-private ephemeral secret for process-local capability attestation (TCB guard)
 _EXECUTOR_ATTESTATION_SECRET: str = secrets.token_hex(32)
@@ -62,7 +70,13 @@ class RefreshResult(str, Enum):
     REFRESH_FAILED_NETWORK = "REFRESH_FAILED_NETWORK"
     REFRESH_FAILED_ACCOUNT_NOT_FOUND = "REFRESH_FAILED_ACCOUNT_NOT_FOUND"
     REFRESH_FAILED_UNKNOWN = "REFRESH_FAILED_UNKNOWN"
+    BINARY_IDENTITY_UNCONFIGURED = "BINARY_IDENTITY_UNCONFIGURED"
+    BINARY_IDENTITY_CONFIG_INVALID = "BINARY_IDENTITY_CONFIG_INVALID"
+    BINARY_IDENTITY_MISMATCH = "BINARY_IDENTITY_MISMATCH"
     BINARY_IDENTITY_UNVERIFIED = "BINARY_IDENTITY_UNVERIFIED"
+    BINARY_CHANGED_DURING_EXECUTION = "BINARY_CHANGED_DURING_EXECUTION"
+    AGM_NOT_FOUND = "AGM_NOT_FOUND"
+    INVALID_ACCOUNT = "INVALID_ACCOUNT"
     DRY_RUN = "DRY_RUN"
 
 
@@ -79,7 +93,7 @@ class LiveExecutionAttestation:
 
 @dataclass
 class SanitizedRefreshEvidenceDTO:
-    """Safe supervisor DTO containing zero raw emails or tokens (Item 6)."""
+    """Safe supervisor DTO containing zero raw emails, free text, or capability tokens (Critical Item 6)."""
     account_ref: str
     result: str
     exit_code: int
@@ -88,7 +102,7 @@ class SanitizedRefreshEvidenceDTO:
     duration_sec: float
     source_origin: str
     transport_trust: str
-    error_class: Optional[str] = None
+    error_code: Optional[str] = None  # Normalized code only! No free-text strings!
 
 
 @dataclass
@@ -107,7 +121,8 @@ class RefreshEvidence:
     transport_trust: TransportTrustClass = TransportTrustClass.PROCESS_LOCAL
     attestation: Optional[LiveExecutionAttestation] = None
     hmac_signature: Optional[str] = None
-    error_summary: Optional[str] = None
+    error_code: Optional[str] = None
+    error_summary_private: Optional[str] = None  # Private diagnostics only
 
     def to_sanitized_dto(self) -> SanitizedRefreshEvidenceDTO:
         """Converts to safe supervisor DTO guaranteed free of raw emails or capability tokens."""
@@ -120,7 +135,7 @@ class RefreshEvidence:
             duration_sec=max(0.0, self.completed_at_epoch - self.started_at_epoch),
             source_origin=self.source_origin.value,
             transport_trust=self.transport_trust.value,
-            error_class=self.error_summary
+            error_code=self.error_code
         )
 
     def to_private_diagnostic_dict(self) -> dict:
@@ -140,20 +155,6 @@ def pseudonymize_account(account: Optional[str]) -> str:
         return "acc_none"
     h = hashlib.sha256(account.strip().lower().encode("utf-8")).hexdigest()[:12]
     return f"acc_{h}"
-
-
-def compute_file_sha256(filepath: str) -> Optional[str]:
-    """Computes SHA-256 hash of an executable file."""
-    if not filepath or not os.path.isfile(filepath):
-        return None
-    try:
-        hasher = hashlib.sha256()
-        with open(filepath, "rb") as f:
-            while chunk := f.read(65536):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-    except Exception:
-        return None
 
 
 def issue_live_execution_attestation(
@@ -228,48 +229,30 @@ def is_canonical_email(account: str) -> bool:
     return True
 
 
-def find_canonical_agm_executable() -> Optional[str]:
-    """Resolves absolute canonical path to AGM binary."""
-    agm_exe = shutil.which("agm")
-    if agm_exe and os.path.isfile(agm_exe):
-        return os.path.abspath(agm_exe)
-
-    candidates = [
-        os.path.join(os.environ.get("TEMP", ""), "agm.exe"),
-        os.path.expanduser(r"~\.local\bin\agm.exe"),
-        os.path.expanduser(r"~\go\bin\agm.exe"),
-        os.path.expanduser(r"~\bin\agm.exe"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return os.path.abspath(c)
-    return None
-
-
 def classify_refresh_failure(stdout: str, stderr: str, exit_code: int) -> Tuple[RefreshResult, str]:
     combined = f"{stdout}\n{stderr}".lower()
     if "invalid_grant" in combined or "unauthorized" in combined or "token expired" in combined or "auth" in combined:
-        return RefreshResult.REFRESH_FAILED_AUTH, "Authentication failed / refresh token expired"
+        return RefreshResult.REFRESH_FAILED_AUTH, "REFRESH_AUTH_FAILED"
     if "timeout" in combined or "connection refused" in combined or "no such host" in combined or "network" in combined or "i/o timeout" in combined:
-        return RefreshResult.REFRESH_FAILED_NETWORK, "Network connection error / timeout"
+        return RefreshResult.REFRESH_FAILED_NETWORK, "REFRESH_NETWORK_FAILED"
     if "not found" in combined or "no account" in combined or "does not exist" in combined:
-        return RefreshResult.REFRESH_FAILED_ACCOUNT_NOT_FOUND, "Account not found in AGM store"
-    return RefreshResult.REFRESH_FAILED_UNKNOWN, f"Unknown refresh failure (exit code {exit_code})"
+        return RefreshResult.REFRESH_FAILED_ACCOUNT_NOT_FOUND, "ACCOUNT_NOT_FOUND"
+    return RefreshResult.REFRESH_FAILED_UNKNOWN, f"REFRESH_FAILED_CODE_{exit_code}"
 
 
 def _execute_live_refresh_sealed(
     account: str,
     supervisor_session_id: str,
+    trusted_identity: Optional[TrustedAgmIdentity],
     timeout_sec: int = 15
 ) -> RefreshEvidence:
     """
-    Clean production live refresh execution (Round 6).
-    Performs pre/post TOCTOU hashing and mints LiveExecutionAttestation.
-    Zero test injection hooks in production path.
+    Production live refresh execution (Round 7).
+    Enforces PRE-EXECUTION binary verification through TrustedAgmRunner.
+    ZERO subprocess calls if trusted_identity is missing, malformed, or mismatched.
     """
     start_t = time.time()
-    agm_bin = find_canonical_agm_executable()
-    if not agm_bin:
+    if not is_canonical_email(account):
         end_t = time.time()
         return RefreshEvidence(
             canonical_account=account,
@@ -280,116 +263,93 @@ def _execute_live_refresh_sealed(
             started_at_epoch=start_t,
             completed_at_epoch=end_t,
             exit_code=1,
-            result=RefreshResult.REFRESH_FAILED_UNKNOWN,
+            result=RefreshResult.INVALID_ACCOUNT,
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary="AGM binary not found on PATH or search locations"
+            error_code="INVALID_ACCOUNT",
+            error_summary_private="Invalid canonical email format"
         )
 
-    sha_pre = compute_file_sha256(agm_bin)
-    if not sha_pre:
-        end_t = time.time()
+    # Invoke through shared trusted runner (handles pre-check, execution, and TOCTOU)
+    exec_res = execute_trusted_agm(
+        subcommand_args=["refresh", account],
+        trusted_identity=trusted_identity,
+        timeout_sec=timeout_sec
+    )
+
+    if not exec_res.command_executed:
+        # Pre-execution gate rejected binary before subprocess execution
+        if exec_res.error_code == RunnerErrorCode.BINARY_IDENTITY_UNCONFIGURED:
+            res_val = RefreshResult.BINARY_IDENTITY_UNCONFIGURED
+        elif exec_res.error_code == RunnerErrorCode.BINARY_IDENTITY_CONFIG_INVALID:
+            res_val = RefreshResult.BINARY_IDENTITY_CONFIG_INVALID
+        elif exec_res.error_code == RunnerErrorCode.BINARY_IDENTITY_MISMATCH:
+            res_val = RefreshResult.BINARY_IDENTITY_MISMATCH
+        elif exec_res.error_code == RunnerErrorCode.AGM_NOT_FOUND:
+            res_val = RefreshResult.AGM_NOT_FOUND
+        else:
+            res_val = RefreshResult.BINARY_IDENTITY_UNVERIFIED
+
         return RefreshEvidence(
             canonical_account=account,
-            canonical_executable_path=agm_bin,
-            binary_sha256="UNKNOWN_SHA256",
+            canonical_executable_path=exec_res.canonical_executable_path,
+            binary_sha256=exec_res.observed_sha_pre,
             source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-            argv=[agm_bin, "refresh", account],
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
-            exit_code=1,
-            result=RefreshResult.BINARY_IDENTITY_UNVERIFIED,
+            argv=[exec_res.canonical_executable_path, "refresh", account],
+            started_at_epoch=exec_res.started_at_epoch,
+            completed_at_epoch=exec_res.completed_at_epoch,
+            exit_code=exec_res.exit_code,
+            result=res_val,
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary="Could not compute pre-execution binary SHA-256"
+            error_code=exec_res.error_code.value,
+            error_summary_private=exec_res.stderr
         )
 
-    argv = [agm_bin, "refresh", account]
-
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec)
-        proc_code = proc.returncode
-        proc_out = proc.stdout
-        proc_err = proc.stderr
-        end_t = time.time()
-    except subprocess.TimeoutExpired:
-        end_t = time.time()
+    if exec_res.error_code == RunnerErrorCode.BINARY_CHANGED_DURING_EXECUTION:
         return RefreshEvidence(
             canonical_account=account,
-            canonical_executable_path=agm_bin,
-            binary_sha256=sha_pre,
-            source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-            argv=argv,
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
-            exit_code=124,
-            result=RefreshResult.REFRESH_FAILED_NETWORK,
-            supervisor_session_id=supervisor_session_id,
-            source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
-            transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary=f"Refresh timed out after {timeout_sec}s"
-        )
-    except Exception as e:
-        end_t = time.time()
-        return RefreshEvidence(
-            canonical_account=account,
-            canonical_executable_path=agm_bin,
-            binary_sha256=sha_pre,
-            source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-            argv=argv,
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
-            exit_code=1,
-            result=RefreshResult.REFRESH_FAILED_UNKNOWN,
-            supervisor_session_id=supervisor_session_id,
-            source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
-            transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary=f"Process execution error: {e}"
-        )
-
-    sha_post = compute_file_sha256(agm_bin)
-    if sha_pre != sha_post:
-        return RefreshEvidence(
-            canonical_account=account,
-            canonical_executable_path=agm_bin,
+            canonical_executable_path=exec_res.canonical_executable_path,
             binary_sha256="MUTATED_DURING_EXECUTION",
             source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-            argv=argv,
-            started_at_epoch=start_t,
-            completed_at_epoch=end_t,
+            argv=[exec_res.canonical_executable_path, "refresh", account],
+            started_at_epoch=exec_res.started_at_epoch,
+            completed_at_epoch=exec_res.completed_at_epoch,
             exit_code=1,
-            result=RefreshResult.BINARY_IDENTITY_UNVERIFIED,
+            result=RefreshResult.BINARY_CHANGED_DURING_EXECUTION,
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
-            error_summary="BINARY_CHANGED_DURING_EXECUTION: SHA-256 mutated during execution"
+            error_code="BINARY_CHANGED_DURING_EXECUTION",
+            error_summary_private=exec_res.stderr
         )
 
-    if proc_code == 0:
+    if exec_res.success:
         res_enum = RefreshResult.REFRESH_SUCCEEDED
-        summary = None
-        attestation = issue_live_execution_attestation(account, sha_pre, end_t)
+        err_code = None
+        attestation = issue_live_execution_attestation(account, exec_res.observed_sha_pre, exec_res.completed_at_epoch)
     else:
-        res_enum, summary = classify_refresh_failure(proc_out, proc_err, proc_code)
+        res_enum, err_code = classify_refresh_failure(exec_res.stdout, exec_res.stderr, exec_res.exit_code)
         attestation = None
 
     return RefreshEvidence(
         canonical_account=account,
-        canonical_executable_path=agm_bin,
-        binary_sha256=sha_pre,
+        canonical_executable_path=exec_res.canonical_executable_path,
+        binary_sha256=exec_res.observed_sha_pre,
         source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-        argv=argv,
-        started_at_epoch=start_t,
-        completed_at_epoch=end_t,
-        exit_code=proc_code,
+        argv=[exec_res.canonical_executable_path, "refresh", account],
+        started_at_epoch=exec_res.started_at_epoch,
+        completed_at_epoch=exec_res.completed_at_epoch,
+        exit_code=exec_res.exit_code,
         result=res_enum,
         supervisor_session_id=supervisor_session_id,
         source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
         transport_trust=TransportTrustClass.PROCESS_LOCAL,
         attestation=attestation,
-        error_summary=summary
+        error_code=err_code,
+        error_summary_private=exec_res.stderr if not exec_res.success else None
     )
 
 
@@ -426,7 +386,7 @@ def execute_refresh_for_test(
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             attestation=None,
-            error_summary="Mandatory supervisor session ID missing"
+            error_code="SESSION_MISSING"
         )
 
     if not is_canonical_email(account):
@@ -440,12 +400,12 @@ def execute_refresh_for_test(
             started_at_epoch=start_t,
             completed_at_epoch=end_t,
             exit_code=1,
-            result=RefreshResult.REFRESH_FAILED_ACCOUNT_NOT_FOUND,
+            result=RefreshResult.INVALID_ACCOUNT,
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             attestation=None,
-            error_summary=f"Invalid canonical email format: '{account}'"
+            error_code="INVALID_ACCOUNT"
         )
 
     if not mock_binary_sha256 or mock_binary_sha256 == "UNKNOWN_SHA256":
@@ -464,7 +424,7 @@ def execute_refresh_for_test(
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             attestation=None,
-            error_summary="Binary identity unverified"
+            error_code="BINARY_IDENTITY_UNVERIFIED"
         )
 
     argv = [mock_binary_path, "refresh", account]
@@ -474,9 +434,9 @@ def execute_refresh_for_test(
             end_t = get_time()
             if exit_code == 0:
                 res_enum = RefreshResult.REFRESH_SUCCEEDED
-                summary = None
+                err_code = None
             else:
-                res_enum, summary = classify_refresh_failure(stdout, stderr, exit_code)
+                res_enum, err_code = classify_refresh_failure(stdout, stderr, exit_code)
 
             return RefreshEvidence(
                 canonical_account=account,
@@ -492,7 +452,8 @@ def execute_refresh_for_test(
                 source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
                 transport_trust=TransportTrustClass.PROCESS_LOCAL,
                 attestation=None,
-                error_summary=summary
+                error_code=err_code,
+                error_summary_private=stderr if exit_code != 0 else None
             )
         except Exception as e:
             end_t = get_time()
@@ -510,7 +471,8 @@ def execute_refresh_for_test(
                 source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
                 transport_trust=TransportTrustClass.PROCESS_LOCAL,
                 attestation=None,
-                error_summary=f"Injected runner error: {e}"
+                error_code="RUNNER_EXCEPTION",
+                error_summary_private=str(e)
             )
 
     end_t = get_time() + 0.01
@@ -528,20 +490,21 @@ def execute_refresh_for_test(
         source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
         transport_trust=TransportTrustClass.PROCESS_LOCAL,
         attestation=None,
-        error_summary=None
+        error_code=None
     )
 
 
 def execute_safe_refresh(
     account: str,
     supervisor_session_id: str,
+    trusted_identity: Optional[TrustedAgmIdentity] = None,
     live_network: bool = False,
     timeout_sec: int = 15
 ) -> RefreshEvidence:
     """
     Production entry point for AGM quota refresh.
     If live_network is False, performs a safe dry-run (DRY_RUN origin).
-    If live_network is True, calls the sealed live refresh execution path.
+    If live_network is True, calls the sealed live refresh execution path requiring trusted_identity.
     """
     if not supervisor_session_id or not supervisor_session_id.strip():
         now_t = time.time()
@@ -559,7 +522,7 @@ def execute_safe_refresh(
             source_origin=EvidenceSourceOrigin.DRY_RUN,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             attestation=None,
-            error_summary="Mandatory supervisor session ID missing"
+            error_code="SESSION_MISSING"
         )
 
     if not is_canonical_email(account):
@@ -573,12 +536,12 @@ def execute_safe_refresh(
             started_at_epoch=now_t,
             completed_at_epoch=now_t,
             exit_code=1,
-            result=RefreshResult.REFRESH_FAILED_ACCOUNT_NOT_FOUND,
+            result=RefreshResult.INVALID_ACCOUNT,
             supervisor_session_id=supervisor_session_id,
             source_origin=EvidenceSourceOrigin.DRY_RUN,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             attestation=None,
-            error_summary=f"Invalid canonical email: '{account}'"
+            error_code="INVALID_ACCOUNT"
         )
 
     if not live_network:
@@ -598,23 +561,29 @@ def execute_safe_refresh(
             source_origin=EvidenceSourceOrigin.DRY_RUN,
             transport_trust=TransportTrustClass.PROCESS_LOCAL,
             attestation=None,
-            error_summary="Dry run mode; no network request executed"
+            error_code=None
         )
 
-    return _execute_live_refresh_sealed(account, supervisor_session_id, timeout_sec=timeout_sec)
+    return _execute_live_refresh_sealed(account, supervisor_session_id, trusted_identity=trusted_identity, timeout_sec=timeout_sec)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Safely execute AGM quota refresh with typed provenance.")
     parser.add_argument("account", help="Canonical email of account to refresh")
     parser.add_argument("--session-id", required=True, help="Mandatory supervisor session ID")
+    parser.add_argument("--expected-binary-sha256", help="Mandatory expected AGM binary SHA-256 for live mode")
     parser.add_argument("--live", action="store_true", help="Execute live network refresh against AGM")
     parser.add_argument("--private-diagnostic-mode", action="store_true", help="Include raw email and internal provenance")
     args = parser.parse_args()
 
+    trusted_id = None
+    if args.expected_binary_sha256:
+        trusted_id = TrustedAgmIdentity(expected_binary_sha256=args.expected_binary_sha256)
+
     evidence = execute_safe_refresh(
         args.account,
         args.session_id,
+        trusted_identity=trusted_id,
         live_network=args.live
     )
     if args.private_diagnostic_mode:
@@ -622,7 +591,18 @@ def main():
     else:
         print(json.dumps(asdict(evidence.to_sanitized_dto()), indent=2))
 
-    sys.exit(0 if evidence.result == RefreshResult.REFRESH_SUCCEEDED else (3 if evidence.result == RefreshResult.DRY_RUN else 1))
+    if evidence.result == RefreshResult.REFRESH_SUCCEEDED:
+        sys.exit(0)
+    elif evidence.result == RefreshResult.DRY_RUN:
+        sys.exit(3)
+    elif evidence.result in (
+        RefreshResult.BINARY_IDENTITY_UNCONFIGURED,
+        RefreshResult.BINARY_IDENTITY_CONFIG_INVALID,
+        RefreshResult.BINARY_IDENTITY_MISMATCH
+    ):
+        sys.exit(4)  # Explicit trust failure exit code
+    else:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

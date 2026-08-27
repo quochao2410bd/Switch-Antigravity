@@ -2,21 +2,20 @@
 """
 inspect_quota.py
 
-Safe read-only parser and normalizer for AGM quota output (Round 6 Architecture).
+Safe read-only parser and normalizer for AGM quota output (Round 7 Architecture).
 
 Key Architectural Trust Improvements:
-1. Mandatory Independent Expected Binary SHA-256 (Critical Item 1 & 2):
-   - Supervisor validation strictly REQUIRES a valid 64-hex expected_binary_sha256.
-   - Missing hash -> BINARY_IDENTITY_UNCONFIGURED -> STALE_CACHED.
-   - Malformed hash -> BINARY_IDENTITY_CONFIG_INVALID -> STALE_CACHED.
-   - Mismatched hash -> BINARY_IDENTITY_MISMATCH -> STALE_CACHED.
-2. Complete Parser Path Threading with TrustedAgmIdentity (Critical Item 2):
-   - parse_agm_list() and parse_agm_info() accept TrustedAgmIdentity.
-   - If trusted identity is missing or unconfigured, evidence fails closed and account is NOT eligible.
-3. Separation of Internal Canonical Email and Safe Public Reference (Item 7 & 11):
-   - AccountQuotaSummary contains canonical_account (internal) and account_ref (pseudonymous).
-   - SanitizedAccountQuotaDTO exposes ONLY account_ref in default logs/DTOs.
-4. Process-Local TCB Model (Item 3 & 4):
+1. Structural TrustedAgmIdentity Requirement (Item 5):
+   - Supervisor-facing functions strictly accept `trusted_identity: Optional[TrustedAgmIdentity]`.
+   - Raw expected_binary_sha256 strings across callers are removed in favor of typed configuration.
+2. Sanitized Warning Codes (Critical Item 7):
+   - `SanitizedAccountQuotaDTO.sanitized_warnings` exposes ONLY normalized codes (e.g. `ACCOUNT_MISMATCH`,
+     `BINARY_IDENTITY_UNCONFIGURED`, `BINARY_IDENTITY_MISMATCH`, `EVIDENCE_EXPIRED`).
+   - Free-text warning strings containing emails or exceptions are strictly isolated to private diagnostics.
+3. Trusted CLI Execution (Critical Item 4):
+   - Live `agm list` execution fallback uses `execute_trusted_agm()` through TrustedAgmRunner.
+   - Missing or unconfigured binary identity fails closed (`BINARY_IDENTITY_UNCONFIGURED`) without running PATH binary.
+4. Process-Local TCB Model (Items 3 & 4):
    - Supervisor process is the trusted TCB; attestation protects against accidental module misuse.
 """
 
@@ -26,7 +25,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -46,6 +44,11 @@ from refresh_quota_safe import (
     verify_evidence_signature,
     verify_live_execution_attestation,
 )
+from trusted_agm_runner import (
+    RunnerErrorCode,
+    TrustedAgmIdentity,
+    execute_trusted_agm,
+)
 
 
 class FreshnessState(str, Enum):
@@ -60,12 +63,32 @@ class FormatSupportState(str, Enum):
     FORMAT_UNSUPPORTED = "FORMAT_UNSUPPORTED"
 
 
-@dataclass
-class TrustedAgmIdentity:
-    """Trusted administrative identity configuration for AGM executable (Item 2)."""
-    expected_binary_sha256: str
-    canonical_executable_path: Optional[str] = None
-    inspected_source_revision: str = INSPECTED_AGM_SOURCE_REVISION
+class WarningCode(str, Enum):
+    NO_EVIDENCE_PROVIDED = "NO_EVIDENCE_PROVIDED"
+    UNTRUSTED_DESERIALIZED_EVIDENCE = "UNTRUSTED_DESERIALIZED_EVIDENCE"
+    SYNTHETIC_TEST_REJECTED = "SYNTHETIC_TEST_REJECTED"
+    DRY_RUN_EVIDENCE = "DRY_RUN_EVIDENCE"
+    MISSING_ATTESTATION = "MISSING_ATTESTATION"
+    ACCOUNT_NON_CANONICAL = "ACCOUNT_NON_CANONICAL"
+    ACCOUNT_MISMATCH = "ACCOUNT_MISMATCH"
+    ARGV_MISMATCH = "ARGV_MISMATCH"
+    BINARY_IDENTITY_UNCONFIGURED = "BINARY_IDENTITY_UNCONFIGURED"
+    BINARY_IDENTITY_CONFIG_INVALID = "BINARY_IDENTITY_CONFIG_INVALID"
+    BINARY_IDENTITY_MISMATCH = "BINARY_IDENTITY_MISMATCH"
+    BINARY_IDENTITY_UNVERIFIED = "BINARY_IDENTITY_UNVERIFIED"
+    SOURCE_REVISION_MISMATCH = "SOURCE_REVISION_MISMATCH"
+    SESSION_MISMATCH = "SESSION_MISMATCH"
+    SESSION_UNCONFIGURED = "SESSION_UNCONFIGURED"
+    REFRESH_NON_ZERO_EXIT = "REFRESH_NON_ZERO_EXIT"
+    CONTRADICTORY_EVIDENCE = "CONTRADICTORY_EVIDENCE"
+    NON_MONOTONIC_TIMESTAMPS = "NON_MONOTONIC_TIMESTAMPS"
+    INSANE_DURATION = "INSANE_DURATION"
+    FUTURE_CLOCK_SKEW = "FUTURE_CLOCK_SKEW"
+    EVIDENCE_EXPIRED = "EVIDENCE_EXPIRED"
+    RAW_UNVALIDATED_TIMESTAMP = "RAW_UNVALIDATED_TIMESTAMP"
+    FORMAT_UNSUPPORTED = "FORMAT_UNSUPPORTED"
+    MALFORMED_SCORE = "MALFORMED_SCORE"
+    RESEARCH_FALLBACK_PARSED = "RESEARCH_FALLBACK_PARSED"
 
 
 @dataclass
@@ -79,7 +102,7 @@ class ModelQuotaDetail:
 
 @dataclass
 class SanitizedAccountQuotaDTO:
-    """Safe supervisor DTO exposing ONLY pseudonymous account_ref (Item 7 & 11)."""
+    """Safe supervisor DTO exposing ONLY pseudonymous account_ref and normalized warning codes (Critical Item 7)."""
     account_ref: str
     status_tags: List[str]
     is_active_cli: bool
@@ -94,7 +117,7 @@ class SanitizedAccountQuotaDTO:
     freshness_state: str
     format_support: str
     source: str
-    parse_warnings: List[str]
+    sanitized_warnings: List[str]  # Normalized codes ONLY! No raw emails or exception strings!
     eligible: bool
 
 
@@ -116,7 +139,8 @@ class AccountQuotaSummary:
     freshness_state: FreshnessState
     format_support: FormatSupportState
     source: str
-    parse_warnings: List[str]
+    warning_codes: List[WarningCode]
+    parse_warnings_private: List[str]  # Diagnostic only
     eligible: bool
 
     def to_sanitized_dto(self) -> SanitizedAccountQuotaDTO:
@@ -136,7 +160,7 @@ class AccountQuotaSummary:
             freshness_state=self.freshness_state.value,
             format_support=self.format_support.value,
             source=self.source,
-            parse_warnings=self.parse_warnings,
+            sanitized_warnings=[c.value for c in self.warning_codes],
             eligible=self.eligible
         )
 
@@ -162,12 +186,13 @@ def parse_percentage_field(val: str) -> Optional[int]:
 def deserialize_evidence_payload(
     payload: dict,
     session_secret: Optional[str] = None
-) -> Tuple[Optional[RefreshEvidence], List[str]]:
+) -> Tuple[Optional[RefreshEvidence], List[WarningCode], List[str]]:
     """
     Safely deserializes a JSON/dict payload.
     All deserialized payloads are initialized as UNTRUSTED_DESERIALIZED regardless of fields.
     """
-    warnings: List[str] = []
+    codes: List[WarningCode] = []
+    diag: List[str] = []
     try:
         res_val = payload.get("result")
         res_enum = RefreshResult(res_val) if isinstance(res_val, str) else res_val
@@ -189,18 +214,20 @@ def deserialize_evidence_payload(
             transport_trust=TransportTrustClass.UNTRUSTED_DESERIALIZED,  # Forced untrusted!
             attestation=None,
             hmac_signature=payload.get("hmac_signature"),
-            error_summary=payload.get("error_summary")
+            error_code=payload.get("error_code")
         )
 
         if session_secret and evidence.hmac_signature:
             if verify_evidence_signature(evidence, session_secret):
                 evidence.transport_trust = TransportTrustClass.SIGNED_DESERIALIZED
             else:
-                warnings.append("HMAC signature verification failed for serialized evidence")
-        return evidence, warnings
+                codes.append(WarningCode.UNTRUSTED_DESERIALIZED_EVIDENCE)
+                diag.append("HMAC signature verification failed for serialized evidence")
+        return evidence, codes, diag
     except Exception as e:
-        warnings.append(f"Malformed serialized evidence dict: {e}")
-        return None, warnings
+        codes.append(WarningCode.UNTRUSTED_DESERIALIZED_EVIDENCE)
+        diag.append(f"Malformed serialized evidence dict: {e}")
+        return None, codes, diag
 
 
 def _validate_refresh_evidence_internal(
@@ -208,57 +235,59 @@ def _validate_refresh_evidence_internal(
     canonical_account: str,
     now_epoch: float,
     expected_session_id: str,
-    expected_binary_sha256: Optional[str] = None,
+    trusted_identity: Optional[TrustedAgmIdentity] = None,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
     session_secret: Optional[str] = None,
     allow_synthetic_test: bool = False
-) -> Tuple[FreshnessState, Optional[float], List[str]]:
-    warnings: List[str] = []
+) -> Tuple[FreshnessState, Optional[float], List[WarningCode], List[str]]:
+    codes: List[WarningCode] = []
+    diag: List[str] = []
+
     if evidence is None:
-        return FreshnessState.STALE_CACHED, None, ["No refresh evidence provided; treating cached quota as STALE_CACHED"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.NO_EVIDENCE_PROVIDED], ["No refresh evidence provided; STALE_CACHED"]
 
     if isinstance(evidence, dict):
-        ev_obj, deser_warn = deserialize_evidence_payload(evidence, session_secret=session_secret)
-        warnings.extend(deser_warn)
+        ev_obj, deser_codes, deser_diag = deserialize_evidence_payload(evidence, session_secret=session_secret)
+        codes.extend(deser_codes)
+        diag.extend(deser_diag)
         if ev_obj is None:
-            return FreshnessState.STALE_CACHED, None, ["Failed to deserialize evidence dict"]
+            return FreshnessState.STALE_CACHED, None, codes, diag
         evidence = ev_obj
 
-    # 1. Transport Trust Check (Critical Item 1)
+    # 1. Transport Trust Check
     if evidence.transport_trust == TransportTrustClass.UNTRUSTED_DESERIALIZED:
-        return FreshnessState.STALE_CACHED, None, [
-            "Untrusted deserialized evidence without verified HMAC signature is rejected in supervisor mode"
+        return FreshnessState.STALE_CACHED, None, [WarningCode.UNTRUSTED_DESERIALIZED_EVIDENCE], [
+            "Untrusted deserialized evidence without verified HMAC signature rejected"
         ]
 
-    # 2. Source Origin & Attestation Check (Critical Item 2, 3, 4)
+    # 2. Source Origin & Attestation Check
     if evidence.source_origin == EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE:
         if not allow_synthetic_test:
-            return FreshnessState.STALE_CACHED, None, [
+            return FreshnessState.STALE_CACHED, None, [WarningCode.SYNTHETIC_TEST_REJECTED], [
                 "Synthetic test evidence is strictly forbidden from establishing production PROVEN_FRESH status"
             ]
-        warnings.append("Validated under explicit test mode")
     elif evidence.source_origin == EvidenceSourceOrigin.DRY_RUN:
-        return FreshnessState.STALE_CACHED, None, ["Dry-run evidence cannot establish freshness"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.DRY_RUN_EVIDENCE], ["Dry-run evidence cannot establish freshness"]
     elif evidence.source_origin == EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION:
         # Process-Local Attestation Verification (TCB misuse guard)
         if evidence.transport_trust == TransportTrustClass.PROCESS_LOCAL:
             if not verify_live_execution_attestation(evidence.attestation, canonical_account, evidence.binary_sha256):
-                return FreshnessState.STALE_CACHED, None, [
-                    "Process-local live evidence lacks valid sealed executor attestation capability; untrusted local construction"
+                return FreshnessState.STALE_CACHED, None, [WarningCode.MISSING_ATTESTATION], [
+                    "Process-local live evidence lacks valid sealed executor attestation capability"
                 ]
     else:
-        return FreshnessState.STALE_CACHED, None, [f"Unknown evidence source origin: '{evidence.source_origin}'"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.UNTRUSTED_DESERIALIZED_EVIDENCE], ["Unknown evidence origin"]
 
-    # 3. Canonical Account Exact Match (RFC 5322)
+    # 3. Canonical Account Exact Match
     if not is_canonical_email(evidence.canonical_account):
-        return FreshnessState.STALE_CACHED, None, [f"Refresh evidence account '{evidence.canonical_account}' is non-canonical"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.ACCOUNT_NON_CANONICAL], [f"Refresh evidence account is non-canonical"]
     if evidence.canonical_account.lower() != canonical_account.lower():
-        return FreshnessState.STALE_CACHED, None, [
+        return FreshnessState.STALE_CACHED, None, [WarningCode.ACCOUNT_MISMATCH], [
             f"Refresh evidence account mismatch (expected '{canonical_account}', got '{evidence.canonical_account}')"
         ]
 
-    # 4. Exact Argv Equality Check (Item 3 - No Suffix Matching!)
+    # 4. Exact Argv Equality Check
     expected_argv = [evidence.canonical_executable_path, "refresh", evidence.canonical_account]
     if (
         len(evidence.argv) != 3
@@ -266,76 +295,77 @@ def _validate_refresh_evidence_internal(
         or evidence.argv[1] != "refresh"
         or evidence.argv[2].lower() != canonical_account.lower()
     ):
-        return FreshnessState.STALE_CACHED, None, [
+        return FreshnessState.STALE_CACHED, None, [WarningCode.ARGV_MISMATCH], [
             f"Exact argv mismatch (expected {expected_argv}, got {evidence.argv})"
         ]
 
-    # 5. Mandatory Independent Expected Binary Identity Binding (Critical Item 1 & 2)
-    if not expected_binary_sha256 or not expected_binary_sha256.strip():
-        return FreshnessState.STALE_CACHED, None, [
-            "BINARY_IDENTITY_UNCONFIGURED: Missing mandatory expected AGM binary SHA-256 configuration; failing closed"
+    # 5. Mandatory Independent Expected Binary Identity Binding (Critical Items 1 & 5)
+    if not trusted_identity or not trusted_identity.expected_binary_sha256 or not trusted_identity.expected_binary_sha256.strip():
+        return FreshnessState.STALE_CACHED, None, [WarningCode.BINARY_IDENTITY_UNCONFIGURED], [
+            "BINARY_IDENTITY_UNCONFIGURED: Missing mandatory expected AGM binary SHA-256 configuration"
         ]
-    expected_sha_clean = expected_binary_sha256.strip()
-    if not re.match(r"^[0-9a-fA-F]{64}$", expected_sha_clean):
-        return FreshnessState.STALE_CACHED, None, [
-            f"BINARY_IDENTITY_CONFIG_INVALID: Expected AGM binary SHA-256 '{expected_binary_sha256}' is not a valid 64-hex string"
+
+    expected_sha_clean = trusted_identity.expected_binary_sha256.strip().lower()
+    if not re.match(r"^[0-9a-f]{64}$", expected_sha_clean):
+        return FreshnessState.STALE_CACHED, None, [WarningCode.BINARY_IDENTITY_CONFIG_INVALID], [
+            f"BINARY_IDENTITY_CONFIG_INVALID: Expected AGM binary SHA-256 is not a valid 64-hex string"
         ]
 
     if not evidence.canonical_executable_path or evidence.canonical_executable_path == "none":
-        return FreshnessState.STALE_CACHED, None, ["Refresh evidence lacks valid canonical executable path"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.BINARY_IDENTITY_UNVERIFIED], ["Refresh evidence lacks valid executable path"]
     if not evidence.binary_sha256 or evidence.binary_sha256 == "UNKNOWN_SHA256":
-        return FreshnessState.STALE_CACHED, None, ["AGM binary SHA-256 identity is unverified; fail closed"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.BINARY_IDENTITY_UNVERIFIED], ["AGM binary SHA-256 identity is unverified"]
     if evidence.source_revision_inspected != INSPECTED_AGM_SOURCE_REVISION:
-        return FreshnessState.STALE_CACHED, None, [
+        return FreshnessState.STALE_CACHED, None, [WarningCode.SOURCE_REVISION_MISMATCH], [
             f"AGM source revision mismatch (expected '{INSPECTED_AGM_SOURCE_REVISION}', got '{evidence.source_revision_inspected}')"
         ]
-    if evidence.binary_sha256.lower() != expected_sha_clean.lower():
-        return FreshnessState.STALE_CACHED, None, [
-            f"BINARY_IDENTITY_MISMATCH: Observed binary SHA-256 '{evidence.binary_sha256}' does not match expected '{expected_sha_clean}'"
+    if evidence.binary_sha256.lower() != expected_sha_clean:
+        return FreshnessState.STALE_CACHED, None, [WarningCode.BINARY_IDENTITY_MISMATCH], [
+            f"BINARY_IDENTITY_MISMATCH: Observed binary SHA-256 does not match expected identity"
         ]
 
     # 6. Mandatory Session ID Check
     if not expected_session_id or not expected_session_id.strip():
-        return FreshnessState.STALE_CACHED, None, ["Mandatory supervisor expected_session_id was omitted in validation"]
+        return FreshnessState.STALE_CACHED, None, [WarningCode.SESSION_UNCONFIGURED], ["Mandatory supervisor expected_session_id missing"]
     if evidence.supervisor_session_id != expected_session_id:
-        return FreshnessState.STALE_CACHED, None, [
+        return FreshnessState.STALE_CACHED, None, [WarningCode.SESSION_MISMATCH], [
             f"Session ID mismatch (expected '{expected_session_id}', got '{evidence.supervisor_session_id}')"
         ]
 
     # 7. Result & Exit Code Consistency
     if evidence.result != RefreshResult.REFRESH_SUCCEEDED:
-        return FreshnessState.REFRESH_FAILED, None, [
-            f"Refresh failed with status {evidence.result.value}: {evidence.error_summary or 'non-zero exit'}"
+        return FreshnessState.REFRESH_FAILED, None, [WarningCode.REFRESH_NON_ZERO_EXIT], [
+            f"Refresh failed with status {evidence.result.value}"
         ]
     if evidence.exit_code != 0:
-        return FreshnessState.REFRESH_FAILED, None, [
-            f"Contradictory evidence: status is REFRESH_SUCCEEDED but exit_code is {evidence.exit_code}; fail closed"
+        return FreshnessState.REFRESH_FAILED, None, [WarningCode.CONTRADICTORY_EVIDENCE], [
+            f"Contradictory evidence: status is REFRESH_SUCCEEDED but exit_code is {evidence.exit_code}"
         ]
 
     # 8. Monotonic Timestamps & Sane Duration
     if evidence.started_at_epoch > evidence.completed_at_epoch:
-        return FreshnessState.STALE_CACHED, None, [
-            f"Invalid timestamp monotonicity: started ({evidence.started_at_epoch}) > completed ({evidence.completed_at_epoch})"
+        return FreshnessState.STALE_CACHED, None, [WarningCode.NON_MONOTONIC_TIMESTAMPS], [
+            f"Invalid timestamp monotonicity: started > completed"
         ]
     duration = evidence.completed_at_epoch - evidence.started_at_epoch
     if duration > 60.0 or duration < 0.0:
-        return FreshnessState.STALE_CACHED, None, [
-            f"Insane execution duration: {duration:.2f}s (must be between 0.0s and 60.0s)"
+        return FreshnessState.STALE_CACHED, None, [WarningCode.INSANE_DURATION], [
+            f"Insane execution duration: {duration:.2f}s"
         ]
 
     # 9. Clock Skew Ceiling & Freshness Expiration
     future_skew = evidence.completed_at_epoch - now_epoch
     if future_skew > allowed_clock_skew_sec:
-        return FreshnessState.STALE_CACHED, None, [
-            f"Refresh completed_at is in the future by {future_skew:.2f}s (> allowed skew {allowed_clock_skew_sec}s); rejected"
+        return FreshnessState.STALE_CACHED, None, [WarningCode.FUTURE_CLOCK_SKEW], [
+            f"Refresh completed_at is in the future by {future_skew:.2f}s"
         ]
     age = now_epoch - evidence.completed_at_epoch
     if age > max_freshness_age_sec:
-        return FreshnessState.STALE_CACHED, evidence.completed_at_epoch, [
+        return FreshnessState.STALE_CACHED, evidence.completed_at_epoch, [WarningCode.EVIDENCE_EXPIRED], [
             f"Refresh evidence expired ({age:.1f}s > max {max_freshness_age_sec:.1f}s)"
         ]
 
-    return FreshnessState.PROVEN_FRESH, evidence.completed_at_epoch, warnings
+    return FreshnessState.PROVEN_FRESH, evidence.completed_at_epoch, codes, diag
 
 
 def validate_refresh_evidence_supervisor(
@@ -343,21 +373,21 @@ def validate_refresh_evidence_supervisor(
     canonical_account: str,
     now_epoch: float,
     expected_session_id: str,
-    expected_binary_sha256: Optional[str] = None,
+    trusted_identity: Optional[TrustedAgmIdentity] = None,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
     session_secret: Optional[str] = None
-) -> Tuple[FreshnessState, Optional[float], List[str]]:
+) -> Tuple[FreshnessState, Optional[float], List[WarningCode], List[str]]:
     """
-    Production supervisor validation entry point.
-    Requires mandatory expected_binary_sha256. NO TEST-WEAKENING FLAGS EXPOSED.
+    Production supervisor validation entry point (Item 5).
+    Requires structured TrustedAgmIdentity. NO TEST-WEAKENING FLAGS EXPOSED.
     """
     return _validate_refresh_evidence_internal(
         evidence=evidence,
         canonical_account=canonical_account,
         now_epoch=now_epoch,
         expected_session_id=expected_session_id,
-        expected_binary_sha256=expected_binary_sha256,
+        trusted_identity=trusted_identity,
         max_freshness_age_sec=max_freshness_age_sec,
         allowed_clock_skew_sec=allowed_clock_skew_sec,
         session_secret=session_secret,
@@ -370,18 +400,18 @@ def _validate_refresh_evidence_for_test(
     canonical_account: str,
     now_epoch: float,
     expected_session_id: str,
-    expected_binary_sha256: Optional[str] = None,
+    trusted_identity: Optional[TrustedAgmIdentity] = None,
     max_freshness_age_sec: float = 300.0,
     allowed_clock_skew_sec: float = 2.0,
     session_secret: Optional[str] = None
-) -> Tuple[FreshnessState, Optional[float], List[str]]:
+) -> Tuple[FreshnessState, Optional[float], List[WarningCode], List[str]]:
     """Test-only validation harness."""
     return _validate_refresh_evidence_internal(
         evidence=evidence,
         canonical_account=canonical_account,
         now_epoch=now_epoch,
         expected_session_id=expected_session_id,
-        expected_binary_sha256=expected_binary_sha256,
+        trusted_identity=trusted_identity,
         max_freshness_age_sec=max_freshness_age_sec,
         allowed_clock_skew_sec=allowed_clock_skew_sec,
         session_secret=session_secret,
@@ -397,18 +427,16 @@ def parse_agm_list(
     source_label: str = "AGM_CLI_LIST",
     supervisor_session_id: Optional[str] = None,
     trusted_identity: Optional[TrustedAgmIdentity] = None,
-    expected_binary_sha256: Optional[str] = None,
     session_secret: Optional[str] = None,
     lenient_parser: bool = False,
     now_epoch: Optional[float] = None,
     _test_mode_allow_synthetic: bool = False
 ) -> List[AccountQuotaSummary]:
     """
-    Parses `agm list` output with strict table header validation and trusted binary identity binding.
+    Parses `agm list` output with strict table header validation and trusted binary identity binding (Item 5).
     """
     now = now_epoch if now_epoch is not None else time.time()
     ev_map = refresh_evidence_map or {}
-    expected_sha = (trusted_identity.expected_binary_sha256 if trusted_identity else expected_binary_sha256)
 
     lines = text.strip().splitlines()
     if not lines or any("No accounts yet" in line for line in lines):
@@ -451,7 +479,8 @@ def parse_agm_list(
                 freshness_state=FreshnessState.UNKNOWN_UNFETCHED,
                 format_support=FormatSupportState.FORMAT_UNSUPPORTED,
                 source=source_label,
-                parse_warnings=["AGM output header does not match expected supported schema. Fail closed."],
+                warning_codes=[WarningCode.FORMAT_UNSUPPORTED],
+                parse_warnings_private=["AGM output header does not match expected supported schema. Fail closed."],
                 eligible=False
             )
         ]
@@ -461,7 +490,9 @@ def parse_agm_list(
         if not line_clean or ("EMAIL" in line and "STATUS" in line) or line_clean.startswith("---") or line_clean.startswith("==="):
             continue
 
-        warnings: List[str] = []
+        codes: List[WarningCode] = []
+        diag: List[str] = []
+
         if col_bounds:
             e_idx, s_idx, gp_idx, gf_idx, cl_idx = col_bounds
             email_part = line[e_idx:s_idx].strip() if len(line) > s_idx else line.strip()
@@ -478,7 +509,8 @@ def parse_agm_list(
             gp_part = tokens[2] if len(tokens) > 2 else ""
             gf_part = tokens[3] if len(tokens) > 3 else ""
             cl_part = tokens[4] if len(tokens) > 4 else ""
-            warnings.append("Parsed using research-lenient fallback tokenization")
+            codes.append(WarningCode.RESEARCH_FALLBACK_PARSED)
+            diag.append("Parsed using research-lenient fallback tokenization")
         else:
             continue
 
@@ -493,28 +525,33 @@ def parse_agm_list(
         cl_val = parse_percentage_field(cl_part)
 
         if gp_part and gp_part != "-" and gp_val is None:
-            warnings.append(f"Malformed GEM-PRO quota string: '{gp_part}'")
+            codes.append(WarningCode.MALFORMED_SCORE)
+            diag.append(f"Malformed GEM-PRO quota string: '{gp_part}'")
         if gf_part and gf_part != "-" and gf_val is None:
-            warnings.append(f"Malformed GEM-FLASH quota string: '{gf_part}'")
+            codes.append(WarningCode.MALFORMED_SCORE)
+            diag.append(f"Malformed GEM-FLASH quota string: '{gf_part}'")
         if cl_part and cl_part != "-" and cl_val is None:
-            warnings.append(f"Malformed CLAUDE quota string: '{cl_part}'")
+            codes.append(WarningCode.MALFORMED_SCORE)
+            diag.append(f"Malformed CLAUDE quota string: '{cl_part}'")
 
         if raw_unvalidated_timestamps and email_part in raw_unvalidated_timestamps:
-            warnings.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
+            codes.append(WarningCode.RAW_UNVALIDATED_TIMESTAMP)
+            diag.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
             freshness = FreshnessState.STALE_CACHED
             ref_confirmed_at = None
         elif email_part in ev_map:
             val_func = _validate_refresh_evidence_for_test if _test_mode_allow_synthetic else validate_refresh_evidence_supervisor
-            freshness, ref_confirmed_at, ev_warn = val_func(
+            freshness, ref_confirmed_at, ev_codes, ev_diag = val_func(
                 ev_map[email_part],
                 canonical_account=email_part,
                 now_epoch=now,
                 expected_session_id=supervisor_session_id or "",
-                expected_binary_sha256=expected_sha,
+                trusted_identity=trusted_identity,
                 max_freshness_age_sec=max_freshness_age_sec,
                 session_secret=session_secret
             )
-            warnings.extend(ev_warn)
+            codes.extend(ev_codes)
+            diag.extend(ev_diag)
         elif all(v is None for v in [gp_val, gf_val, cl_val]):
             freshness = FreshnessState.UNKNOWN_UNFETCHED
             ref_confirmed_at = None
@@ -550,7 +587,8 @@ def parse_agm_list(
             freshness_state=freshness,
             format_support=format_state,
             source=source_label,
-            parse_warnings=warnings,
+            warning_codes=codes,
+            parse_warnings_private=diag,
             eligible=eligible
         ))
 
@@ -565,17 +603,14 @@ def parse_agm_info(
     source_label: str = "AGM_CLI_INFO",
     supervisor_session_id: Optional[str] = None,
     trusted_identity: Optional[TrustedAgmIdentity] = None,
-    expected_binary_sha256: Optional[str] = None,
     session_secret: Optional[str] = None,
     now_epoch: Optional[float] = None,
     _test_mode_allow_synthetic: bool = False
 ) -> Optional[AccountQuotaSummary]:
     """
-    Parses `agm info <email>` output with STRICT table header verification (Item 6).
-    Enforces exact column order: PROVIDER, MODEL, SCORE, RESET and trusted binary binding.
+    Parses `agm info <email>` output with strict table header verification and trusted identity (Item 5).
     """
     now = now_epoch if now_epoch is not None else time.time()
-    expected_sha = (trusted_identity.expected_binary_sha256 if trusted_identity else expected_binary_sha256)
     lines = text.strip().splitlines()
     if not lines:
         return None
@@ -583,7 +618,8 @@ def parse_agm_info(
     email = ""
     is_expired = False
     models: Dict[str, ModelQuotaDetail] = {}
-    warnings: List[str] = []
+    codes: List[WarningCode] = []
+    diag: List[str] = []
     in_table = False
     header_found = False
     earliest_reset = None
@@ -596,14 +632,15 @@ def parse_agm_info(
             if "(expired)" in line_clean:
                 is_expired = True
         elif "No quota data" in line_clean:
-            warnings.append("No quota data recorded in store")
+            diag.append("No quota data recorded in store")
         elif "PROVIDER" in line:
             tokens = line_clean.split()
             if tokens == ["PROVIDER", "MODEL", "SCORE", "RESET"]:
                 header_found = True
                 in_table = True
             else:
-                warnings.append(f"Info table header deviation: expected ['PROVIDER', 'MODEL', 'SCORE', 'RESET'], got {tokens}")
+                codes.append(WarningCode.FORMAT_UNSUPPORTED)
+                diag.append(f"Info table header deviation: expected ['PROVIDER', 'MODEL', 'SCORE', 'RESET'], got {tokens}")
             continue
         elif line_clean.startswith("---") or line_clean.startswith("==="):
             continue
@@ -618,7 +655,8 @@ def parse_agm_info(
                     earliest_reset = reset_str
                 pct = parse_percentage_field(score_str)
                 if pct is None and score_str != "-":
-                    warnings.append(f"Malformed score for model {model}: '{score_str}'")
+                    codes.append(WarningCode.MALFORMED_SCORE)
+                    diag.append(f"Malformed score for model {model}: '{score_str}'")
 
                 models[model] = ModelQuotaDetail(
                     model_name=model,
@@ -628,31 +666,35 @@ def parse_agm_info(
                     freshness_state=FreshnessState.STALE_CACHED
                 )
             else:
-                warnings.append(f"Info row column count mismatch: '{line_clean}'")
+                codes.append(WarningCode.FORMAT_UNSUPPORTED)
+                diag.append(f"Info row column count mismatch: '{line_clean}'")
 
     if not email:
         return None
 
     format_state = FormatSupportState.FORMAT_SUPPORTED if header_found else FormatSupportState.FORMAT_UNSUPPORTED
     if not header_found:
-        warnings.append("AGM info output missing or deviated from expected table header schema; fail closed")
+        codes.append(WarningCode.FORMAT_UNSUPPORTED)
+        diag.append("AGM info output missing or deviated from expected table header schema; fail closed")
 
     if raw_unvalidated_timestamp is not None:
-        warnings.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
+        codes.append(WarningCode.RAW_UNVALIDATED_TIMESTAMP)
+        diag.append("Raw unvalidated timestamp provided without RefreshEvidence; rejected as STALE_CACHED")
         freshness = FreshnessState.STALE_CACHED
         ref_confirmed_at = None
     elif refresh_evidence is not None:
         val_func = _validate_refresh_evidence_for_test if _test_mode_allow_synthetic else validate_refresh_evidence_supervisor
-        freshness, ref_confirmed_at, ev_warn = val_func(
+        freshness, ref_confirmed_at, ev_codes, ev_diag = val_func(
             refresh_evidence,
             canonical_account=email,
             now_epoch=now,
             expected_session_id=supervisor_session_id or "",
-            expected_binary_sha256=expected_sha,
+            trusted_identity=trusted_identity,
             max_freshness_age_sec=max_freshness_age_sec,
             session_secret=session_secret
         )
-        warnings.extend(ev_warn)
+        codes.extend(ev_codes)
+        diag.extend(ev_diag)
     elif len(models) == 0:
         freshness = FreshnessState.UNKNOWN_UNFETCHED
         ref_confirmed_at = None
@@ -695,7 +737,8 @@ def parse_agm_info(
         freshness_state=freshness,
         format_support=format_state,
         source=source_label,
-        parse_warnings=warnings,
+        warning_codes=codes,
+        parse_warnings_private=diag,
         eligible=eligible
     )
 
@@ -720,6 +763,10 @@ def main():
             print(f"Error parsing provenance JSON: {e}", file=sys.stderr)
             sys.exit(1)
 
+    trusted_id = None
+    if args.expected_binary_sha256:
+        trusted_id = TrustedAgmIdentity(expected_binary_sha256=args.expected_binary_sha256)
+
     if args.file:
         with open(args.file, "r", encoding="utf-8") as f:
             content = f.read()
@@ -727,12 +774,16 @@ def main():
         if not sys.stdin.isatty():
             content = sys.stdin.read()
         else:
-            try:
-                res = subprocess.run(["agm", "list"], capture_output=True, text=True, check=True)
-                content = res.stdout
-            except Exception as e:
-                print(f"Error executing agm list: {e}", file=sys.stderr)
-                sys.exit(1)
+            # Critical Item 4: Use TrustedAgmRunner for CLI fallback; do NOT run bare PATH binary!
+            exec_res = execute_trusted_agm(["list"], trusted_identity=trusted_id)
+            if not exec_res.success:
+                print(f"Error executing trusted agm list: {exec_res.error_code.value} - {exec_res.stderr}", file=sys.stderr)
+                sys.exit(4 if exec_res.error_code in (
+                    RunnerErrorCode.BINARY_IDENTITY_UNCONFIGURED,
+                    RunnerErrorCode.BINARY_IDENTITY_CONFIG_INVALID,
+                    RunnerErrorCode.BINARY_IDENTITY_MISMATCH
+                ) else 1)
+            content = exec_res.stdout
 
     mode = args.mode
     if mode == "auto":
@@ -747,7 +798,7 @@ def main():
             content,
             refresh_evidence=first_ev,
             supervisor_session_id=args.session_id,
-            expected_binary_sha256=args.expected_binary_sha256,
+            trusted_identity=trusted_id,
             session_secret=session_secret
         )
         if res:
@@ -759,7 +810,7 @@ def main():
             content,
             refresh_evidence_map=ev_map,
             supervisor_session_id=args.session_id,
-            expected_binary_sha256=args.expected_binary_sha256,
+            trusted_identity=trusted_id,
             session_secret=session_secret,
             lenient_parser=args.research_lenient_parser
         )

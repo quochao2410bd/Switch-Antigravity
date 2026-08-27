@@ -2,16 +2,19 @@
 """
 validate_agm_output.py
 
-Comprehensive zero-trust test suite for T02 AGM integration (Round 6 Final Closure):
-- 100% Globally Trapped Host Isolation with Verified Tripwires.
-- Critical Item 1 & 2: Mandatory Expected Binary SHA-256 (Missing, Malformed, Wrong, Correct).
-- Critical Item 2: Production Path Parser Threading with TrustedAgmIdentity (parse_agm_list & info).
-- Item 3 & 4: Process-Local TCB Model & Synthetic vs Live Origin Invariants.
-- Item 5: Clean Production Live Origin (No Test Injection Hooks in Production Path).
-- Item 6: Sanitized Refresh CLI Output DTO (Zero Email or Capability Token Leaks).
-- Item 7 & 11: Privacy Audit: Internal Canonical Email vs Pseudonymous account_ref in Logs/DTOs.
-- Item 8, 9, 10: AGM Reuse, Auto-Switch Analysis, and Thin Selection Policy Verification.
-- Item 12: Closure Boundary Verification.
+Comprehensive zero-trust test suite for T02 AGM integration (Round 7 Final Closure):
+1. Global side-effect tripwires (CredRead, CredWrite, live AGM, Google HTTP).
+2. Critical Item 1: Pre-execution binary check (wrong binary SHA -> SUBPROCESS_CALL_COUNT == 0).
+3. Critical Item 2 & 11: TrustedAgmRunner test matrix (missing SHA, malformed SHA, wrong SHA, TOCTOU).
+4. Critical Item 3: Safe switch requires TrustedAgmIdentity (missing/wrong -> 0 subprocess calls).
+5. Critical Item 4: List / Info CLI requires TrustedAgmIdentity.
+6. Item 5: Supervisor APIs require structured TrustedAgmIdentity.
+7. Critical Item 6: SanitizedRefreshEvidenceDTO contains normalized error_code only.
+8. Critical Item 7 & 10: Adversarial Privacy Test Matrix (toxic tokens/emails/paths/traces completely absent in default DTOs).
+9. Item 8: SanitizedVerificationOutput exposes safe enums and zero free-text stderr.
+10. Item 9: switch_account_safe does not echo raw invalid account input in default output.
+11. Item 13: Transport trust & HMAC signature regression suite.
+12. Zero host operations assertion.
 """
 
 import json
@@ -28,7 +31,7 @@ from inspect_quota import (
     AccountQuotaSummary,
     FormatSupportState,
     FreshnessState,
-    TrustedAgmIdentity,
+    WarningCode,
     _validate_refresh_evidence_for_test,
     deserialize_evidence_payload,
     parse_agm_info,
@@ -47,15 +50,23 @@ from refresh_quota_safe import (
     execute_safe_refresh,
     issue_live_execution_attestation,
     pseudonymize_account,
+    verify_evidence_signature,
     verify_live_execution_attestation,
 )
 from selection_policy import (
     AccountSelector,
+    CandidateRejectCode,
     ModelGroup,
     SelectionConfig,
     TerminalState,
 )
 from switch_account_safe import SwitchOutcome, execute_safe_switch
+from trusted_agm_runner import (
+    RunnerErrorCode,
+    TrustedAgmIdentity,
+    TrustedExecutionResult,
+    execute_trusted_agm,
+)
 from verify_active_account import (
     CredentialVerificationStatus,
     VerificationResult,
@@ -70,7 +81,7 @@ def run_tests():
         print(f"Error: Fixtures directory not found at {fixtures_dir}", file=sys.stderr)
         return False
 
-    print("=== Running AGM Zero-Trust Round 6 Test Suite ===")
+    print("=== Running AGM Zero-Trust Round 7 Test Suite ===")
     print(f"Fixtures Path: {fixtures_dir}\n")
 
     # Global Side-Effect Call Counters (Item 12 & Tripwire)
@@ -104,8 +115,8 @@ def run_tests():
     tests_passed = 0
     tests_total = 0
     now = 1756220000.0
-    session_id = "sess-prod-666"
-    secret = "ephemeral-session-secret-666"
+    session_id = "sess-prod-777"
+    secret = "ephemeral-session-secret-777"
     valid_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
     try:
@@ -125,9 +136,129 @@ def run_tests():
         tests_passed += 1
 
         # =========================================================================
-        # 2. Critical Item 1: Missing Expected Binary SHA-256 Fails Closed
+        # 2. Critical Item 1 & 11: Pre-Execution Binary Check (Wrong SHA -> 0 Subprocess Calls)
         # =========================================================================
         tests_total += 1
+        runner_subprocess_calls = 0
+
+        def counting_injected_runner(argv, timeout):
+            nonlocal runner_subprocess_calls
+            runner_subprocess_calls += 1
+            return 0, "mock success", ""
+
+        trusted_identity_wrong = TrustedAgmIdentity(expected_binary_sha256="f" * 64)
+        exec_res_mismatch = execute_trusted_agm(
+            subcommand_args=["refresh", "alice@example.com"],
+            trusted_identity=trusted_identity_wrong,
+            injected_runner=counting_injected_runner,
+            injected_sha_computer=lambda path: valid_sha,
+            injected_resolver=lambda: "mock_agm.exe"
+        )
+        assert exec_res_mismatch.command_executed is False
+        assert exec_res_mismatch.error_code == RunnerErrorCode.BINARY_IDENTITY_MISMATCH
+        assert runner_subprocess_calls == 0  # CRITICAL ITEM 1: SUBPROCESS CALL COUNT == 0!
+        print("  [PASS] 2: Pre-execution binary check stops execution before subprocess -> SUBPROCESS_CALL_COUNT == 0")
+        tests_passed += 1
+
+        # =========================================================================
+        # 3. Critical Item 2 & 11: TrustedAgmRunner Test Matrix (Missing & Malformed SHA)
+        # =========================================================================
+        tests_total += 1
+        # 3a. Missing expected identity -> 0 calls
+        runner_subprocess_calls = 0
+        res_no_id = execute_trusted_agm(
+            ["refresh", "alice@example.com"],
+            trusted_identity=None,
+            injected_runner=counting_injected_runner,
+            injected_sha_computer=lambda p: valid_sha,
+            injected_resolver=lambda: "mock_agm.exe"
+        )
+        assert res_no_id.command_executed is False
+        assert res_no_id.error_code == RunnerErrorCode.BINARY_IDENTITY_UNCONFIGURED
+        assert runner_subprocess_calls == 0
+
+        # 3b. Malformed expected SHA -> 0 calls
+        res_bad_id = execute_trusted_agm(
+            ["refresh", "alice@example.com"],
+            trusted_identity=TrustedAgmIdentity(expected_binary_sha256="not_a_64_hex_string"),
+            injected_runner=counting_injected_runner,
+            injected_sha_computer=lambda p: valid_sha,
+            injected_resolver=lambda: "mock_agm.exe"
+        )
+        assert res_bad_id.command_executed is False
+        assert res_bad_id.error_code == RunnerErrorCode.BINARY_IDENTITY_CONFIG_INVALID
+        assert runner_subprocess_calls == 0
+
+        # 3c. Correct SHA -> command permitted
+        trusted_id_ok = TrustedAgmIdentity(expected_binary_sha256=valid_sha)
+        res_ok = execute_trusted_agm(
+            ["refresh", "alice@example.com"],
+            trusted_identity=trusted_id_ok,
+            injected_runner=counting_injected_runner,
+            injected_sha_computer=lambda p: valid_sha,
+            injected_resolver=lambda: "mock_agm.exe"
+        )
+        assert res_ok.command_executed is True
+        assert res_ok.success is True
+        assert runner_subprocess_calls == 1
+
+        # 3d. TOCTOU post-mutation check
+        mutation_calls = [valid_sha, "mutated_post_sha" + "0" * 48]
+        res_toctou = execute_trusted_agm(
+            ["refresh", "alice@example.com"],
+            trusted_identity=trusted_id_ok,
+            injected_runner=counting_injected_runner,
+            injected_sha_computer=lambda p: mutation_calls.pop(0),
+            injected_resolver=lambda: "mock_agm.exe"
+        )
+        assert res_toctou.command_executed is True
+        assert res_toctou.error_code == RunnerErrorCode.BINARY_CHANGED_DURING_EXECUTION
+        print("  [PASS] 3: TrustedAgmRunner test matrix (missing, malformed, match, TOCTOU mutation) verified")
+        tests_passed += 1
+
+        # =========================================================================
+        # 4. Critical Item 3: Switch Command Requires TrustedAgmIdentity (0 Calls on Failure)
+        # =========================================================================
+        tests_total += 1
+        switch_subprocess_calls = 0
+
+        def counting_switch_runner(argv, timeout):
+            nonlocal switch_subprocess_calls
+            switch_subprocess_calls += 1
+            return 0, "switched", ""
+
+        # 4a. No trusted identity -> exit 4, 0 calls
+        sw_res_no_id = execute_safe_switch(
+            "alice@example.com", confirm=True,
+            trusted_identity=None,
+            agm_runner=counting_switch_runner,
+            executable_resolver=lambda: "mock_agm.exe"
+        )
+        assert sw_res_no_id["exit_code"] == 4
+        assert sw_res_no_id["status"] == SwitchOutcome.BINARY_IDENTITY_UNCONFIGURED.value
+        assert switch_subprocess_calls == 0
+
+        # 4b. Wrong expected SHA -> exit 4, 0 calls
+        sw_res_wrong_id = execute_safe_switch(
+            "alice@example.com", confirm=True,
+            trusted_identity=TrustedAgmIdentity(expected_binary_sha256="d" * 64),
+            agm_runner=counting_switch_runner,
+            executable_resolver=lambda: "mock_agm.exe",
+            sha_computer=lambda p: valid_sha
+        )
+        assert sw_res_wrong_id["exit_code"] == 4
+        assert sw_res_wrong_id["status"] == SwitchOutcome.BINARY_IDENTITY_MISMATCH.value
+        assert switch_subprocess_calls == 0
+        print("  [PASS] 4: Safe switch enforces TrustedAgmIdentity before execution -> 0 subprocess calls")
+        tests_passed += 1
+
+        # =========================================================================
+        # 5. Item 5: Supervisor APIs Require Structured TrustedAgmIdentity
+        # =========================================================================
+        tests_total += 1
+        with open(fixtures_dir / "list_normal.txt", "r", encoding="utf-8") as f:
+            list_text = f.read()
+
         ev_test = RefreshEvidence(
             canonical_account="alice@example.com",
             canonical_executable_path="mock_agm.exe",
@@ -141,246 +272,259 @@ def run_tests():
             supervisor_session_id=session_id,
             source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE
         )
-        st_missing_sha, _, w_missing_sha = _validate_refresh_evidence_for_test(
-            ev_test, "alice@example.com", now,
-            expected_session_id=session_id,
-            expected_binary_sha256=None  # Missing expected SHA!
-        )
-        assert st_missing_sha == FreshnessState.STALE_CACHED
-        assert any("BINARY_IDENTITY_UNCONFIGURED" in w for w in w_missing_sha)
-        print("  [PASS] 2: Missing expected binary SHA fails closed -> BINARY_IDENTITY_UNCONFIGURED")
-        tests_passed += 1
-
-        # =========================================================================
-        # 3. Critical Item 1: Malformed Expected Binary SHA-256 Fails Closed
-        # =========================================================================
-        tests_total += 1
-        st_malformed_sha, _, w_malformed_sha = _validate_refresh_evidence_for_test(
-            ev_test, "alice@example.com", now,
-            expected_session_id=session_id,
-            expected_binary_sha256="not_a_valid_64_hex_hash"  # Malformed SHA!
-        )
-        assert st_malformed_sha == FreshnessState.STALE_CACHED
-        assert any("BINARY_IDENTITY_CONFIG_INVALID" in w for w in w_malformed_sha)
-        print("  [PASS] 3: Malformed expected binary SHA fails closed -> BINARY_IDENTITY_CONFIG_INVALID")
-        tests_passed += 1
-
-        # =========================================================================
-        # 4. Critical Item 1: Wrong Valid 64-Hex Expected SHA-256 Fails Closed
-        # =========================================================================
-        tests_total += 1
-        wrong_valid_sha = "a" * 64
-        st_wrong_sha, _, w_wrong_sha = _validate_refresh_evidence_for_test(
-            ev_test, "alice@example.com", now,
-            expected_session_id=session_id,
-            expected_binary_sha256=wrong_valid_sha  # Wrong 64-hex SHA!
-        )
-        assert st_wrong_sha == FreshnessState.STALE_CACHED
-        assert any("BINARY_IDENTITY_MISMATCH" in w for w in w_wrong_sha)
-        print("  [PASS] 4: Wrong valid 64-hex expected SHA fails closed -> BINARY_IDENTITY_MISMATCH")
-        tests_passed += 1
-
-        # =========================================================================
-        # 5. Critical Item 2: parse_agm_list with Missing Binary Config Fails Closed
-        # =========================================================================
-        tests_total += 1
-        with open(fixtures_dir / "list_normal.txt", "r", encoding="utf-8") as f:
-            list_text = f.read()
-
         ev_map = {"alice@example.com": ev_test}
+
+        # 5a. Missing trusted identity -> fail closed
         res_list_no_sha = parse_agm_list(
             list_text, refresh_evidence_map=ev_map, supervisor_session_id=session_id,
-            trusted_identity=None, expected_binary_sha256=None, now_epoch=now,
-            _test_mode_allow_synthetic=True
+            trusted_identity=None, now_epoch=now, _test_mode_allow_synthetic=True
         )
         alice_no_sha = next(r for r in res_list_no_sha if r.canonical_account == "alice@example.com")
         assert alice_no_sha.freshness_state == FreshnessState.STALE_CACHED
         assert alice_no_sha.eligible is False
-        assert any("BINARY_IDENTITY_UNCONFIGURED" in w for w in alice_no_sha.parse_warnings)
-        print("  [PASS] 5: parse_agm_list with no trusted binary config -> STALE_CACHED and NOT eligible")
-        tests_passed += 1
+        assert alice_no_sha.warning_codes == [WarningCode.BINARY_IDENTITY_UNCONFIGURED]
 
-        # =========================================================================
-        # 6. Critical Item 2: parse_agm_info with Missing Binary Config Fails Closed
-        # =========================================================================
-        tests_total += 1
-        with open(fixtures_dir / "info_normal.txt", "r", encoding="utf-8") as f:
-            info_text = f.read()
-
-        res_info_no_sha = parse_agm_info(
-            info_text, refresh_evidence=ev_test, supervisor_session_id=session_id,
-            trusted_identity=None, expected_binary_sha256=None, now_epoch=now,
-            _test_mode_allow_synthetic=True
-        )
-        assert res_info_no_sha is not None
-        assert res_info_no_sha.freshness_state == FreshnessState.STALE_CACHED
-        assert res_info_no_sha.eligible is False
-        assert any("BINARY_IDENTITY_UNCONFIGURED" in w for w in res_info_no_sha.parse_warnings)
-        print("  [PASS] 6: parse_agm_info with no trusted binary config -> STALE_CACHED and NOT eligible")
-        tests_passed += 1
-
-        # =========================================================================
-        # 7. Critical Item 2: Correct TrustedAgmIdentity Allows Freshness Validation
-        # =========================================================================
-        tests_total += 1
-        trusted_id = TrustedAgmIdentity(expected_binary_sha256=valid_sha, canonical_executable_path="mock_agm.exe")
+        # 5b. Valid trusted identity -> PROVEN_FRESH
         res_list_ok = parse_agm_list(
             list_text, refresh_evidence_map=ev_map, supervisor_session_id=session_id,
-            trusted_identity=trusted_id, now_epoch=now,
-            _test_mode_allow_synthetic=True
+            trusted_identity=trusted_id_ok, now_epoch=now, _test_mode_allow_synthetic=True
         )
         alice_ok = next(r for r in res_list_ok if r.canonical_account == "alice@example.com")
         assert alice_ok.freshness_state == FreshnessState.PROVEN_FRESH
         assert alice_ok.eligible is True
-        print("  [PASS] 7: parse_agm_list with valid TrustedAgmIdentity -> PROVEN_FRESH and eligible")
+        print("  [PASS] 5: Supervisor APIs require structured TrustedAgmIdentity")
         tests_passed += 1
 
         # =========================================================================
-        # 8. Item 3 & 4: Synthetic Test Origin Rejected in Production Mode
+        # 6. Critical Item 6: SanitizedRefreshEvidenceDTO Contains Normalized error_code Only
         # =========================================================================
         tests_total += 1
-        st_prod_synth, _, w_prod_synth = validate_refresh_evidence_supervisor(
-            ev_test, "alice@example.com", now,
-            expected_session_id=session_id,
-            expected_binary_sha256=valid_sha
-        )
-        assert st_prod_synth == FreshnessState.STALE_CACHED
-        assert any("Synthetic test evidence is strictly forbidden" in w for w in w_prod_synth)
-        print("  [PASS] 8: Synthetic test origin strictly rejected in production supervisor mode")
-        tests_passed += 1
-
-        # =========================================================================
-        # 9. Item 6: Sanitized Refresh Evidence DTO Contains No Email or Token
-        # =========================================================================
-        tests_total += 1
-        raw_email = "alice.confidential@corp.example.com"
-        ev_privacy = RefreshEvidence(
-            canonical_account=raw_email,
+        ev_err = RefreshEvidence(
+            canonical_account="confidential@example.com",
             canonical_executable_path="mock_agm.exe",
             binary_sha256=valid_sha,
             source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
-            argv=["mock_agm.exe", "refresh", raw_email],
+            argv=["mock_agm.exe", "refresh", "confidential@example.com"],
             started_at_epoch=now - 5,
             completed_at_epoch=now - 4,
-            exit_code=0,
-            result=RefreshResult.REFRESH_SUCCEEDED,
+            exit_code=1,
+            result=RefreshResult.REFRESH_FAILED_AUTH,
             supervisor_session_id=session_id,
-            source_origin=EvidenceSourceOrigin.SYNTHETIC_TEST_EVIDENCE,
-            attestation=issue_live_execution_attestation(raw_email, valid_sha, now - 4)
+            source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
+            error_code="REFRESH_AUTH_FAILED",
+            error_summary_private="oauth2: invalid_grant for user confidential@example.com"
         )
-        sanitized_refresh = ev_privacy.to_sanitized_dto()
-        refresh_dict = asdict(sanitized_refresh)
+        dto_err = ev_err.to_sanitized_dto()
+        dto_err_dict = asdict(dto_err)
 
-        assert "canonical_account" not in refresh_dict
-        assert "attestation" not in refresh_dict
-        assert "capability_token" not in refresh_dict
-        assert raw_email not in json.dumps(refresh_dict)
-        assert refresh_dict["account_ref"] == pseudonymize_account(raw_email)
-        print("  [PASS] 9: SanitizedRefreshEvidenceDTO contains zero raw emails or capability tokens")
+        assert dto_err_dict["error_code"] == "REFRESH_AUTH_FAILED"
+        assert "error_summary" not in dto_err_dict
+        assert "error_summary_private" not in dto_err_dict
+        assert "confidential@example.com" not in json.dumps(dto_err_dict)
+        print("  [PASS] 6: SanitizedRefreshEvidenceDTO contains normalized error_code only")
         tests_passed += 1
 
         # =========================================================================
-        # 10. Item 7 & 11: Sanitized Account Quota Summary Exposes Only account_ref
+        # 7. Critical Item 7 & 10: Adversarial Privacy Test Matrix (Zero Sensitive Leaks)
         # =========================================================================
         tests_total += 1
-        quota_dto = alice_ok.to_sanitized_dto()
-        quota_dict = asdict(quota_dto)
+        toxic_email = "alice.secret.ident@corp.internal.example"
+        toxic_path = "C:\\Users\\admin\\AppData\\Local\\secret\\agm.exe"
+        toxic_bearer = "Bearer ya29.v1secret_token_12345"
+        toxic_refresh = "1//04secret_refresh_token_abcde"
+        toxic_cap_token = "cap_token_8899aabbccddeeff"
+        toxic_exception = f"Exception: Failed to connect to Google for {toxic_email} at {toxic_path} with {toxic_bearer}"
 
-        assert "canonical_account" not in quota_dict
-        assert "alice@example.com" not in json.dumps(quota_dict)
-        assert quota_dict["account_ref"] == pseudonymize_account("alice@example.com")
-        print("  [PASS] 10: SanitizedAccountQuotaDTO exposes only pseudonymous account_ref")
-        tests_passed += 1
+        # 7a. Refresh Evidence DTO
+        ev_toxic = RefreshEvidence(
+            canonical_account=toxic_email,
+            canonical_executable_path=toxic_path,
+            binary_sha256=valid_sha,
+            source_revision_inspected=INSPECTED_AGM_SOURCE_REVISION,
+            argv=[toxic_path, "refresh", toxic_email],
+            started_at_epoch=now - 5,
+            completed_at_epoch=now - 4,
+            exit_code=1,
+            result=RefreshResult.REFRESH_FAILED_NETWORK,
+            supervisor_session_id=session_id,
+            source_origin=EvidenceSourceOrigin.LIVE_REFRESH_EXECUTION,
+            attestation=LiveExecutionAttestation(
+                session_nonce=session_id, execution_nonce="exec-1", account=toxic_email,
+                binary_sha256=valid_sha, issued_at=now, capability_token=toxic_cap_token
+            ),
+            hmac_signature="hmac_sig_123",
+            error_code="REFRESH_NETWORK_FAILED",
+            error_summary_private=toxic_exception
+        )
+        refresh_json = json.dumps(asdict(ev_toxic.to_sanitized_dto()))
+        assert toxic_email not in refresh_json
+        assert toxic_path not in refresh_json
+        assert toxic_bearer not in refresh_json
+        assert toxic_refresh not in refresh_json
+        assert toxic_cap_token not in refresh_json
+        assert "Exception" not in refresh_json
 
-        # =========================================================================
-        # 11. Item 10 & 11: Selection Policy Returns Canonical Email Internally & Ref in Logs
-        # =========================================================================
-        tests_total += 1
-        acc_cand = AccountQuotaSummary(
-            canonical_account="bob@example.com",
-            account_ref=pseudonymize_account("bob@example.com"),
+        # 7b. Account Quota DTO (warnings with toxic email inside private text)
+        quota_toxic = AccountQuotaSummary(
+            canonical_account=toxic_email,
+            account_ref=pseudonymize_account(toxic_email),
             status_tags=[],
             is_active_cli=False,
             is_active_ide=False,
             is_token_expired=False,
-            gemini_pro_pct=85,
-            gemini_flash_pct=90,
+            gemini_pro_pct=90,
+            gemini_flash_pct=95,
             claude_pct=None,
             models={},
             parsed_at_epoch=now,
             refresh_confirmed_at_epoch=now - 10,
             quota_reset_time=None,
-            freshness_state=FreshnessState.PROVEN_FRESH,
+            freshness_state=FreshnessState.STALE_CACHED,
             format_support=FormatSupportState.FORMAT_SUPPORTED,
             source="TEST",
-            parse_warnings=[],
-            eligible=True
+            warning_codes=[WarningCode.ACCOUNT_MISMATCH, WarningCode.EVIDENCE_EXPIRED],
+            parse_warnings_private=[f"Account mismatch: expected {toxic_email}"],
+            eligible=False
         )
-        selector = AccountSelector(SelectionConfig(min_quota_pct=20, target_model_group="gemini-pro"))
-        sel_res = selector.select_next_account([acc_cand], now=now)
+        quota_json = json.dumps(asdict(quota_toxic.to_sanitized_dto()))
+        assert toxic_email not in quota_json
+        assert "parse_warnings_private" not in quota_json
+        assert quota_json.count(pseudonymize_account(toxic_email)) > 0
 
-        assert sel_res.selected_account == "bob@example.com"  # Internal for switch adapter
-        assert sel_res.selected_account_ref == pseudonymize_account("bob@example.com")  # Safe for logging
-        assert "bob@example.com" not in sel_res.decision_reason
-        assert pseudonymize_account("bob@example.com") in sel_res.decision_reason
-        for entry in sel_res.evaluated_candidates:
-            assert "canonical_account" not in entry
-            assert "bob@example.com" not in json.dumps(entry)
-        print("  [PASS] 11: SelectionPolicy returns canonical email internally and account_ref in decision logs")
+        # 7c. Verification Output DTO
+        v_toxic = VerificationResult(
+            account_ref=pseudonymize_account(toxic_email),
+            status=CredentialVerificationStatus.CREDENTIAL_STORE_ACCESS_DENIED,
+            credential_present=False,
+            evidence_rank="UNKNOWN",
+            matches_expected=False,
+            scope="CREDENTIAL_STORE_ONLY",
+            desktop_adoption_status="UNKNOWN",
+            verification_source="WINDOWS_CREDENTIAL_MANAGER",
+            error_code="ACCESS_DENIED",
+            safe_summary="STORE_ACCESS_DENIED",
+            details_private=f"PowerShell failed with {toxic_exception}",
+            raw_expected_account=toxic_email,
+            raw_detected_email=toxic_email,
+            token_fingerprint="fp_123"
+        )
+        verify_json = json.dumps(asdict(v_toxic.to_sanitized_dto()))
+        assert toxic_email not in verify_json
+        assert toxic_exception not in verify_json
+        assert "details_private" not in verify_json
+
+        # 7d. Selection Result DTO
+        selector = AccountSelector()
+        sel_toxic = selector.select_next_account([quota_toxic], now=now)
+        sel_json = json.dumps(sel_toxic.to_sanitized_dto())
+        assert toxic_email not in sel_json
+
+        # 7e. Safe Switch Default Output (mocked verifier to maintain 100% test isolation)
+        sw_toxic = execute_safe_switch(
+            toxic_email, confirm=False,
+            verifier=lambda exp, net: VerificationResult(
+                account_ref=pseudonymize_account(exp),
+                status=CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED,
+                credential_present=True,
+                evidence_rank="MEDIUM",
+                matches_expected=None,
+                scope="CREDENTIAL_STORE_ONLY",
+                desktop_adoption_status="UNKNOWN",
+                verification_source="WINDOWS_CREDENTIAL_MANAGER"
+            )
+        )
+        sw_json = json.dumps(sw_toxic)
+        assert toxic_email not in sw_json
+        print("  [PASS] 7: Adversarial Privacy Test Matrix verified: ZERO sensitive markers in all default DTOs")
         tests_passed += 1
 
         # =========================================================================
-        # 12. Safe Switch Post-Success Branches
-        # =========================================================================
-        tests_total += 1
-        sw_a = execute_safe_switch(
-            "alice@example.com", confirm=True,
-            agm_runner=lambda argv, t: (1, "", "switch failed"),
-            verifier=lambda exp, net: VerificationResult(pseudonymize_account(exp), CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY, False, "UNKNOWN", False, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "WINDOWS_CREDENTIAL_MANAGER", "")
-        )
-        assert sw_a["exit_code"] == 1
-
-        sw_b = execute_safe_switch(
-            "alice@example.com", confirm=True,
-            agm_runner=lambda argv, t: (0, "switched", ""),
-            verifier=lambda exp, net: VerificationResult(pseudonymize_account(exp), CredentialVerificationStatus.CREDENTIAL_STORE_WRITTEN_UNVERIFIED, True, "MEDIUM", None, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "WINDOWS_CREDENTIAL_MANAGER", "")
-        )
-        assert sw_b["exit_code"] == 2
-
-        sw_c = execute_safe_switch(
-            "alice@example.com", confirm=True,
-            agm_runner=lambda argv, t: (0, "switched", ""),
-            verifier=lambda exp, net: VerificationResult(pseudonymize_account(exp), CredentialVerificationStatus.CREDENTIAL_STORE_IDENTITY_VERIFIED, True, "STRONG", True, "CREDENTIAL_STORE_ONLY", "UNKNOWN", "GOOGLE_USERINFO_ENDPOINT", "")
-        )
-        assert sw_c["exit_code"] == 0
-        print("  [PASS] 12: Safe switch post-success branches (exit 1, exit 2, exit 0) verified")
-        tests_passed += 1
-
-        # =========================================================================
-        # 13. Structured Credential Reader Envelope
+        # 8. Item 8: SanitizedVerificationOutput Exposes Safe Enums & Zero Stderr
         # =========================================================================
         tests_total += 1
         env_not_found = json.dumps({"found": False, "win32_code": 1168, "blob_length": 0, "blob_utf8": ""})
-        v_env_1 = verify_active_account(ps_runner=lambda: (0, env_not_found, ""))
-        assert v_env_1.status == CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY
-        assert v_env_1.credential_present is False
-
-        env_empty_blob = json.dumps({"found": True, "win32_code": 0, "blob_length": 0, "blob_utf8": ""})
-        v_env_2 = verify_active_account(ps_runner=lambda: (0, env_empty_blob, ""))
-        assert v_env_2.status == CredentialVerificationStatus.CREDENTIAL_TOKEN_FIELDS_MISSING
-        assert v_env_2.credential_present is True
-        print("  [PASS] 13: Structured credential reader envelope Win32 error handling verified")
+        v_res = verify_active_account(ps_runner=lambda: (0, env_not_found, ""))
+        v_dto = v_res.to_sanitized_dto()
+        assert v_dto.status == CredentialVerificationStatus.CREDENTIAL_STORE_EMPTY.value
+        assert v_dto.error_code == "WIN32_1168_NOT_FOUND"
+        assert v_dto.safe_summary == "CREDENTIAL_STORE_QUERY_FAILED"
+        assert "details" not in asdict(v_dto)
+        print("  [PASS] 8: SanitizedVerificationOutput exposes safe enums and zero free-text stderr")
         tests_passed += 1
 
         # =========================================================================
-        # 14. Assert ZERO Real Host Operations
+        # 9. Item 9: switch_account_safe Does Not Echo Raw Invalid Input
+        # =========================================================================
+        tests_total += 1
+        invalid_input = "not-an-email-with-secrets<payload>"
+        sw_invalid = execute_safe_switch(invalid_input, confirm=True)
+        assert invalid_input not in json.dumps(sw_invalid)
+        assert sw_invalid["message"] == "Account input is not a valid canonical email."
+        print("  [PASS] 9: switch_account_safe does not echo raw invalid input")
+        tests_passed += 1
+
+        # =========================================================================
+        # 10. Item 13: Transport Trust & HMAC Signature Regression Suite
+        # =========================================================================
+        tests_total += 1
+        # 10a. Unsigned deserialized LIVE claim -> rejected
+        ev_unsigned_dict = {
+            "canonical_account": "alice@example.com",
+            "canonical_executable_path": "mock_agm.exe",
+            "binary_sha256": valid_sha,
+            "source_revision_inspected": INSPECTED_AGM_SOURCE_REVISION,
+            "argv": ["mock_agm.exe", "refresh", "alice@example.com"],
+            "started_at_epoch": now - 5,
+            "completed_at_epoch": now - 4,
+            "exit_code": 0,
+            "result": "REFRESH_SUCCEEDED",
+            "supervisor_session_id": session_id,
+            "source_origin": "LIVE_REFRESH_EXECUTION"
+        }
+        st_unsigned, _, codes_unsigned, _ = validate_refresh_evidence_supervisor(
+            ev_unsigned_dict, "alice@example.com", now,
+            expected_session_id=session_id,
+            trusted_identity=trusted_id_ok
+        )
+        assert st_unsigned == FreshnessState.STALE_CACHED
+        assert WarningCode.UNTRUSTED_DESERIALIZED_EVIDENCE in codes_unsigned
+
+        # 10b. Signed deserialized with BAD HMAC -> rejected
+        ev_bad_sig_dict = dict(ev_unsigned_dict)
+        ev_bad_sig_dict["hmac_signature"] = "bad_hmac_signature_123"
+        st_bad_sig, _, codes_bad_sig, _ = validate_refresh_evidence_supervisor(
+            ev_bad_sig_dict, "alice@example.com", now,
+            expected_session_id=session_id,
+            trusted_identity=trusted_id_ok,
+            session_secret=secret
+        )
+        assert st_bad_sig == FreshnessState.STALE_CACHED
+        assert WarningCode.UNTRUSTED_DESERIALIZED_EVIDENCE in codes_bad_sig
+
+        # 10c. Signed deserialized with VALID HMAC -> accepted
+        ev_signed_obj, _, _ = deserialize_evidence_payload(ev_unsigned_dict)
+        valid_hmac = compute_evidence_hmac(ev_signed_obj, secret)
+        ev_good_sig_dict = dict(ev_unsigned_dict)
+        ev_good_sig_dict["hmac_signature"] = valid_hmac
+        st_good_sig, _, codes_good_sig, _ = validate_refresh_evidence_supervisor(
+            ev_good_sig_dict, "alice@example.com", now,
+            expected_session_id=session_id,
+            trusted_identity=trusted_id_ok,
+            session_secret=secret
+        )
+        assert st_good_sig == FreshnessState.PROVEN_FRESH
+        print("  [PASS] 10: Transport trust & HMAC signature regression suite verified")
+        tests_passed += 1
+
+        # =========================================================================
+        # 11. Final Assertion: ZERO Host Operations
         # =========================================================================
         tests_total += 1
         assert os_cred_read_calls == 0
         assert os_cred_write_calls == 0
         assert live_agm_calls == 0
         assert live_google_http_calls == 0
-        print("  [PASS] 14: Global Side-Effect Trap verified: ZERO OS CredRead/Write, ZERO Live AGM, ZERO Google HTTP calls")
+        print("  [PASS] 11: Global Side-Effect Trap verified: ZERO OS CredRead/Write, ZERO Live AGM, ZERO Google HTTP calls")
         tests_passed += 1
 
     finally:

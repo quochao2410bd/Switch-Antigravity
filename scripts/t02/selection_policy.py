@@ -2,21 +2,22 @@
 """
 selection_policy.py
 
-Thin supervisor decision policy for Switch-Antigravity watchdog (Round 6 Architecture).
+Thin supervisor decision policy for Switch-Antigravity watchdog (Round 7 Architecture).
 
 Architectural Role & Scope (Items 8 & 10):
 1. NOT A MULTI-ACCOUNT MANAGER:
    - AGM is the authoritative multi-account manager (storage, encrypted tokens, OAuth, aliases, switch).
    - selection_policy.py is ONLY a thin fail-closed decision evaluator for candidate accounts
      already managed by AGM and parsed by inspect_quota.py.
-2. Purpose of Thin Policy (Item 9 & 10):
+2. Purpose of Thin Policy:
    - Bridges gaps where AGM built-in auto-switch cannot be directly used by the autonomous watchdog:
      a. Enforces target-specific scope ('agy' Credential Store only; never switches all surfaces).
      b. Enforces strict per-model quota thresholds (Gemini Pro vs Flash, without broad model matching).
      c. Enforces supervisor-level bounded rotation attempts and cooldown failure penalties.
      d. Requires cryptographic freshness provenance before selecting an account.
-3. Privacy Contract (Items 7 & 11):
-   - Decision logs and evaluated candidate tables expose ONLY pseudonymous account_ref (acc_<hash>).
+3. Privacy Contract (Critical Items 7 & 10):
+   - Decision logs and evaluated candidate tables expose ONLY pseudonymous account_ref (acc_<hash>)
+     and normalized reject codes (e.g. NON_CANONICAL_EMAIL, TOKEN_EXPIRED, IN_COOLDOWN).
    - selected_account (canonical email) is returned strictly for internal orchestration to invoke 'agm switch'.
 """
 
@@ -49,6 +50,19 @@ class TerminalState(str, Enum):
     SWITCH_FAILED = "SWITCH_FAILED"
     VERIFY_FAILED = "VERIFY_FAILED"
     FAILED_SAFE = "FAILED_SAFE"
+
+
+class CandidateRejectCode(str, Enum):
+    NONE = "NONE"
+    NON_CANONICAL_EMAIL = "NON_CANONICAL_EMAIL"
+    TOKEN_EXPIRED = "TOKEN_EXPIRED"
+    ACTIVE_ACCOUNT_EXHAUSTED = "ACTIVE_ACCOUNT_EXHAUSTED"
+    IN_COOLDOWN = "IN_COOLDOWN"
+    STALE_CACHED_NO_PROVENANCE = "STALE_CACHED_NO_PROVENANCE"
+    REFRESH_FAILED = "REFRESH_FAILED"
+    QUOTA_SCORE_UNKNOWN = "QUOTA_SCORE_UNKNOWN"
+    QUOTA_BELOW_MINIMUM = "QUOTA_BELOW_MINIMUM"
+    EVIDENCE_EXPIRED = "EVIDENCE_EXPIRED"
 
 
 @dataclass
@@ -128,7 +142,7 @@ class AccountSelector:
                 selected_account=None,
                 selected_account_ref=None,
                 terminal_state=TerminalState.FAILED_SAFE,
-                decision_reason=f"INVALID_MODEL_GROUP: '{self.config.target_model_group}' is not a supported ModelGroup enum",
+                decision_reason=f"INVALID_MODEL_GROUP: '{self.config.target_model_group}' is not supported",
                 evaluated_candidates=[],
                 rotation_count=self.rotation_attempts
             )
@@ -138,7 +152,7 @@ class AccountSelector:
                 selected_account=None,
                 selected_account_ref=None,
                 terminal_state=TerminalState.FAILED_SAFE,
-                decision_reason=f"Exceeded maximum rotation attempts ({self.rotation_attempts}/{self.config.max_rotation_attempts})",
+                decision_reason=f"EXCEEDED_MAX_ROTATION_ATTEMPTS_{self.rotation_attempts}",
                 evaluated_candidates=[],
                 rotation_count=self.rotation_attempts
             )
@@ -148,7 +162,7 @@ class AccountSelector:
                 selected_account=None,
                 selected_account_ref=None,
                 terminal_state=TerminalState.BLOCKED_NO_ACCOUNT,
-                decision_reason="No stored accounts found in account store",
+                decision_reason="NO_ACCOUNTS_IN_STORE",
                 evaluated_candidates=[],
                 rotation_count=self.rotation_attempts
             )
@@ -158,7 +172,7 @@ class AccountSelector:
                 selected_account=None,
                 selected_account_ref=None,
                 terminal_state=TerminalState.FAILED_SAFE,
-                decision_reason="AGM output schema is unsupported. Failing closed.",
+                decision_reason="FORMAT_UNSUPPORTED_FAIL_CLOSED",
                 evaluated_candidates=[],
                 rotation_count=self.rotation_attempts
             )
@@ -192,32 +206,34 @@ class AccountSelector:
                 "failure_count": penalty.failure_count,
                 "quota_score": score,
                 "freshness_state": acc.freshness_state.value,
-                "status": "REJECTED"
+                "status": "REJECTED",
+                "reject_code": CandidateRejectCode.NONE.value
             }
 
             if not is_canonical_email(c_acc):
-                eval_entry["reject_reason"] = "Account reference is not a canonical email"
+                eval_entry["reject_code"] = CandidateRejectCode.NON_CANONICAL_EMAIL.value
             elif acc.is_token_expired:
-                eval_entry["reject_reason"] = "Token is expired"
+                eval_entry["reject_code"] = CandidateRejectCode.TOKEN_EXPIRED.value
             elif is_current:
-                eval_entry["reject_reason"] = "Currently active exhausted account"
+                eval_entry["reject_code"] = CandidateRejectCode.ACTIVE_ACCOUNT_EXHAUSTED.value
             elif is_in_cooldown:
-                eval_entry["reject_reason"] = f"In cooldown until {penalty.cooldown_until_epoch:.0f} ({penalty.last_failure_reason})"
+                eval_entry["reject_code"] = CandidateRejectCode.IN_COOLDOWN.value
             elif acc.freshness_state == FreshnessState.STALE_CACHED:
                 has_stale_or_unknown_account = True
-                eval_entry["reject_reason"] = "Cached quota lacks verified fresh RefreshEvidence (execute agm refresh)"
+                eval_entry["reject_code"] = CandidateRejectCode.STALE_CACHED_NO_PROVENANCE.value
             elif acc.freshness_state == FreshnessState.REFRESH_FAILED:
-                eval_entry["reject_reason"] = "Recent quota refresh failed"
+                eval_entry["reject_code"] = CandidateRejectCode.REFRESH_FAILED.value
             elif acc.freshness_state == FreshnessState.UNKNOWN_UNFETCHED or score is None:
                 has_stale_or_unknown_account = True
-                eval_entry["reject_reason"] = f"Quota score for '{validated_model.value}' is unknown/missing (live refresh required)"
+                eval_entry["reject_code"] = CandidateRejectCode.QUOTA_SCORE_UNKNOWN.value
             elif score < self.config.min_quota_pct:
-                eval_entry["reject_reason"] = f"Quota score ({score}%) for '{validated_model.value}' below threshold ({self.config.min_quota_pct}%)"
+                eval_entry["reject_code"] = CandidateRejectCode.QUOTA_BELOW_MINIMUM.value
             elif acc.refresh_confirmed_at_epoch and (t - acc.refresh_confirmed_at_epoch) > self.config.max_quota_age_sec:
                 has_stale_or_unknown_account = True
-                eval_entry["reject_reason"] = f"Refresh evidence expired ({t - acc.refresh_confirmed_at_epoch:.0f}s > max {self.config.max_quota_age_sec}s)"
+                eval_entry["reject_code"] = CandidateRejectCode.EVIDENCE_EXPIRED.value
             else:
                 eval_entry["status"] = "ELIGIBLE"
+                eval_entry["reject_code"] = CandidateRejectCode.NONE.value
                 eligible_candidates.append((acc, score, penalty.failure_count))
 
             evaluated.append(eval_entry)
@@ -228,7 +244,7 @@ class AccountSelector:
                     selected_account=None,
                     selected_account_ref=None,
                     terminal_state=TerminalState.BLOCKED_QUOTA_UNKNOWN,
-                    decision_reason=f"All candidate accounts have stale/unknown quota for model group '{validated_model.value}'; live refresh required",
+                    decision_reason=f"ALL_CANDIDATES_STALE_OR_UNKNOWN_{validated_model.value}",
                     evaluated_candidates=evaluated,
                     rotation_count=self.rotation_attempts
                 )
@@ -236,7 +252,7 @@ class AccountSelector:
                 selected_account=None,
                 selected_account_ref=None,
                 terminal_state=TerminalState.BLOCKED_NO_ACCOUNT,
-                decision_reason=f"No eligible accounts remaining with sufficient quota (>= {self.config.min_quota_pct}%) for '{validated_model.value}'",
+                decision_reason=f"NO_ELIGIBLE_ACCOUNTS_REMAINING_{validated_model.value}",
                 evaluated_candidates=evaluated,
                 rotation_count=self.rotation_attempts
             )
@@ -250,7 +266,7 @@ class AccountSelector:
             selected_account=winner_acc.canonical_account,
             selected_account_ref=winner_acc.account_ref,
             terminal_state=TerminalState.NONE,
-            decision_reason=f"Selected account {winner_acc.account_ref} with {winner_score}% quota for model group '{validated_model.value}'",
+            decision_reason=f"SELECTED_{winner_acc.account_ref}_{winner_score}PCT_{validated_model.value}",
             evaluated_candidates=evaluated,
             rotation_count=self.rotation_attempts
         )
