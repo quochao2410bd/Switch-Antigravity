@@ -1,80 +1,131 @@
 import unittest
+
 from desktop_identity import DesktopProcessSnapshot, DesktopRuntimeProbe, pseudonymize_email
 
 
+def snap(ls_pid=4242):
+    return DesktopProcessSnapshot(
+        main_pid=1111,
+        main_executable=r"C:\Antigravity\Antigravity.exe",
+        language_server_pid=ls_pid,
+        csrf_token="synthetic_csrf",
+        listening_ports=[50001],
+    )
+
+
 class DesktopIdentityTests(unittest.TestCase):
-    def snapshot(self, pid=55):
-        return DesktopProcessSnapshot(10, r"C:\\Antigravity\\Antigravity.exe", pid, "secret", [1001, 1002])
-
-    def test_identity_match_from_running_language_server(self):
-        p = DesktopRuntimeProbe(
-            process_snapshot_provider=lambda hint: (self.snapshot(), "OK"),
-            user_status_fetcher=lambda snap: [{"userStatus": {"email": "b@example.com"}}],
+    def test_exact_language_server_email_match_verifies(self):
+        probe = DesktopRuntimeProbe(
+            process_snapshot_provider=lambda hint: (snap(), "OK"),
+            user_status_fetcher=lambda s: [{"userStatus": {"email": "b@example.com"}}],
         )
-        r = p.probe_identity(pseudonymize_email("b@example.com"), 55)
-        self.assertTrue(r["verified"])
-        self.assertEqual(r["source"], "LANGUAGE_SERVER_GET_USER_STATUS")
+        expected = pseudonymize_email("b@example.com")
+        result = probe.probe_identity(expected, 4242)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["status"], "DESKTOP_ADOPTION_VERIFIED")
+        self.assertEqual(result["source"], "LANGUAGE_SERVER_GET_USER_STATUS")
 
-    def test_identity_mismatch_fails_closed(self):
-        p = DesktopRuntimeProbe(
-            process_snapshot_provider=lambda hint: (self.snapshot(), "OK"),
-            user_status_fetcher=lambda snap: [{"userStatus": {"email": "a@example.com"}}],
+    def test_mismatched_language_server_email_fails_closed(self):
+        probe = DesktopRuntimeProbe(
+            process_snapshot_provider=lambda hint: (snap(), "OK"),
+            user_status_fetcher=lambda s: [{"userStatus": {"email": "a@example.com"}}],
         )
-        r = p.probe_identity(pseudonymize_email("b@example.com"), 55)
-        self.assertFalse(r["verified"])
-        self.assertEqual(r["status"], "DESKTOP_IDENTITY_MISMATCH")
+        result = probe.probe_identity(pseudonymize_email("b@example.com"), 4242)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "DESKTOP_IDENTITY_MISMATCH")
 
-    def test_ambiguous_identity_fails_closed(self):
-        p = DesktopRuntimeProbe(
-            process_snapshot_provider=lambda hint: (self.snapshot(), "OK"),
-            user_status_fetcher=lambda snap: [
+    def test_ambiguous_user_status_emails_fail_closed(self):
+        probe = DesktopRuntimeProbe(
+            process_snapshot_provider=lambda hint: (snap(), "OK"),
+            user_status_fetcher=lambda s: [
                 {"userStatus": {"email": "a@example.com"}},
                 {"userStatus": {"email": "b@example.com"}},
             ],
         )
-        r = p.probe_identity(pseudonymize_email("b@example.com"), 55)
-        self.assertFalse(r["verified"])
-        self.assertEqual(r["status"], "DESKTOP_IDENTITY_AMBIGUOUS")
+        result = probe.probe_identity(pseudonymize_email("b@example.com"), 4242)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "DESKTOP_IDENTITY_AMBIGUOUS")
 
-    def test_restart_waits_for_new_ls_pid_then_verifies(self):
+    def test_missing_email_fails_closed(self):
+        probe = DesktopRuntimeProbe(
+            process_snapshot_provider=lambda hint: (snap(), "OK"),
+            user_status_fetcher=lambda s: [{"userStatus": {}}],
+        )
+        result = probe.probe_identity(pseudonymize_email("b@example.com"), 4242)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "DESKTOP_IDENTITY_EMAIL_MISSING")
+
+    def test_restart_waits_for_new_language_server_pid_then_verifies(self):
+        before = snap(4242)
+        after = snap(4342)
         calls = {"inspect": 0, "restart": 0}
-        old = self.snapshot(55)
-        new = self.snapshot(77)
+
         def provider(hint):
             calls["inspect"] += 1
-            if calls["inspect"] <= 1:
-                return old, "OK"
-            return new, "OK"
-        def restart(snapshot, timeout):
+            if calls["inspect"] == 1:
+                return before, "OK"
+            return after, "OK"
+
+        def restart_executor(snapshot, timeout):
             calls["restart"] += 1
+            self.assertEqual(snapshot.language_server_pid, 4242)
             return True, "DESKTOP_RESTART_LAUNCHED"
-        p = DesktopRuntimeProbe(
+
+        probe = DesktopRuntimeProbe(
             process_snapshot_provider=provider,
-            user_status_fetcher=lambda snap: [{"userStatus": {"email": "b@example.com"}}],
-            restart_executor=restart,
+            user_status_fetcher=lambda s: [{"userStatus": {"email": "b@example.com"}}],
+            restart_executor=restart_executor,
             sleep_func=lambda _: None,
         )
-        r = p.restart_and_verify(pseudonymize_email("b@example.com"), 55, ready_timeout_sec=1)
-        self.assertTrue(r["verified"])
-        self.assertEqual(r["language_server_pid"], 77)
+        result = probe.restart_and_verify(
+            pseudonymize_email("b@example.com"),
+            pid_hint=4242,
+            ready_timeout_sec=1.0,
+        )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["old_language_server_pid"], 4242)
+        self.assertEqual(result["language_server_pid"], 4342)
         self.assertEqual(calls["restart"], 1)
 
-    def test_restart_mismatch_stops(self):
-        calls = {"inspect": 0}
-        old = self.snapshot(55)
-        new = self.snapshot(77)
+    def test_restart_identity_mismatch_does_not_loop_restart(self):
+        before = snap(4242)
+        after = snap(4342)
+        calls = {"inspect": 0, "restart": 0}
+
         def provider(hint):
             calls["inspect"] += 1
-            return (old, "OK") if calls["inspect"] == 1 else (new, "OK")
-        p = DesktopRuntimeProbe(
+            return (before, "OK") if calls["inspect"] == 1 else (after, "OK")
+
+        def restart_executor(snapshot, timeout):
+            calls["restart"] += 1
+            return True, "DESKTOP_RESTART_LAUNCHED"
+
+        probe = DesktopRuntimeProbe(
             process_snapshot_provider=provider,
-            user_status_fetcher=lambda snap: [{"userStatus": {"email": "wrong@example.com"}}],
-            restart_executor=lambda snap, timeout: (True, "DESKTOP_RESTART_LAUNCHED"),
+            user_status_fetcher=lambda s: [{"userStatus": {"email": "a@example.com"}}],
+            restart_executor=restart_executor,
             sleep_func=lambda _: None,
         )
-        r = p.restart_and_verify(pseudonymize_email("b@example.com"), 55, ready_timeout_sec=1)
-        self.assertFalse(r["verified"])
-        self.assertEqual(r["status"], "DESKTOP_IDENTITY_MISMATCH")
+        result = probe.restart_and_verify(
+            pseudonymize_email("b@example.com"),
+            pid_hint=4242,
+            ready_timeout_sec=1.0,
+        )
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "DESKTOP_IDENTITY_MISMATCH")
+        self.assertEqual(calls["restart"], 1)
+
+    def test_restart_executor_failure_fails_closed(self):
+        probe = DesktopRuntimeProbe(
+            process_snapshot_provider=lambda hint: (snap(), "OK"),
+            user_status_fetcher=lambda s: [],
+            restart_executor=lambda snapshot, timeout: (False, "DESKTOP_RESTART_FAILED"),
+            sleep_func=lambda _: None,
+        )
+        result = probe.restart_and_verify(pseudonymize_email("b@example.com"), 4242)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "DESKTOP_RESTART_FAILED")
+        self.assertTrue(result["restart_performed"])
 
 
 if __name__ == "__main__":
