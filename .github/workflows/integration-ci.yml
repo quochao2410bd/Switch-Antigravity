@@ -35,12 +35,14 @@ jobs:
       - name: Compile all Python
         run: python -m compileall -q scripts
 
-      - name: T01 integration contract tests
+      - name: T01 Windows integration contract tests
+        if: runner.os == 'Windows'
         working-directory: scripts/integration
         run: python -m unittest -v test_quota_adapter.py
 
-      - name: T02 zero-side-effect trust tests
-        run: python scripts/t02/validate_agm_output.py
+      - name: T02 supervisor trust contract tests
+        working-directory: scripts/integration
+        run: python -m unittest -v test_t02_contract.py
 
       - name: T03 recovery journal and resume tests
         run: python scripts/t03/test_suite.py
