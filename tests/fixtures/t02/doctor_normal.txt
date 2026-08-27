@@ -1,0 +1,10 @@
+Running diagnostics...
+✓ DATA_DIR: C:\Users\user\.antigravity-agent
+✓ DATABASE: C:\Users\user\.antigravity-agent\cloud_accounts.db
+✓ MASTER_KEY: C:\Users\user\.antigravity-agent\.mk
+⚠ IDE_DB: not found (needed for --target ide)
+✓ AGY_EXE: C:\Users\user\.local\bin\agy.exe
+✓ CLI_CREDS: user@example.com
+⚠ IDE_EXE: not found
+✓ ACCOUNTS: 2
+

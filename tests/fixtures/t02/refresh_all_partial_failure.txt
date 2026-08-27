@@ -1,0 +1,10 @@
+Starting bulk refresh for 3 accounts...
+
+→ alice@example.com
+  ✓ ok
+→ bob@example.com
+  ✗ token refresh failed (400): invalid_grant
+→ charlie@example.com
+  ✓ ok
+
+Completed: 2 successful, 1 failed

@@ -1,0 +1,3 @@
+Account: bob@example.com
+Token expiry: 2026-08-26T23:00:00+07:00
+No quota data. Run: agm refresh bob@example.com

@@ -1,0 +1,5 @@
+EMAIL                                STATUS         GEM-PRO  GEM-FLASH     CLAUDE
+------------------------------------------------------------------------------------
+user.tést_ñ@domain.com               cli,ide            70%        80%        90%
+käyttäjä@yritys.fi                   active             100%       100%       100%
+日本語アカウント@example.jp                             50%        50%        50%

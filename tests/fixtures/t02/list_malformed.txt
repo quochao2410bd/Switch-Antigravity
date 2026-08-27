@@ -1,0 +1,3 @@
+CORRUPTED OUTPUT WITHOUT HEADERS
+some_random_text_here
+alice@example.com   broken_status   NaN%   ???   foo

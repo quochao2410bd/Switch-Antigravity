@@ -1,0 +1,5 @@
+EMAIL                                 STATUS        GEM-PRO    GEM-FLASH  CLAUDE
+alice@example.com                     cli,ide       85%        95%        70%
+bob.dev@corp.example.org              active        0%         100%       -
+stale.user@domain.com                 token-exp     -          -          -
+fresh.nomodels@domain.com                           -          -          -

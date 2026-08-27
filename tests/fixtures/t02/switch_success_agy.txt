@@ -1,0 +1,2 @@
+Successfully switched active Antigravity account to alice@example.com for target 'agy'.
+Token updated in Windows Credential Manager 'gemini:antigravity'.

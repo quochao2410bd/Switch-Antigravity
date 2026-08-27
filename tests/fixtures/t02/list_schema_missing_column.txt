@@ -1,0 +1,3 @@
+EMAIL                                 STATUS        GEM-PRO    GEM-FLASH
+alice@example.com                     cli,ide       85%        95%
+bob.dev@corp.example.org              active        0%         100%
