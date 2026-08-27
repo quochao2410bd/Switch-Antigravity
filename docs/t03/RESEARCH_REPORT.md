@@ -4,18 +4,18 @@
 **Assigned Issue:** #3 — Desktop conversation restore and automatic resume submission  
 **Assigned Branch:** `research/T03-conversation-resume`  
 **Base SHA:** `3377bf7a0523795a678ac5da951371e3f5ee94c7`  
-**Review Iteration:** R7 (Zero-Trust Review Round 6 Compliance — Final Closure)
+**Review Iteration:** R8 (Zero-Trust Review Round 7 Compliance — Final Async-Runtime Closure)
 
 ---
 
-## 1. Architecture Boundary & Executive Summary
+## 1. Architecture Boundary & Multi-Manager Segregation
 
 T03 owns **ONLY** the Antigravity Desktop conversation restoration, verification, and resume submission adapter. It does **NOT** implement an account database, account rotation, multi-account manager, or credential manager; all multi-account coordination is delegated to the supervisor and T02 AGM integration.
 
 ### Core Hardened Principles:
 - **`DO_NOT_SEND` over `POSSIBLY_SEND_TO_WRONG_THREAD`**: Ambiguous target selection, route pathname divergence, missing target container, or multiple composers fail closed immediately.
 - **`DO_NOT_RESEND` over `POSSIBLY_DUPLICATE_RESUME`**: If state is unconfirmed, an agent turn is active, or the prompt signature exists in conversation history, submission is aborted.
-- **In-Lock Non-Reentrant Authoritative Path**: Authoritative evaluation, fresh disk re-read, reconciliation, reservation, text insertion, durable `SUBMISSION_ATTEMPTED` barrier, and input dispatch are strictly executed **inside** an exclusive non-reentrant cross-process lock using explicit unlocked private methods.
+- **In-Lock Non-Blocking Async Architecture**: Authoritative evaluation, fresh disk re-read, reconciliation, reservation, text insertion, durable `SUBMISSION_ATTEMPTED` barrier, and input dispatch are strictly executed **inside** an async non-blocking cross-process lock (`async_exclusive_lock`) using explicit unlocked private methods.
 
 ---
 

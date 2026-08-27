@@ -373,12 +373,15 @@ class QualifiedAntigravityClient:
                 return {{ error: "WRONG_CONVERSATION_ACTIVE", currentPathname: pathname }};
             }}
 
-            const targetRoot = document.querySelector('main');
-            if (!targetRoot) {{
-                return {{ error: "TARGET_ROOT_NOT_FOUND" }};
-            }}
+            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
+            if (mains.length === 0) return {{ error: "TARGET_ROOT_NOT_FOUND" }};
+            if (mains.length > 1) return {{ error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
+            const targetRoot = mains[0];
 
-            const messageContainer = targetRoot.querySelector('[data-testid="conversation-messages"]') || targetRoot;
+            const messageContainer = targetRoot.querySelector('[data-testid="conversation-messages"]');
+            if (!messageContainer) {{
+                return {{ error: "MESSAGE_CONTAINER_NOT_FOUND" }};
+            }}
             const articles = Array.from(messageContainer.querySelectorAll('article, [role="article"]'));
             
             const mainStopButtons = Array.from(targetRoot.querySelectorAll('button')).filter(b => {{
@@ -470,8 +473,10 @@ class QualifiedAntigravityClient:
                 }}
             }}
 
-            const targetRoot = document.querySelector('main');
-            if (!targetRoot) return {{ found: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
+            if (mains.length === 0) return {{ found: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            if (mains.length > 1) return {{ found: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
+            const targetRoot = mains[0];
 
             const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
             if (editors.length === 0) return {{ found: false, error: "COMPOSER_NOT_FOUND" }};
@@ -588,10 +593,10 @@ class QualifiedAntigravityClient:
                 return {{ safe: false, error: "ROUTE_MUTATED_BEFORE_DISPATCH" }};
             }}
             
-            const targetRoot = document.querySelector('main');
-            if (!targetRoot) {{
-                return {{ safe: false, error: "TARGET_ROOT_NOT_FOUND" }};
-            }}
+            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
+            if (mains.length === 0) return {{ safe: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            if (mains.length > 1) return {{ safe: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
+            const targetRoot = mains[0];
             
             const stopBtn = Array.from(targetRoot.querySelectorAll('button')).find(b => {{
                 if (b.closest('[data-testid="conversation-list-sidebar"]')) return false;
@@ -668,7 +673,7 @@ class QualifiedAntigravityClient:
             "elapsed_seconds": round(time.time() - start, 2)
         }
 
-async def execute_resume_pipeline(args, client_override=None, journal_override=None, external_error_hook=None, pre_lock_barrier=None):
+async def execute_resume_pipeline(args, client_override=None, journal_override=None, external_error_hook=None, pre_lock_barrier=None, in_lock_pause_event=None):
     """
     Main execution pipeline for conversation restore and resume submission.
     Guarantees that all authoritative send decisions and forward reconciliations
@@ -848,8 +853,8 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
             if pre_lock_barrier is not None:
                 await pre_lock_barrier.wait()
 
-            # Production Send Mode: Authoritative decision, reconciliation, reservation & dispatch INSIDE LOCK
-            with journal.exclusive_lock(conversation_uuid=target["uuid"]):
+            # Production Send Mode: Authoritative decision, reconciliation, reservation & dispatch INSIDE ASYNC LOCK
+            async with journal.async_exclusive_lock(conversation_uuid=target["uuid"]):
                 # 1. Re-read fresh journal state from disk
                 latest_rec, j_status = journal.get_latest_record(target["uuid"])
 
@@ -897,6 +902,9 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
                     result["errors"].append("Composer contains unsubmitted user draft. Send refused.")
                     return result
 
+                if in_lock_pause_event is not None:
+                    await in_lock_pause_event.wait()
+
                 # 5. Reserve attempt in NOT_SENT state (explicit unlocked method)
                 attempt_rec = journal._start_recovery_attempt_unlocked(target["uuid"], prompt_text)
                 attempt_id = attempt_rec["attempt_id"]
@@ -936,24 +944,24 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
             
             if turn_res.get("user_message_observed"):
                 result["phases"]["5_user_message_observed"] = True
-                journal.transition_state(target["uuid"], attempt_id, STATE_MESSAGE_OBSERVED)
+                await journal.transition_state_async(target["uuid"], attempt_id, STATE_MESSAGE_OBSERVED)
 
             assistant_type = turn_res.get("assistant_turn_type", "NO_ASSISTANT_TURN")
             if assistant_type in ["ASSISTANT_GENERATION_ACTIVE", "ASSISTANT_GENERATION_COMPLETED"]:
                 result["phases"]["6_assistant_turn_started"] = True
-                journal.transition_state(target["uuid"], attempt_id, STATE_TURN_STARTED)
+                await journal.transition_state_async(target["uuid"], attempt_id, STATE_TURN_STARTED)
                 result["status"] = "TURN_STARTED"
             elif assistant_type == "QUOTA_ERROR_OBSERVED":
-                journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail="API quota exhausted")
+                await journal.transition_state_async(target["uuid"], attempt_id, STATE_FAILED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail="API quota exhausted")
                 result["status"] = "QUOTA_ERROR_OBSERVED"
                 result["errors"].append("Turn started but immediately hit API quota limits.")
             elif assistant_type == "ERROR_RESPONSE_OBSERVED":
-                journal.transition_state(target["uuid"], attempt_id, STATE_FAILED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail="API error received")
+                await journal.transition_state_async(target["uuid"], attempt_id, STATE_FAILED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail="API error received")
                 result["status"] = "ERROR_RESPONSE_OBSERVED"
             elif turn_res.get("user_message_observed"):
                 result["status"] = "USER_MESSAGE_OBSERVED_ASSISTANT_PENDING"
             else:
-                journal.transition_state(target["uuid"], attempt_id, STATE_DISPATCHED_UNCONFIRMED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail="Post-dispatch confirmation timeout")
+                await journal.transition_state_async(target["uuid"], attempt_id, STATE_DISPATCHED_UNCONFIRMED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail="Post-dispatch confirmation timeout")
                 result["status"] = "DISPATCHED_UNCONFIRMED"
                 result["errors"].append("Send input was dispatched, but DOM confirmation timed out. Resend strictly blocked.")
 

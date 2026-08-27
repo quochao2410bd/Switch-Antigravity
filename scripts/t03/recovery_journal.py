@@ -17,6 +17,7 @@ Review Round 6 Hardening:
 - Durability barriers (fsync failure raises JournalDurabilityError).
 """
 
+import asyncio
 import contextlib
 import ctypes
 import hashlib
@@ -271,6 +272,21 @@ def validate_journal_schema(data):
 
     return True
 
+def validate_lock_metadata(lock_meta):
+    """Strictly validates lock file metadata structure and types."""
+    if not isinstance(lock_meta, dict):
+        return False, "Lock metadata root must be an object"
+    owner_pid = lock_meta.get("owner_pid")
+    if not isinstance(owner_pid, int) or owner_pid <= 0:
+        return False, "Invalid or missing owner_pid"
+    nonce = lock_meta.get("lock_nonce")
+    if not nonce or not isinstance(nonce, str):
+        return False, "Invalid or missing lock_nonce"
+    created_at = lock_meta.get("created_at")
+    if not isinstance(created_at, (int, float)) or created_at <= 0:
+        return False, "Invalid or missing created_at"
+    return True, "OK"
+
 def evaluate_recovery_permission(latest_record, live_dom_state, prompt_hash, journal_status="OK", is_first_attempt=False):
     """
     Authoritative evaluation of recovery permission.
@@ -343,6 +359,67 @@ class RecoveryJournal:
         self.lock_path = f"{self.journal_path}.lock"
         self._is_corrupted = False
         self._schema_unsupported = False
+
+    @contextlib.asynccontextmanager
+    async def async_exclusive_lock(self, timeout=5.0, conversation_uuid=None):
+        """
+        Async-safe non-blocking cross-process advisory lock.
+        Uses await asyncio.sleep() to yield control to the event loop on contention.
+        """
+        target_dir = os.path.dirname(os.path.abspath(self.lock_path))
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        start_time = time.time()
+        lock_fd = None
+        current_pid = os.getpid()
+        current_start_id = get_process_start_identity(current_pid)
+        nonce = str(uuid.uuid4())
+
+        while time.time() - start_time < timeout:
+            try:
+                lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                meta = {
+                    "owner_pid": current_pid,
+                    "start_identity": current_start_id,
+                    "lock_nonce": nonce,
+                    "created_at": time.time(),
+                    "conversation_uuid": conversation_uuid
+                }
+                os.write(lock_fd, json.dumps(meta).encode("utf-8"))
+                break
+            except OSError:
+                try:
+                    if os.path.exists(self.lock_path):
+                        with open(self.lock_path, "r", encoding="utf-8") as f:
+                            lock_meta = json.load(f)
+                        valid, _ = validate_lock_metadata(lock_meta)
+                        if valid:
+                            owner_pid = lock_meta.get("owner_pid")
+                            start_id = lock_meta.get("start_identity")
+                            liveness = check_process_liveness(owner_pid, start_id)
+
+                            if liveness == LIVENESS_DEAD_CONFIRMED:
+                                try:
+                                    os.remove(self.lock_path)
+                                    continue
+                                except OSError:
+                                    pass
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)
+
+        if lock_fd is None:
+            raise TimeoutError(f"Could not acquire journal lock '{self.lock_path}' within {timeout}s")
+
+        try:
+            yield
+        finally:
+            try:
+                os.close(lock_fd)
+                if os.path.exists(self.lock_path):
+                    os.remove(self.lock_path)
+            except OSError:
+                pass
 
     @contextlib.contextmanager
     def exclusive_lock(self, timeout=5.0, conversation_uuid=None):
@@ -582,6 +659,11 @@ class RecoveryJournal:
 
         updated_rec, _ = self.get_latest_record(conversation_uuid)
         return updated_rec, reconciled
+
+    # Async public method for async pipelines:
+    async def transition_state_async(self, conversation_uuid, attempt_id, new_state, failure_stage=None, detail=None):
+        async with self.async_exclusive_lock(conversation_uuid=conversation_uuid):
+            return self._transition_state_unlocked(conversation_uuid, attempt_id, new_state, failure_stage, detail)
 
     # Public locked methods:
     def start_recovery_attempt(self, conversation_uuid, prompt_text):
