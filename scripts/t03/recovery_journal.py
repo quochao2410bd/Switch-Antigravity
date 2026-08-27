@@ -157,15 +157,19 @@ def check_process_liveness(pid, expected_start_identity=None):
         try:
             # Check exit code
             exit_code = ctypes.c_ulong()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                STILL_ACTIVE = 259
-                if exit_code.value != STILL_ACTIVE:
-                    return LIVENESS_DEAD_CONFIRMED
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return LIVENESS_UNKNOWN
+            
+            STILL_ACTIVE = 259
+            if exit_code.value != STILL_ACTIVE:
+                return LIVENESS_DEAD_CONFIRMED
 
             # Check PID reuse if start identity was recorded
             if expected_start_identity is not None:
                 current_start = get_process_start_identity(pid)
-                if current_start is not None and current_start != expected_start_identity:
+                if current_start is None:
+                    return LIVENESS_UNKNOWN
+                if current_start != expected_start_identity:
                     return LIVENESS_DEAD_CONFIRMED
 
             return LIVENESS_ALIVE
@@ -176,7 +180,9 @@ def check_process_liveness(pid, expected_start_identity=None):
             os.kill(pid, 0)
             if expected_start_identity is not None:
                 current_start = get_process_start_identity(pid)
-                if current_start is not None and current_start != expected_start_identity:
+                if current_start is None:
+                    return LIVENESS_UNKNOWN
+                if current_start != expected_start_identity:
                     return LIVENESS_DEAD_CONFIRMED
             return LIVENESS_ALIVE
         except ProcessLookupError:
@@ -366,7 +372,8 @@ class RecoveryJournal:
         """
         Async-safe non-blocking cross-process advisory lock.
         Uses await asyncio.sleep() to yield control to the event loop on contention.
-        Verifies ownership nonce on release and uses atomic quarantine rename on stale reclaim.
+        Fails closed on existing lock to prevent ABA stale-reclaim races.
+        Verifies ownership nonce on release.
         """
         target_dir = os.path.dirname(os.path.abspath(self.lock_path))
         if target_dir:
@@ -390,36 +397,8 @@ class RecoveryJournal:
                 os.write(lock_fd, json.dumps(meta).encode("utf-8"))
                 break
             except OSError:
-                try:
-                    if os.path.exists(self.lock_path):
-                        with open(self.lock_path, "r", encoding="utf-8") as f:
-                            lock_meta = json.load(f)
-                        valid, _ = validate_lock_metadata(lock_meta)
-                        if valid:
-                            owner_pid = lock_meta.get("owner_pid")
-                            start_id = lock_meta.get("start_identity")
-                            stale_nonce = lock_meta.get("lock_nonce")
-                            liveness = check_process_liveness(owner_pid, start_id)
-
-                            if liveness == LIVENESS_DEAD_CONFIRMED:
-                                # Safe atomic reclaim via quarantine rename
-                                quarantine_path = f"{self.lock_path}.stale.{stale_nonce}.tmp"
-                                try:
-                                    os.replace(self.lock_path, quarantine_path)
-                                    # Verify renamed metadata matches the inspected stale nonce
-                                    try:
-                                        with open(quarantine_path, "r", encoding="utf-8") as qf:
-                                            q_meta = json.load(qf)
-                                        if q_meta.get("lock_nonce") == stale_nonce:
-                                            os.remove(quarantine_path)
-                                    except Exception:
-                                        if os.path.exists(quarantine_path):
-                                            os.remove(quarantine_path)
-                                    continue
-                                except OSError:
-                                    pass
-                except Exception:
-                    pass
+                # Contention: yield control to the asyncio event loop without content-based deletion.
+                # Strictly fail closed against blind delete/rename to guarantee zero ABA races against successor locks.
                 await asyncio.sleep(0.05)
 
         if lock_fd is None:
@@ -450,7 +429,8 @@ class RecoveryJournal:
         """
         Synchronous cross-process advisory lock.
         Writes ownership metadata (owner_pid, start_identity, lock_nonce, timestamp, conversation_uuid).
-        Verifies ownership nonce on release and uses atomic quarantine rename on stale reclaim.
+        Fails closed on existing lock to prevent ABA stale-reclaim races.
+        Verifies ownership nonce on release.
         """
         target_dir = os.path.dirname(os.path.abspath(self.lock_path))
         if target_dir:
@@ -474,34 +454,6 @@ class RecoveryJournal:
                 os.write(lock_fd, json.dumps(meta).encode("utf-8"))
                 break
             except OSError:
-                try:
-                    if os.path.exists(self.lock_path):
-                        with open(self.lock_path, "r", encoding="utf-8") as f:
-                            lock_meta = json.load(f)
-                        valid, _ = validate_lock_metadata(lock_meta)
-                        if valid:
-                            owner_pid = lock_meta.get("owner_pid")
-                            start_id = lock_meta.get("start_identity")
-                            stale_nonce = lock_meta.get("lock_nonce")
-                            liveness = check_process_liveness(owner_pid, start_id)
-
-                            if liveness == LIVENESS_DEAD_CONFIRMED:
-                                quarantine_path = f"{self.lock_path}.stale.{stale_nonce}.tmp"
-                                try:
-                                    os.replace(self.lock_path, quarantine_path)
-                                    try:
-                                        with open(quarantine_path, "r", encoding="utf-8") as qf:
-                                            q_meta = json.load(qf)
-                                        if q_meta.get("lock_nonce") == stale_nonce:
-                                            os.remove(quarantine_path)
-                                    except Exception:
-                                        if os.path.exists(quarantine_path):
-                                            os.remove(quarantine_path)
-                                    continue
-                                except OSError:
-                                    pass
-                except Exception:
-                    pass
                 time.sleep(0.05)
 
         if lock_fd is None:

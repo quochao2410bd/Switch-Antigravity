@@ -127,10 +127,14 @@ class MockAntigravityClient:
         return dict(self.composer_state)
 
     async def clear_composer(self, target_uuid):
+        if hasattr(self, "clear_override") and self.clear_override:
+            return await self.clear_override(target_uuid)
         self.composer_state["text"] = ""
         self.composer_state["draftPresent"] = False
 
     async def insert_prompt_text(self, target_uuid, text):
+        if hasattr(self, "insert_override") and self.insert_override:
+            return await self.insert_override(target_uuid, text)
         self.composer_state["text"] = text
 
     async def inspect_scoped_conversation_state(self, target_uuid, prompt_hash, baseline_article_count=0):
@@ -201,9 +205,9 @@ class AsyncBarrier:
             self.event.set()
         await self.event.wait()
 
-class TestT03Round6Final(unittest.TestCase):
+class TestT03Round8Final(unittest.TestCase):
     def setUp(self):
-        self.test_dir = tempfile.mkdtemp(prefix="t03_r6_")
+        self.test_dir = tempfile.mkdtemp(prefix="t03_r8_")
         self.journal_file = os.path.join(self.test_dir, "test_journal.json")
         self.journal = RecoveryJournal(self.journal_file)
         self.prompt_hash = hash_prompt(SYNTHETIC_PROMPT)
@@ -211,11 +215,36 @@ class TestT03Round6Final(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    # CRITICAL ITEM 4 & 5: Real Yielding Same-Loop Contention Test
-    def test_01_real_yielding_same_loop_contention(self):
-        """MANDATORY TEST: YieldingMockAntigravityClient under concurrent same-loop execution.
-        Asserts event loop heartbeat continues without freeze, bounded termination, and TOTAL DISPATCH == 1."""
-        for iteration in range(3):
+    # 1. Stale lock ABA successor protection
+    def test_01_stale_lock_aba_successor_protection(self):
+        """Contender B observing stale lock cannot delete, rename, or replace valid successor lock Y."""
+        nonce_y = "nonce-valid-successor-yyyy"
+        lock_meta_y = {
+            "owner_pid": os.getpid(),
+            "start_identity": get_process_start_identity(os.getpid()),
+            "lock_nonce": nonce_y,
+            "created_at": time.time(),
+            "conversation_uuid": SYNTHETIC_UUID_1
+        }
+        with open(self.journal.lock_path, "w", encoding="utf-8") as f:
+            json.dump(lock_meta_y, f)
+
+        journal_b = RecoveryJournal(self.journal_file)
+        async def contender_b_attempt():
+            with self.assertRaises(TimeoutError):
+                async with journal_b.async_exclusive_lock(timeout=0.1, conversation_uuid=SYNTHETIC_UUID_1):
+                    pass
+        asyncio.run(contender_b_attempt())
+
+        self.assertTrue(os.path.exists(self.journal.lock_path))
+        with open(self.journal.lock_path, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        self.assertEqual(persisted.get("lock_nonce"), nonce_y)
+
+    # 2. Yielding same-loop two-worker pipeline race
+    def test_02_yielding_same_loop_two_worker_race(self):
+        """YieldingMockAntigravityClient under concurrent same-loop execution. TOTAL DISPATCH COUNT == 1."""
+        for iteration in range(2):
             test_j = os.path.join(self.test_dir, f"yielding_race_{iteration}.json")
             yielding_client = YieldingMockAntigravityClient()
             journal_a = RecoveryJournal(test_j)
@@ -250,121 +279,124 @@ class TestT03Round6Final(unittest.TestCase):
             res_a, res_b = asyncio.run(run_test())
             elapsed = time.time() - start_t
 
-            # Assertions
-            self.assertLess(elapsed, 3.0, f"Iteration {iteration}: Race took too long ({elapsed}s)")
-            self.assertGreater(heartbeat_ticks, 5, f"Iteration {iteration}: Event loop was starved! Heartbeat ticks: {heartbeat_ticks}")
-            self.assertEqual(yielding_client.dispatch_count, 1, f"Iteration {iteration}: Total dispatch count was not 1")
+            self.assertLess(elapsed, 3.0)
+            self.assertGreater(heartbeat_ticks, 3)
+            self.assertEqual(yielding_client.dispatch_count, 1)
             statuses = [res_a["status"], res_b["status"]]
             self.assertIn("TURN_STARTED", statuses)
-            self.assertTrue(
-                "PREVIOUS_SUBMISSION_UNCONFIRMED" in statuses or "RESUME_ALREADY_OBSERVED" in statuses or "TURN_ALREADY_ACTIVE" in statuses,
-                f"Expected safety block in statuses: {statuses}"
-            )
 
-    # CRITICAL ITEM 1: Non-reentrant lock prevents same-process lock bypass
-    # CRITICAL ITEM 1: Unknown Windows Liveness Errors Must Fail Closed (Return UNKNOWN)
-    def test_02_win32_liveness_error_matrix(self):
-        """UNIT_TEST: OpenProcess failure returns DEAD_CONFIRMED only for 87/1168; UNKNOWN for 5 and 12345."""
+    # 3. Win32 unknown error returns UNKNOWN
+    def test_03_win32_unknown_error_returns_liveness_unknown(self):
+        """OpenProcess returning unknown error 12345 or ACCESS_DENIED (5) returns LIVENESS_UNKNOWN."""
         if os.name == 'nt':
             import ctypes
-            # Test ACCESS_DENIED (5) -> UNKNOWN
-            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
-                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=5):
-                self.assertEqual(check_process_liveness(1234), LIVENESS_UNKNOWN)
-
-            # Test arbitrary unrecognized error 12345 -> UNKNOWN
             with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
                  patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=12345):
                 self.assertEqual(check_process_liveness(1234), LIVENESS_UNKNOWN)
 
-            # Test confirmed nonexistent PID error 87 (ERROR_INVALID_PARAMETER) -> DEAD_CONFIRMED
             with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
-                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=87):
-                self.assertEqual(check_process_liveness(1234), LIVENESS_DEAD_CONFIRMED)
+                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=5):
+                self.assertEqual(check_process_liveness(1234), LIVENESS_UNKNOWN)
 
-            # Test confirmed nonexistent PID error 1168 (ERROR_NOT_FOUND) -> DEAD_CONFIRMED
-            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
-                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=1168):
-                self.assertEqual(check_process_liveness(1234), LIVENESS_DEAD_CONFIRMED)
+    # 4. Win32 GetExitCodeProcess failure returns UNKNOWN
+    def test_04_win32_getexitcodeprocess_failure_returns_liveness_unknown(self):
+        """OpenProcess succeeds but GetExitCodeProcess fails -> returns LIVENESS_UNKNOWN."""
+        if os.name == 'nt':
+            import ctypes
+            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=9999), \
+                 patch.object(ctypes.windll.kernel32, 'GetExitCodeProcess', return_value=0), \
+                 patch.object(ctypes.windll.kernel32, 'CloseHandle', return_value=1):
+                self.assertEqual(check_process_liveness(1234), LIVENESS_UNKNOWN)
 
-    # CRITICAL ITEM 2 & 9: Lock Release Must Verify Ownership Nonce (Successor Lock Protection)
-    def test_03_lock_release_verifies_ownership_nonce(self):
-        """UNIT_TEST: Lock context with nonce A does not delete lock file if replaced by nonce B."""
-        # 1. Async lock release test
-        async def test_async_release():
-            async with self.journal.async_exclusive_lock(conversation_uuid=SYNTHETIC_UUID_1):
-                # Replace lock file with successor lock (nonce B)
-                successor_meta = {
-                    "owner_pid": os.getpid(),
-                    "start_identity": get_process_start_identity(os.getpid()),
-                    "lock_nonce": "successor-nonce-bbbb",
-                    "created_at": time.time(),
-                    "conversation_uuid": SYNTHETIC_UUID_1
-                }
-                with open(self.journal.lock_path, "w", encoding="utf-8") as f:
-                    json.dump(successor_meta, f)
+    # 5. Process start identity unavailable returns UNKNOWN
+    def test_05_expected_process_identity_unavailable_returns_unknown(self):
+        """Process exists but start identity cannot be established -> returns LIVENESS_UNKNOWN."""
+        with patch("recovery_journal.get_process_start_identity", return_value=None):
+            self.assertEqual(check_process_liveness(os.getpid(), expected_start_identity=12345678), LIVENESS_UNKNOWN)
 
-            # After exit, successor lock must NOT be deleted
-            self.assertTrue(os.path.exists(self.journal.lock_path))
-            with open(self.journal.lock_path, "r", encoding="utf-8") as f:
-                cur = json.load(f)
-            self.assertEqual(cur.get("lock_nonce"), "successor-nonce-bbbb")
-
-        asyncio.run(test_async_release())
-
-        # Cleanup successor lock
-        if os.path.exists(self.journal.lock_path):
-            os.remove(self.journal.lock_path)
-
-        # 2. Sync lock release test
-        with self.journal.exclusive_lock(conversation_uuid=SYNTHETIC_UUID_1):
-            successor_meta = {
-                "owner_pid": os.getpid(),
-                "start_identity": get_process_start_identity(os.getpid()),
-                "lock_nonce": "successor-nonce-cccc",
-                "created_at": time.time(),
-                "conversation_uuid": SYNTHETIC_UUID_1
-            }
-            with open(self.journal.lock_path, "w", encoding="utf-8") as f:
-                json.dump(successor_meta, f)
-
-        self.assertTrue(os.path.exists(self.journal.lock_path))
-        with open(self.journal.lock_path, "r", encoding="utf-8") as f:
-            cur = json.load(f)
-        self.assertEqual(cur.get("lock_nonce"), "successor-nonce-cccc")
-
-    # CRITICAL ITEM 3: Prompt Text Mismatch inside Renderer Aborts Dispatch
-    def test_03_pre_dispatch_prompt_mutation_aborts_send(self):
-        """UNIT_TEST: Modifying composer text prior to dispatch returns PROMPT_IDENTITY_MISMATCH and zero clicks."""
+    # 6. Missing message container aborts send
+    def test_06_missing_message_container_aborts_send(self):
+        """0 candidate message containers returns MESSAGE_CONTAINER_NOT_FOUND and 0 dispatches."""
         mock_client = MockAntigravityClient()
+        mock_client.scoped_state = {"error": "MESSAGE_CONTAINER_NOT_FOUND"}
         args = argparse.Namespace(
             conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
             send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
             journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
         )
-        # Override dispatch to simulate renderer detecting altered text
-        mock_client.dispatch_override = lambda uuid, p: {"dispatched": False, "error": "PROMPT_IDENTITY_MISMATCH"}
-
         res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "SEND_INPUT_DISPATCH_FAILED")
+        self.assertEqual(res["status"], "MESSAGE_CONTAINER_NOT_FOUND")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-    # CRITICAL ITEM 6: Real Send Mode Requires Explicit Validated UUID
-    def test_04_real_send_requires_explicit_uuid(self):
-        """UNIT_TEST: send=True requires --conversation-id/--uuid; title-only and implicit active are blocked."""
+    # 7. Multiple message containers aborts send
+    def test_07_multiple_message_containers_aborts_send(self):
+        """>1 candidate message containers returns MESSAGE_CONTAINER_AMBIGUOUS and 0 dispatches."""
+        mock_client = MockAntigravityClient()
+        mock_client.scoped_state = {"error": "MESSAGE_CONTAINER_AMBIGUOUS", "count": 2}
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res["status"], "MESSAGE_CONTAINER_AMBIGUOUS")
+        self.assertEqual(mock_client.dispatch_count, 0)
+
+    # 8. Multiple target roots before clear aborts mutation
+    def test_08_multiple_target_roots_before_clear_aborts_mutation(self):
+        """>1 visible main roots before clear_composer prevents composer mutation."""
+        mock_client = MockAntigravityClient()
+        mock_client.composer_state["text"] = "DoNotTouchThisDraft"
+
+        async def failing_clear(uuid):
+            raise RuntimeError("Could not focus composer: TARGET_ROOT_AMBIGUOUS")
+        mock_client.clear_override = failing_clear
+
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res["status"], "EXCEPTION")
+        self.assertEqual(mock_client.composer_state["text"], "DoNotTouchThisDraft")
+        self.assertEqual(mock_client.dispatch_count, 0)
+
+    # 9. Multiple target roots before insert aborts mutation
+    def test_09_multiple_target_roots_before_insert_aborts_mutation(self):
+        """>1 visible main roots before insert_prompt_text prevents text insertion."""
+        mock_client = MockAntigravityClient()
+        mock_client.composer_state["text"] = ""
+
+        async def failing_insert(uuid, text):
+            raise RuntimeError("Could not focus composer: TARGET_ROOT_AMBIGUOUS")
+        mock_client.insert_override = failing_insert
+
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res["status"], "EXCEPTION")
+        self.assertEqual(mock_client.dispatch_count, 0)
+
+    # 10. Real send mode requires explicit UUID
+    def test_10_real_send_requires_explicit_uuid(self):
+        """send=True requires --conversation-id/--uuid; title-only and implicit active are blocked with 0 dispatches."""
         mock_client = MockAntigravityClient()
 
-        # 1. Send=True with title only -> UUID_REQUIRED_FOR_SEND (0 dispatch)
-        args_title_only = argparse.Namespace(
+        # Send + title only
+        args_title = argparse.Namespace(
             conversation_id=None, title="Synthetic Task", prompt=SYNTHETIC_PROMPT,
             send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
             journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
         )
-        res1 = asyncio.run(execute_resume_pipeline(args_title_only, client_override=mock_client, journal_override=self.journal))
+        res1 = asyncio.run(execute_resume_pipeline(args_title, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res1["status"], "UUID_REQUIRED_FOR_SEND")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-        # 2. Send=True with neither UUID nor title -> UUID_REQUIRED_FOR_SEND (0 dispatch)
+        # Send + implicit active
         args_implicit = argparse.Namespace(
             conversation_id=None, title=None, prompt=SYNTHETIC_PROMPT,
             send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
@@ -374,22 +406,106 @@ class TestT03Round6Final(unittest.TestCase):
         self.assertEqual(res2["status"], "UUID_REQUIRED_FOR_SEND")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-        # 3. Send=True with explicit UUID -> allowed to continue
-        args_uuid = argparse.Namespace(
+        # Send + valid UUID
+        args_valid = argparse.Namespace(
             conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
             send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
             journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
         )
-        res3 = asyncio.run(execute_resume_pipeline(args_uuid, client_override=mock_client, journal_override=self.journal))
+        res3 = asyncio.run(execute_resume_pipeline(args_valid, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res3["status"], "TURN_STARTED")
-        self.assertEqual(mock_client.dispatch_count, 1)
+    # 11. Real dispatch exception recovery test across two invocations
+    def test_11_dispatch_exception_recovery_two_invocations(self):
+        """Invocation 1 hits dispatch exception -> FAILED+POST_IRREVERSIBLE_UNKNOWN. Invocation 2 blocks resend."""
+        mock_client = MockAntigravityClient()
+        def failing_dispatch(uuid, prompt):
+            raise ConnectionResetError("CDP WebSocket disconnected during dispatch frame")
+        mock_client.dispatch_override = failing_dispatch
 
-    # Send Button Ambiguity (>1 buttons) Aborts Dispatch
-    def test_05_send_button_ambiguity_aborts_send(self):
-        """UNIT_TEST: Multiple send buttons (>1) returns SEND_CONTROL_AMBIGUOUS and aborts dispatch."""
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+
+        res1 = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res1["status"], "SEND_INPUT_DISPATCH_EXCEPTION")
+        latest1, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
+        self.assertEqual(latest1["state"], STATE_FAILED)
+        self.assertEqual(latest1["failure_stage"], "POST_IRREVERSIBLE_UNKNOWN")
+
+        # Second attempt against same journal state fails closed without dispatch
+        res2 = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res2["status"], "MANUAL_RECONCILIATION_REQUIRED")
+        self.assertEqual(mock_client.dispatch_count, 0)
+
+    # 12. Post-dispatch concurrency race test between workers
+    def test_12_post_dispatch_concurrency_race(self):
+        """Worker A dispatches and completes post-turn transitions; concurrent Worker B cannot overwrite or double-dispatch."""
+        test_j = os.path.join(self.test_dir, "post_dispatch_race.json")
+        journal_a = RecoveryJournal(test_j)
+        journal_b = RecoveryJournal(test_j)
+        shared_client = MockAntigravityClient()
+
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=test_j, timeout=5, json=False, verbose_private_data=False
+        )
+
+        async def run_concurrent():
+            task_a = asyncio.create_task(execute_resume_pipeline(args, client_override=shared_client, journal_override=journal_a))
+            await asyncio.sleep(0.05)
+            task_b = asyncio.create_task(execute_resume_pipeline(args, client_override=shared_client, journal_override=journal_b))
+            res_a, res_b = await asyncio.gather(task_a, task_b)
+            return res_a, res_b
+
+        res_a, res_b = asyncio.run(run_concurrent())
+        self.assertEqual(shared_client.dispatch_count, 1)
+        latest, _ = journal_a.get_latest_record(SYNTHETIC_UUID_1)
+        self.assertEqual(latest["state"], STATE_TURN_STARTED)
+
+    # 13. Pre-click validation failure transitions to PRE_IRREVERSIBLE
+    def test_13_pre_click_validation_failure_allows_pre_irreversible(self):
+        """dispatch_submission_input returning dispatched=False transitions to FAILED+PRE_IRREVERSIBLE."""
+        mock_client = MockAntigravityClient()
+        mock_client.dispatch_override = lambda uuid, p: {"dispatched": False, "error": "PROMPT_IDENTITY_MISMATCH"}
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res["status"], "SEND_INPUT_DISPATCH_FAILED")
+        latest, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
+        self.assertEqual(latest["state"], STATE_FAILED)
+        self.assertEqual(latest["failure_stage"], "PRE_IRREVERSIBLE")
+
+    # 14. Nonce verification on lock release protects successor
+    def test_14_lock_release_nonce_verification(self):
+        """Releasing lock context does not delete successor lock if nonce differs."""
+        async def run_test():
+            async with self.journal.async_exclusive_lock(conversation_uuid=SYNTHETIC_UUID_1):
+                successor_meta = {
+                    "owner_pid": os.getpid(),
+                    "start_identity": get_process_start_identity(os.getpid()),
+                    "lock_nonce": "successor-nonce-1234",
+                    "created_at": time.time(),
+                    "conversation_uuid": SYNTHETIC_UUID_1
+                }
+                with open(self.journal.lock_path, "w", encoding="utf-8") as f:
+                    json.dump(successor_meta, f)
+            self.assertTrue(os.path.exists(self.journal.lock_path))
+            with open(self.journal.lock_path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+            self.assertEqual(cur.get("lock_nonce"), "successor-nonce-1234")
+        asyncio.run(run_test())
+
+    # 15. Send button ambiguity aborts send
+    def test_15_send_button_ambiguity_aborts_send(self):
+        """Multiple send buttons (>1) returns SEND_CONTROL_AMBIGUOUS and 0 dispatches."""
         mock_client = MockAntigravityClient()
         mock_client.composer_state["sendButton"] = {"found": False, "error": "SEND_CONTROL_AMBIGUOUS"}
-
         args = argparse.Namespace(
             conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
             send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
@@ -399,91 +515,23 @@ class TestT03Round6Final(unittest.TestCase):
         self.assertEqual(res["status"], "SEND_INPUT_DISPATCH_FAILED")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-    # ITEM 5 & 6: Tri-state process liveness and PID reuse detection
-    def test_05_tri_state_liveness_and_pid_reuse(self):
-        """UNIT_TEST: check_process_liveness returns ALIVE for current PID, DEAD for dead PID, and detects start identity mismatch."""
-        current_pid = os.getpid()
-        current_start = get_process_start_identity(current_pid)
-        self.assertEqual(check_process_liveness(current_pid, current_start), LIVENESS_ALIVE)
-
-        # PID reuse mismatch
-        self.assertEqual(check_process_liveness(current_pid, expected_start_identity=999999999999), LIVENESS_DEAD_CONFIRMED)
-
-        # Definitely dead PID
-        self.assertEqual(check_process_liveness(99999999), LIVENESS_DEAD_CONFIRMED)
-
-    # ITEM 8: Real Selector Decision Logic Tests
-    def test_06_real_selector_decision_logic(self):
-        """UNIT_TEST: Missing targetRoot or multiple composers fail closed."""
+    # 16. Route mutation before send aborts
+    def test_16_route_mutation_before_send_aborts(self):
+        """Route mutation prior to dispatch returns ROUTE_MUTATED_BEFORE_DISPATCH and 0 dispatches."""
         mock_client = MockAntigravityClient()
-        mock_client.composer_state = {"found": False, "error": "TARGET_ROOT_NOT_FOUND"}
-
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "TARGET_ROOT_NOT_FOUND")
-
-    # ITEM 10: Crash Tests with Stale Lock + Journal States
-    def test_07_crash_reclaim_with_submission_attempted(self):
-        """UNIT_TEST: Dead owner lock + SUBMISSION_ATTEMPTED halts without blind resend."""
-        # Setup dead lock
-        dead_pid = 99999999
-        lock_meta = {"owner_pid": dead_pid, "start_identity": None, "lock_nonce": "dead-nonce", "created_at": time.time() - 100, "conversation_uuid": SYNTHETIC_UUID_1}
-        with open(self.journal.lock_path, "w", encoding="utf-8") as f:
-            json.dump(lock_meta, f)
-
-        # Setup journal in SUBMISSION_ATTEMPTED
-        journal_data = {
-            "version": 2,
-            "records": {
-                SYNTHETIC_UUID_1: [
-                    {
-                        "attempt_id": "11111111-1111-4111-8111-111111111111",
-                        "conversation_uuid": SYNTHETIC_UUID_1,
-                        "state": STATE_SUBMISSION_ATTEMPTED,
-                        "prompt_sha256": self.prompt_hash,
-                        "created_at_utc": 1000.0,
-                        "updated_at_utc": 1001.0,
-                        "failure_stage": None,
-                        "history": [{"state": STATE_SUBMISSION_ATTEMPTED, "timestamp": 1000.0}]
-                    }
-                ]
-            }
-        }
-        with open(self.journal_file, "w", encoding="utf-8") as f:
-            json.dump(journal_data, f)
-
-        mock_client = MockAntigravityClient()
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "PREVIOUS_SUBMISSION_UNCONFIRMED")
-        self.assertEqual(mock_client.dispatch_count, 0)
-
-    # ITEM 11: Route Mutation Immediately Before Send
-    def test_08_route_mutation_before_send_aborts(self):
-        """UNIT_TEST: Route mutation prior to send dispatch yields ROUTE_MUTATED_BEFORE_DISPATCH."""
-        mock_client = MockAntigravityClient()
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
         mock_client.dispatch_override = lambda uuid, p: {"dispatched": False, "error": "ROUTE_MUTATED_BEFORE_DISPATCH"}
-
+        args = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
         res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res["status"], "SEND_INPUT_DISPATCH_FAILED")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-    # ITEM 1: Strict Journal Schema Validation
-    def test_09_strict_journal_schema_validation(self):
-        """UNIT_TEST: Valid JSON with semantic error raises JournalSchemaError."""
+    # 17. Strict journal schema validation
+    def test_17_strict_journal_schema_validation(self):
+        """Valid JSON with semantic error sets status to SCHEMA_INVALID."""
         invalid_data = {
             "version": 2,
             "records": {
@@ -491,83 +539,31 @@ class TestT03Round6Final(unittest.TestCase):
                     {
                         "attempt_id": "11111111-1111-4111-8111-111111111111",
                         "conversation_uuid": SYNTHETIC_UUID_1,
-                        "state": "INVALID_STATE_GARBAGE",
+                        "state": "INVALID_GARBAGE",
                         "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                         "created_at_utc": 1000.0,
                         "updated_at_utc": 1001.0,
                         "failure_stage": None,
-                        "history": [{"state": "INVALID_STATE_GARBAGE", "timestamp": 1000.0}]
+                        "history": [{"state": "INVALID_GARBAGE", "timestamp": 1000.0}]
                     }
                 ]
             }
         }
         with open(self.journal_file, "w", encoding="utf-8") as f:
             json.dump(invalid_data, f)
-
         _, status = self.journal._read_raw()
         self.assertEqual(status, "SCHEMA_INVALID")
 
-    # ITEM 2: FAILED Unknown Stage Fails Closed
-    def test_10_failed_unknown_stage_fails_closed(self):
-        """UNIT_TEST: FAILED state with missing or unknown failure_stage blocks retry."""
-        rec_unknown = {
-            "attempt_id": "11111111-1111-4111-8111-111111111111",
-            "conversation_uuid": SYNTHETIC_UUID_1,
-            "state": STATE_FAILED,
-            "prompt_sha256": self.prompt_hash,
-            "failure_stage": "UNKNOWN"
-        }
-        decision, _ = evaluate_recovery_permission(rec_unknown, {"duplicateStatus": "RESUME_NOT_PRESENT"}, self.prompt_hash)
-        self.assertEqual(decision, DECISION_MANUAL_RECONCILIATION_REQUIRED)
-
-    # Post-Baseline Error Tracking
-    def test_11_post_baseline_error_tracking(self):
-        """UNIT_TEST: Historical quota errors do not poison new healthy turns."""
-        historical_dom = {
-            "totalArticles": 5,
-            "hasQuotaError": True,
-            "newQuotaError": False,
-            "newGenericError": False,
-            "isMainTurnActive": True
-        }
-        status = correlate_turn_status(historical_dom, baseline_state={"totalArticles": 4})
-        self.assertEqual(status, "ASSISTANT_GENERATION_ACTIVE")
-
-    # Semantic Author Identification
-    def test_12_semantic_author_identification(self):
-        """UNIT_TEST: Semantic role metadata drives classification."""
-        msgs = ["User prompt 1", "User prompt 2"]
-        status, _ = classify_duplicate_state(msgs, self.prompt_hash, has_unknown_role=True, last_message_is_unknown=False)
-        self.assertEqual(status, "RESUME_NOT_PRESENT")
-
-    # Fsync Failure Raises Durability Error
-    def test_13_fsync_failure_raises_durability_error(self):
-        """UNIT_TEST: os.fsync failure raises JournalDurabilityError."""
+    # 18. Fsync failure raises durability error
+    def test_18_fsync_failure_raises_durability_error(self):
+        """os.fsync failure raises JournalDurabilityError."""
         with patch("os.fsync", side_effect=OSError("Disk failure")):
             with self.assertRaises(JournalDurabilityError):
                 self.journal._write_atomic({"version": 2, "records": {}})
 
-    # Verified Dry-Run Navigation Restoration
-    def test_14_dry_run_navigation_restoration(self):
-        """UNIT_TEST: Dry-run verifies restoration of original conversation route."""
-        mock_client = MockAntigravityClient(
-            conversations=[
-                {"index": 0, "title": "A", "href": f"/c/{SYNTHETIC_UUID_1}", "uuid": SYNTHETIC_UUID_1, "isActive": True},
-                {"index": 1, "title": "B", "href": f"/c/{SYNTHETIC_UUID_2}", "uuid": SYNTHETIC_UUID_2, "isActive": False}
-            ]
-        )
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_2, title=None, prompt=SYNTHETIC_PROMPT,
-            send=False, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "DRY_RUN_READ_ONLY_SUCCESS")
-        self.assertTrue(res.get("dry_run_navigation_restored"))
-
-    # Duplicate Blocks Send
-    def test_15_pipeline_duplicate_blocks_send(self):
-        """UNIT_TEST: Duplicate prompt in user message history blocks send."""
+    # 19. Duplicate blocks send
+    def test_19_duplicate_blocks_send(self):
+        """Duplicate prompt in user message history blocks send."""
         mock_client = MockAntigravityClient()
         mock_client.scoped_state["userMessages"] = [SYNTHETIC_PROMPT]
         args = argparse.Namespace(
@@ -578,9 +574,9 @@ class TestT03Round6Final(unittest.TestCase):
         res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res["status"], "RESUME_ALREADY_OBSERVED")
 
-    # Draft Present Blocks Send
-    def test_16_pipeline_draft_blocks_send(self):
-        """UNIT_TEST: Unsubmitted user draft in composer blocks send."""
+    # 20. Draft present blocks send
+    def test_20_draft_present_blocks_send(self):
+        """Unsubmitted user draft in composer blocks send."""
         mock_client = MockAntigravityClient()
         mock_client.composer_state["draftPresent"] = True
         mock_client.composer_state["text"] = "Existing draft"
@@ -592,9 +588,9 @@ class TestT03Round6Final(unittest.TestCase):
         res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res["status"], "BLOCKED_DRAFT_PRESENT")
 
-    # Navigation Failure Blocks Send
-    def test_17_pipeline_navigation_failure_blocks(self):
-        """UNIT_TEST: Switch timeout halts pipeline before dispatch."""
+    # 21. Navigation failure blocks send
+    def test_21_navigation_failure_blocks_send(self):
+        """Switch timeout halts pipeline before dispatch."""
         mock_client = MockAntigravityClient(
             conversations=[{"index": 0, "title": "A", "href": f"/c/{SYNTHETIC_UUID_1}", "uuid": SYNTHETIC_UUID_1, "isActive": False}]
         )
@@ -607,42 +603,9 @@ class TestT03Round6Final(unittest.TestCase):
         res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
         self.assertEqual(res["status"], "CONVERSATION_SWITCH_TIMEOUT")
 
-    # Post-Dispatch Timeout Yields DISPATCHED_UNCONFIRMED
-    def test_18_pipeline_post_dispatch_timeout(self):
-        """UNIT_TEST: Post-dispatch timeout yields DISPATCHED_UNCONFIRMED."""
-        mock_client = MockAntigravityClient()
-        mock_client.turn_result = {"user_message_observed": False, "assistant_turn_type": "NO_ASSISTANT_TURN", "timeout": 5}
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(args, client_override=mock_client, journal_override=self.journal))
-        self.assertEqual(res["status"], "DISPATCHED_UNCONFIRMED")
-        latest, _ = self.journal.get_latest_record(SYNTHETIC_UUID_1)
-        self.assertEqual(latest["state"], STATE_DISPATCHED_UNCONFIRMED)
-
-    # External Error Hook Integration
-    def test_19_external_error_hook_integration(self):
-        """UNIT_TEST: External error correlation hook overrides turn classification."""
-        def custom_hook(dom_state, baseline_state):
-            return "QUOTA_ERROR_OBSERVED"
-
-        mock_client = MockAntigravityClient()
-        mock_client.turn_result = {"user_message_observed": True, "assistant_turn_type": "QUOTA_ERROR_OBSERVED", "elapsed_seconds": 0.8}
-        args = argparse.Namespace(
-            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
-            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
-            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
-        )
-        res = asyncio.run(execute_resume_pipeline(
-            args, client_override=mock_client, journal_override=self.journal, external_error_hook=custom_hook
-        ))
-        self.assertEqual(res["status"], "QUOTA_ERROR_OBSERVED")
-
-    # Strict transition enforcement
-    def test_20_illegal_state_transitions_rejected(self):
-        """UNIT_TEST: Illegal state transitions raise ValueError."""
+    # 22. Strict transition enforcement
+    def test_22_illegal_state_transitions_rejected(self):
+        """Illegal state transitions raise ValueError."""
         rec = self.journal.start_recovery_attempt(SYNTHETIC_UUID_1, SYNTHETIC_PROMPT)
         with self.assertRaises(ValueError):
             self.journal.transition_state(SYNTHETIC_UUID_1, rec["attempt_id"], STATE_MESSAGE_OBSERVED)

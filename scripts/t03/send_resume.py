@@ -378,10 +378,14 @@ class QualifiedAntigravityClient:
             if (mains.length > 1) return {{ error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
             const targetRoot = mains[0];
 
-            const messageContainer = targetRoot.querySelector('[data-testid="conversation-messages"]');
-            if (!messageContainer) {{
+            const messageContainers = Array.from(targetRoot.querySelectorAll('[data-testid="conversation-messages"]')).filter(c => !!c.offsetParent);
+            if (messageContainers.length === 0) {{
                 return {{ error: "MESSAGE_CONTAINER_NOT_FOUND" }};
             }}
+            if (messageContainers.length > 1) {{
+                return {{ error: "MESSAGE_CONTAINER_AMBIGUOUS", count: messageContainers.length }};
+            }}
+            const messageContainer = messageContainers[0];
             const articles = Array.from(messageContainer.querySelectorAll('article, [role="article"]'));
             
             const mainStopButtons = Array.from(targetRoot.querySelectorAll('button')).filter(b => {{
@@ -527,10 +531,13 @@ class QualifiedAntigravityClient:
         ((targetUuid) => {{
             const pathname = window.location.pathname.toLowerCase();
             if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ focused: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-            const targetRoot = document.querySelector('main');
-            if (!targetRoot) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
+            if (mains.length === 0) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            if (mains.length > 1) return {{ focused: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
+            const targetRoot = mains[0];
             const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-            if (editors.length !== 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS_OR_MISSING" }};
+            if (editors.length === 0) return {{ focused: false, error: "COMPOSER_NOT_FOUND" }};
+            if (editors.length > 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS", count: editors.length }};
             const editor = editors[0];
             editor.focus();
             return {{ focused: (document.activeElement === editor) }};
@@ -560,10 +567,13 @@ class QualifiedAntigravityClient:
         ((targetUuid) => {{
             const pathname = window.location.pathname.toLowerCase();
             if (pathname !== '/c/' + targetUuid.toLowerCase()) return {{ focused: false, error: "WRONG_CONVERSATION_ACTIVE" }};
-            const targetRoot = document.querySelector('main');
-            if (!targetRoot) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            const mains = Array.from(document.querySelectorAll('main')).filter(m => !!m.offsetParent);
+            if (mains.length === 0) return {{ focused: false, error: "TARGET_ROOT_NOT_FOUND" }};
+            if (mains.length > 1) return {{ focused: false, error: "TARGET_ROOT_AMBIGUOUS", count: mains.length }};
+            const targetRoot = mains[0];
             const editors = Array.from(targetRoot.querySelectorAll('[data-lexical-editor="true"]')).filter(e => !!e.offsetParent);
-            if (editors.length !== 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS_OR_MISSING" }};
+            if (editors.length === 0) return {{ focused: false, error: "COMPOSER_NOT_FOUND" }};
+            if (editors.length > 1) return {{ focused: false, error: "COMPOSER_AMBIGUOUS", count: editors.length }};
             const editor = editors[0];
             editor.focus();
             return {{ focused: (document.activeElement === editor) }};
