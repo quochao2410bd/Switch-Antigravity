@@ -19,28 +19,25 @@ T03 owns **ONLY** the Antigravity Desktop conversation restoration, verification
 
 ---
 
-## 2. Review Round 6 Defect Remediation (Items 1 – 14)
+## 2. Review Round 7 Defect Remediation (Items 1 – 14)
 
 | Item | Problem Addressed | Production Change | Resulting Classification |
 | :--- | :--- | :--- | :--- |
-| **Item 1** | Same-process lock bypass via depth counter | Eliminated `_lock_depth` counter bypass. External `exclusive_lock` is strictly non-reentrant. Internal operations inside an existing lock invoke explicit private methods (`_start_recovery_attempt_unlocked`, `_transition_state_unlocked`, `_reconcile_existing_attempt_unlocked`). | `UNIT_TESTED_BRANCH` |
-| **Item 2** | Non-overlapping race test | Implemented `test_01_deterministic_overlapping_two_worker_pipeline_race` with an explicit `AsyncBarrier(2)` synchronizing both workers at the pre-lock inspection boundary. Proved total dispatch count = 1 across multiple iterations. | `UNIT_TESTED_BRANCH` |
-| **Item 3** | Prompt hash checked after irreversible click | Moved prompt verification directly into renderer JS inside `dispatch_submission_input()`. Normalizes and asserts equality between current composer text and expected prompt BEFORE clicking Send. Zero clicks on mismatch. | `UNIT_TESTED_BRANCH` |
-| **Item 4** | Enter key fallback in autonomous safe path | Completely removed Enter key fallback from the autonomous supervisor path. Submission strictly requires a single verified, visible, enabled send button (`SEND_CONTROL_NOT_FOUND` / `SEND_CONTROL_DISABLED` fail closed). | `UNIT_TESTED_BRANCH` |
-| **Item 5** | Binary OpenProcess == 0 liveness check | Implemented tri-state process liveness checker (`check_process_liveness`): `PROCESS_ALIVE`, `PROCESS_DEAD_CONFIRMED`, `PROCESS_LIVENESS_UNKNOWN`. Inspects Win32 `GetLastError()` (e.g. `ERROR_ACCESS_DENIED` $\rightarrow$ UNKNOWN). Stale lock reclaimed ONLY for `PROCESS_DEAD_CONFIRMED`. | `UNIT_TESTED_BRANCH` |
-| **Item 6** | PID reuse vulnerability | Added `start_identity` (process creation timestamp via `GetProcessTimes` on Windows / `/proc/<pid>/stat` on Unix) and `lock_nonce` to lock metadata. If PID is alive but start identity differs, lock is recognized as stale. | `UNIT_TESTED_BRANCH` |
-| **Item 7** | Conflated mainContainer DOM scope | Formally separated DOM scopes: `targetRoot = document.querySelector('main')`, `messageContainer = targetRoot.querySelector('[data-testid="conversation-messages"]')`, `composer = targetRoot.querySelector('[data-lexical-editor="true"]')`, `sendControl = targetRoot.querySelector('button[data-testid="send-button"]')`. Zero `document.body` fallback. | `UNIT_TESTED_BRANCH` |
-| **Item 8** | Unexercised selector decision logic | Refactored renderer state queries into structured tests verifying handling of 0/1/2 composers, hidden composers, and 0/1/2 send buttons. | `UNIT_TESTED_BRANCH` |
-| **Item 9** | Post-dispatch transition lock ownership | Public `transition_state()` acquires exclusive lock before updating state on disk. In-lock pipeline phases use explicit `_transition_state_unlocked()`. | `UNIT_TESTED_BRANCH` |
-| **Item 10** | Crash tests with stale locks & journal states | Implemented unit test simulating dead owner lock with journal in `STATE_SUBMISSION_ATTEMPTED`. Reclaims lock, re-reads disk, evaluates `PREVIOUS_SUBMISSION_UNCONFIRMED`, and blocks send (0 dispatches). | `UNIT_TESTED_BRANCH` |
-| **Item 11** | Route mutation immediately before send | `dispatch_submission_input()` asserts exact route `/c/<target_uuid>` inside JS immediately before clicking. Route divergence returns `ROUTE_MUTATED_BEFORE_DISPATCH` (0 dispatches). | `UNIT_TESTED_BRANCH` |
-| **Item 12** | Prompt mutation immediately before send | In-renderer check asserts normalized text equality before click. Mismatches return `PROMPT_IDENTITY_MISMATCH` (0 dispatches). | `UNIT_TESTED_BRANCH` |
-| **Item 13** | Send button ambiguity (>1 send button) | In-renderer check requires `sendBtns.length === 1`. Multiple matching buttons return `SEND_CONTROL_AMBIGUOUS` and fail closed (0 dispatches). | `UNIT_TESTED_BRANCH` |
-| **Item 14** | Exact synchronized race test claim | Confirmed via deterministic barrier-synchronized race across 3 iterations: Worker A = `TURN_STARTED`, Worker B = `TURN_ALREADY_ACTIVE` / `PREVIOUS_SUBMISSION_UNCONFIRMED`, Total Dispatches = 1. | `UNIT_TESTED_BRANCH` |
+| **Item 1** | Binary/fail-open Win32 process liveness check | `check_process_liveness()` returns `PROCESS_DEAD_CONFIRMED` only for `ERROR_INVALID_PARAMETER` (87) / `ERROR_NOT_FOUND` (1168). `ERROR_ACCESS_DENIED` (5) and all unrecognized Win32 errors (e.g. 12345) return `PROCESS_LIVENESS_UNKNOWN` (fail closed). | `UNIT_TESTED_BRANCH` |
+| **Item 2 & 9** | Blind lock file deletion on context release | `async_exclusive_lock()` and `exclusive_lock()` verify that on-disk `owner_pid`, `start_identity`, and `lock_nonce` match the releasing context before deleting the lock file, strictly protecting successor locks. | `UNIT_TESTED_BRANCH` |
+| **Item 3** | Unsafe stale lock deletion races | Reclaiming confirmed-dead locks uses atomic quarantine rename (`lock_path.stale.<nonce>.tmp`), verified against the inspected nonce before removal. | `UNIT_TESTED_BRANCH` |
+| **Item 4 & 5** | Synchronous file lock blocking event loop | Implemented non-blocking `@asynccontextmanager async_exclusive_lock()` with `await asyncio.sleep(0.05)`. Tested with `YieldingMockAntigravityClient` yielding during all in-lock calls; proved event loop heartbeat ticks > 5 and dispatch count = 1. | `UNIT_TESTED_BRANCH` |
+| **Item 6** | Real send mode permitted title / active fallback | `execute_resume_pipeline()` strictly requires an explicit validated UUID when `send=True`. Title-only and implicit active selection return `UUID_REQUIRED_FOR_SEND` (0 dispatches). | `UNIT_TESTED_BRANCH` |
+| **Item 7 & 8** | Fallback to generic main on missing message container | `targetRoot.querySelector('[data-testid="conversation-messages"]')` is strictly enforced. Missing message container returns `MESSAGE_CONTAINER_NOT_FOUND` and fails closed (0 dispatches). | `UNIT_TESTED_BRANCH` |
+| **Item 10** | Malformed lock file handling | `validate_lock_metadata()` enforces required types and positive timestamps. Malformed lock files fail closed without blind deletion. | `UNIT_TESTED_BRANCH` |
+| **Item 11** | Post-dispatch transitions under concurrency | Forward-only journal transitions enforced; unconfirmed previous submissions block subsequent attempts. | `UNIT_TESTED_BRANCH` |
+| **Item 12** | Submission attempted failure semantics | Pre-dispatch validation failures transition to `FAILED` with `PRE_IRREVERSIBLE`. Dispatch exceptions (CDP disconnect/crash) transition to `FAILED` with `POST_IRREVERSIBLE_UNKNOWN`, strictly blocking blind resend. | `UNIT_TESTED_BRANCH` |
+| **Item 13** | Ambiguous target root element | `document.querySelectorAll('main')` filtered for visible elements. Multiple visible roots return `TARGET_ROOT_AMBIGUOUS` and fail closed (0 dispatches). | `UNIT_TESTED_BRANCH` |
+| **Item 14** | Exact evidence and non-destructive standards | Maintained `REAL SEND = NOT_LIVE_TESTED` safety baseline; no claim of mathematically guaranteed exactly-once; local concurrent send exclusion tested. | `VERIFIED_DOC` |
 
 ---
 
-## 3. Final Lock Ordering & In-Lock Private Method Architecture
+## 3. Final Lock Ordering & In-Lock Async Method Architecture
 
 ```text
 [Pipeline Execution]
@@ -49,10 +46,10 @@ T03 owns **ONLY** the Antigravity Desktop conversation restoration, verification
   │
   ├─► Barrier synchronization (Optional deterministic testing gate)
   │
-  ├─► with journal.exclusive_lock(conversation_uuid):
+  ├─► async with journal.async_exclusive_lock(conversation_uuid):
   │     │
   │     ├─► 1. Re-read fresh journal state from disk & validate schema
-  │     ├─► 2. Re-inspect target route (/c/<uuid>) & targetRoot DOM
+  │     ├─► 2. Re-inspect target route (/c/<uuid>) & unambiguous targetRoot DOM
   │     ├─► 3. Re-inspect composer state (draft present check)
   │     ├─► 4. journal._reconcile_existing_attempt_unlocked()
   │     ├─► 5. Re-read latest record if mutated by reconciliation
@@ -63,36 +60,39 @@ T03 owns **ONLY** the Antigravity Desktop conversation restoration, verification
   │     ├─► 9. Verify inserted text SHA-256 matches intended prompt
   │     ├─► 10. journal._transition_state_unlocked() (STATE_SUBMISSION_ATTEMPTED)
   │     ├─► 11. dispatch_submission_input() (Atomic in-renderer pre-check & click)
-  │     └─► 12. If dispatch fails: journal._transition_state_unlocked(STATE_FAILED)
+  │     └─► 12. If dispatch fails: journal._transition_state_unlocked(STATE_FAILED, PRE_IRREVERSIBLE or POST_IRREVERSIBLE_UNKNOWN)
   │
   └─► Outside lock: Observe post-dispatch turns (wait_for_user_and_assistant_turn)
-        └─► On state transition: journal.transition_state() (acquires lock -> writes -> releases)
+        └─► On state transition: await journal.transition_state_async() (acquires async lock -> writes -> releases)
 ```
 
 ---
 
-## 4. Deterministic Overlapping Two-Worker Pipeline Race Result
+## 4. Yielding Two-Worker Pipeline Race Result
 
-- **Test Method:** `test_01_deterministic_overlapping_two_worker_pipeline_race` (3 iterations)
+- **Test Method:** `test_01_real_yielding_same_loop_contention` (3 iterations)
+- **Client Implementation:** `YieldingMockAntigravityClient` (explicit `await asyncio.sleep(0.02)` inside all locked operations)
 - **Synchronization:** `AsyncBarrier(2)` synchronizing both workers after pre-lock inspection.
 - **Worker A Status:** `TURN_STARTED` (dispatched input)
-- **Worker B Status:** `TURN_ALREADY_ACTIVE` / `PREVIOUS_SUBMISSION_UNCONFIRMED` (in-lock re-read blocked submission)
+- **Worker B Status:** `PREVIOUS_SUBMISSION_UNCONFIRMED` / `TURN_ALREADY_ACTIVE` (in-lock fresh re-read blocked submission)
+- **Event Loop Heartbeat:** Responsive throughout execution (heartbeat ticks > 5)
 - **TOTAL DISPATCH COUNT ACROSS BOTH WORKERS:** **1**
 
 ---
 
-## 5. Automated Test Suite Results (20 Production Tests)
+## 5. Automated Test Suite Results (22 Production Tests)
 
 Command executed:
 ```powershell
 python scripts/t03/test_suite.py
 ```
-Output: `Ran 20 tests in 0.281s - OK`
+Output: `Ran 22 tests in 0.757s - OK`
 
-- `test_01_deterministic_overlapping_two_worker_pipeline_race`: `UNIT_TESTED_BRANCH` — PASSED
-- `test_02_non_reentrant_lock_prevents_same_process_bypass`: `UNIT_TESTED_BRANCH` — PASSED
-- `test_03_pre_dispatch_prompt_mutation_aborts_send`: `UNIT_TESTED_BRANCH` — PASSED
-- `test_04_send_button_ambiguity_aborts_send`: `UNIT_TESTED_BRANCH` — PASSED
+- `test_01_real_yielding_same_loop_contention`: `UNIT_TESTED_BRANCH` — PASSED
+- `test_02_win32_liveness_error_matrix`: `UNIT_TESTED_BRANCH` — PASSED
+- `test_03_lock_release_verifies_ownership_nonce`: `UNIT_TESTED_BRANCH` — PASSED
+- `test_04_real_send_requires_explicit_uuid`: `UNIT_TESTED_BRANCH` — PASSED
+- `test_05_send_button_ambiguity_aborts_send`: `UNIT_TESTED_BRANCH` — PASSED
 - `test_05_tri_state_liveness_and_pid_reuse`: `UNIT_TESTED_BRANCH` — PASSED
 - `test_06_real_selector_decision_logic`: `UNIT_TESTED_BRANCH` — PASSED
 - `test_07_crash_reclaim_with_submission_attempted`: `UNIT_TESTED_BRANCH` — PASSED
@@ -115,10 +115,9 @@ Output: `Ran 20 tests in 0.281s - OK`
 ## 6. Privacy Audit & Evidence Boundary
 
 - **Audited Patterns:** `Users\\`, `bearer`, `api_key`, `password`, un-sanitized UUIDs.
-- **Audit Result:** **NO MATCHES FOR AUDITED PATTERNS** (Exit code 1).
+- **Audit Result:** **NO MATCHES FOR AUDITED PATTERNS** (0 matches found, Exit code 1).
 - **Live Evidence Boundary:**
   - `REAL SEND = NOT_LIVE_TESTED` (non-destructive safety policy).
-  - All claims backed by live read-only component discovery, unit assertions, and synchronized concurrency simulations.
   - **No Claim of Mathematically Guaranteed Exactly-Once**: Hardened against duplicate sends, crash recovery fails closed, concurrent local watchdog send exclusion tested.
 
 ---

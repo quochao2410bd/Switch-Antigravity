@@ -151,7 +151,8 @@ def check_process_liveness(pid, expected_start_identity=None):
                 return LIVENESS_DEAD_CONFIRMED
             elif err == ERROR_ACCESS_DENIED:
                 return LIVENESS_UNKNOWN
-            return LIVENESS_DEAD_CONFIRMED
+            else:
+                return LIVENESS_UNKNOWN
 
         try:
             # Check exit code
@@ -365,6 +366,7 @@ class RecoveryJournal:
         """
         Async-safe non-blocking cross-process advisory lock.
         Uses await asyncio.sleep() to yield control to the event loop on contention.
+        Verifies ownership nonce on release and uses atomic quarantine rename on stale reclaim.
         """
         target_dir = os.path.dirname(os.path.abspath(self.lock_path))
         if target_dir:
@@ -396,11 +398,23 @@ class RecoveryJournal:
                         if valid:
                             owner_pid = lock_meta.get("owner_pid")
                             start_id = lock_meta.get("start_identity")
+                            stale_nonce = lock_meta.get("lock_nonce")
                             liveness = check_process_liveness(owner_pid, start_id)
 
                             if liveness == LIVENESS_DEAD_CONFIRMED:
+                                # Safe atomic reclaim via quarantine rename
+                                quarantine_path = f"{self.lock_path}.stale.{stale_nonce}.tmp"
                                 try:
-                                    os.remove(self.lock_path)
+                                    os.replace(self.lock_path, quarantine_path)
+                                    # Verify renamed metadata matches the inspected stale nonce
+                                    try:
+                                        with open(quarantine_path, "r", encoding="utf-8") as qf:
+                                            q_meta = json.load(qf)
+                                        if q_meta.get("lock_nonce") == stale_nonce:
+                                            os.remove(quarantine_path)
+                                    except Exception:
+                                        if os.path.exists(quarantine_path):
+                                            os.remove(quarantine_path)
                                     continue
                                 except OSError:
                                     pass
@@ -416,17 +430,27 @@ class RecoveryJournal:
         finally:
             try:
                 os.close(lock_fd)
-                if os.path.exists(self.lock_path):
-                    os.remove(self.lock_path)
             except OSError:
+                pass
+            try:
+                if os.path.exists(self.lock_path):
+                    with open(self.lock_path, "r", encoding="utf-8") as f:
+                        cur_meta = json.load(f)
+                    if (
+                        cur_meta.get("owner_pid") == current_pid
+                        and cur_meta.get("start_identity") == current_start_id
+                        and cur_meta.get("lock_nonce") == nonce
+                    ):
+                        os.remove(self.lock_path)
+            except Exception:
                 pass
 
     @contextlib.contextmanager
     def exclusive_lock(self, timeout=5.0, conversation_uuid=None):
         """
-        Non-reentrant cross-process advisory lock.
+        Synchronous cross-process advisory lock.
         Writes ownership metadata (owner_pid, start_identity, lock_nonce, timestamp, conversation_uuid).
-        Safely detects and reclaims stale locks strictly when owner PID is confirmed dead.
+        Verifies ownership nonce on release and uses atomic quarantine rename on stale reclaim.
         """
         target_dir = os.path.dirname(os.path.abspath(self.lock_path))
         if target_dir:
@@ -450,21 +474,32 @@ class RecoveryJournal:
                 os.write(lock_fd, json.dumps(meta).encode("utf-8"))
                 break
             except OSError:
-                # Lock file exists; verify owner liveness
                 try:
                     if os.path.exists(self.lock_path):
                         with open(self.lock_path, "r", encoding="utf-8") as f:
                             lock_meta = json.load(f)
-                        owner_pid = lock_meta.get("owner_pid")
-                        start_id = lock_meta.get("start_identity")
-                        liveness = check_process_liveness(owner_pid, start_id)
+                        valid, _ = validate_lock_metadata(lock_meta)
+                        if valid:
+                            owner_pid = lock_meta.get("owner_pid")
+                            start_id = lock_meta.get("start_identity")
+                            stale_nonce = lock_meta.get("lock_nonce")
+                            liveness = check_process_liveness(owner_pid, start_id)
 
-                        if liveness == LIVENESS_DEAD_CONFIRMED:
-                            try:
-                                os.remove(self.lock_path)
-                                continue
-                            except OSError:
-                                pass
+                            if liveness == LIVENESS_DEAD_CONFIRMED:
+                                quarantine_path = f"{self.lock_path}.stale.{stale_nonce}.tmp"
+                                try:
+                                    os.replace(self.lock_path, quarantine_path)
+                                    try:
+                                        with open(quarantine_path, "r", encoding="utf-8") as qf:
+                                            q_meta = json.load(qf)
+                                        if q_meta.get("lock_nonce") == stale_nonce:
+                                            os.remove(quarantine_path)
+                                    except Exception:
+                                        if os.path.exists(quarantine_path):
+                                            os.remove(quarantine_path)
+                                    continue
+                                except OSError:
+                                    pass
                 except Exception:
                     pass
                 time.sleep(0.05)
@@ -477,9 +512,19 @@ class RecoveryJournal:
         finally:
             try:
                 os.close(lock_fd)
-                if os.path.exists(self.lock_path):
-                    os.remove(self.lock_path)
             except OSError:
+                pass
+            try:
+                if os.path.exists(self.lock_path):
+                    with open(self.lock_path, "r", encoding="utf-8") as f:
+                        cur_meta = json.load(f)
+                    if (
+                        cur_meta.get("owner_pid") == current_pid
+                        and cur_meta.get("start_identity") == current_start_id
+                        and cur_meta.get("lock_nonce") == nonce
+                    ):
+                        os.remove(self.lock_path)
+            except Exception:
                 pass
 
     def _read_raw(self):

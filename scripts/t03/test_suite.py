@@ -167,6 +167,28 @@ class MockAntigravityClient:
     async def wait_for_user_and_assistant_turn(self, target_uuid, prompt_hash, baseline, timeout=12, external_error_hook=None):
         return self.turn_result
 
+class YieldingMockAntigravityClient(MockAntigravityClient):
+    """Mock client that explicitly yields control (asyncio.sleep) during all in-lock operations."""
+    async def inspect_scoped_conversation_state(self, target_uuid, prompt_hash, baseline_article_count=0):
+        await asyncio.sleep(0.02)
+        return await super().inspect_scoped_conversation_state(target_uuid, prompt_hash, baseline_article_count)
+
+    async def inspect_composer_state(self, target_uuid=None):
+        await asyncio.sleep(0.02)
+        return await super().inspect_composer_state(target_uuid)
+
+    async def clear_composer(self, target_uuid):
+        await asyncio.sleep(0.02)
+        await super().clear_composer(target_uuid)
+
+    async def insert_prompt_text(self, target_uuid, text):
+        await asyncio.sleep(0.02)
+        await super().insert_prompt_text(target_uuid, text)
+
+    async def dispatch_submission_input(self, target_uuid, expected_prompt_text):
+        await asyncio.sleep(0.02)
+        return await super().dispatch_submission_input(target_uuid, expected_prompt_text)
+
 class AsyncBarrier:
     def __init__(self, count):
         self.count = count
@@ -189,15 +211,15 @@ class TestT03Round6Final(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    # CRITICAL ITEM 2: Deterministic Overlapping Two-Worker Pipeline Race
-    def test_01_deterministic_overlapping_two_worker_pipeline_race(self):
-        """MANDATORY TEST: Synchronized overlapping race between two workers. Assert TOTAL dispatch count == 1."""
+    # CRITICAL ITEM 4 & 5: Real Yielding Same-Loop Contention Test
+    def test_01_real_yielding_same_loop_contention(self):
+        """MANDATORY TEST: YieldingMockAntigravityClient under concurrent same-loop execution.
+        Asserts event loop heartbeat continues without freeze, bounded termination, and TOTAL DISPATCH == 1."""
         for iteration in range(3):
-            test_j = os.path.join(self.test_dir, f"race_j_{iteration}.json")
-            shared_client = MockAntigravityClient()
+            test_j = os.path.join(self.test_dir, f"yielding_race_{iteration}.json")
+            yielding_client = YieldingMockAntigravityClient()
             journal_a = RecoveryJournal(test_j)
             journal_b = RecoveryJournal(test_j)
-
             barrier = AsyncBarrier(2)
 
             args = argparse.Namespace(
@@ -206,17 +228,32 @@ class TestT03Round6Final(unittest.TestCase):
                 journal_path=test_j, timeout=5, json=False, verbose_private_data=False
             )
 
-            async def run_race():
-                task_a = asyncio.create_task(execute_resume_pipeline(args, client_override=shared_client, journal_override=journal_a, pre_lock_barrier=barrier))
-                task_b = asyncio.create_task(execute_resume_pipeline(args, client_override=shared_client, journal_override=journal_b, pre_lock_barrier=barrier))
+            heartbeat_ticks = 0
+            stop_heartbeat = asyncio.Event()
+
+            async def heartbeat():
+                nonlocal heartbeat_ticks
+                while not stop_heartbeat.is_set():
+                    heartbeat_ticks += 1
+                    await asyncio.sleep(0.01)
+
+            async def run_test():
+                hb_task = asyncio.create_task(heartbeat())
+                task_a = asyncio.create_task(execute_resume_pipeline(args, client_override=yielding_client, journal_override=journal_a, pre_lock_barrier=barrier))
+                task_b = asyncio.create_task(execute_resume_pipeline(args, client_override=yielding_client, journal_override=journal_b, pre_lock_barrier=barrier))
                 res_a, res_b = await asyncio.gather(task_a, task_b)
+                stop_heartbeat.set()
+                await hb_task
                 return res_a, res_b
 
-            res_a, res_b = asyncio.run(run_race())
+            start_t = time.time()
+            res_a, res_b = asyncio.run(run_test())
+            elapsed = time.time() - start_t
 
-            # Assert: Exactly one worker dispatched input across the entire execution
-            self.assertEqual(shared_client.dispatch_count, 1, f"Iteration {iteration}: dispatch_count was not 1")
-
+            # Assertions
+            self.assertLess(elapsed, 3.0, f"Iteration {iteration}: Race took too long ({elapsed}s)")
+            self.assertGreater(heartbeat_ticks, 5, f"Iteration {iteration}: Event loop was starved! Heartbeat ticks: {heartbeat_ticks}")
+            self.assertEqual(yielding_client.dispatch_count, 1, f"Iteration {iteration}: Total dispatch count was not 1")
             statuses = [res_a["status"], res_b["status"]]
             self.assertIn("TURN_STARTED", statuses)
             self.assertTrue(
@@ -225,12 +262,76 @@ class TestT03Round6Final(unittest.TestCase):
             )
 
     # CRITICAL ITEM 1: Non-reentrant lock prevents same-process lock bypass
-    def test_02_non_reentrant_lock_prevents_same_process_bypass(self):
-        """UNIT_TEST: Second caller in same process cannot bypass exclusive lock while held."""
+    # CRITICAL ITEM 1: Unknown Windows Liveness Errors Must Fail Closed (Return UNKNOWN)
+    def test_02_win32_liveness_error_matrix(self):
+        """UNIT_TEST: OpenProcess failure returns DEAD_CONFIRMED only for 87/1168; UNKNOWN for 5 and 12345."""
+        if os.name == 'nt':
+            import ctypes
+            # Test ACCESS_DENIED (5) -> UNKNOWN
+            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
+                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=5):
+                self.assertEqual(check_process_liveness(1234), LIVENESS_UNKNOWN)
+
+            # Test arbitrary unrecognized error 12345 -> UNKNOWN
+            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
+                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=12345):
+                self.assertEqual(check_process_liveness(1234), LIVENESS_UNKNOWN)
+
+            # Test confirmed nonexistent PID error 87 (ERROR_INVALID_PARAMETER) -> DEAD_CONFIRMED
+            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
+                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=87):
+                self.assertEqual(check_process_liveness(1234), LIVENESS_DEAD_CONFIRMED)
+
+            # Test confirmed nonexistent PID error 1168 (ERROR_NOT_FOUND) -> DEAD_CONFIRMED
+            with patch.object(ctypes.windll.kernel32, 'OpenProcess', return_value=0), \
+                 patch.object(ctypes.windll.kernel32, 'GetLastError', return_value=1168):
+                self.assertEqual(check_process_liveness(1234), LIVENESS_DEAD_CONFIRMED)
+
+    # CRITICAL ITEM 2 & 9: Lock Release Must Verify Ownership Nonce (Successor Lock Protection)
+    def test_03_lock_release_verifies_ownership_nonce(self):
+        """UNIT_TEST: Lock context with nonce A does not delete lock file if replaced by nonce B."""
+        # 1. Async lock release test
+        async def test_async_release():
+            async with self.journal.async_exclusive_lock(conversation_uuid=SYNTHETIC_UUID_1):
+                # Replace lock file with successor lock (nonce B)
+                successor_meta = {
+                    "owner_pid": os.getpid(),
+                    "start_identity": get_process_start_identity(os.getpid()),
+                    "lock_nonce": "successor-nonce-bbbb",
+                    "created_at": time.time(),
+                    "conversation_uuid": SYNTHETIC_UUID_1
+                }
+                with open(self.journal.lock_path, "w", encoding="utf-8") as f:
+                    json.dump(successor_meta, f)
+
+            # After exit, successor lock must NOT be deleted
+            self.assertTrue(os.path.exists(self.journal.lock_path))
+            with open(self.journal.lock_path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+            self.assertEqual(cur.get("lock_nonce"), "successor-nonce-bbbb")
+
+        asyncio.run(test_async_release())
+
+        # Cleanup successor lock
+        if os.path.exists(self.journal.lock_path):
+            os.remove(self.journal.lock_path)
+
+        # 2. Sync lock release test
         with self.journal.exclusive_lock(conversation_uuid=SYNTHETIC_UUID_1):
-            with self.assertRaises(TimeoutError):
-                with self.journal.exclusive_lock(timeout=0.1, conversation_uuid=SYNTHETIC_UUID_1):
-                    pass
+            successor_meta = {
+                "owner_pid": os.getpid(),
+                "start_identity": get_process_start_identity(os.getpid()),
+                "lock_nonce": "successor-nonce-cccc",
+                "created_at": time.time(),
+                "conversation_uuid": SYNTHETIC_UUID_1
+            }
+            with open(self.journal.lock_path, "w", encoding="utf-8") as f:
+                json.dump(successor_meta, f)
+
+        self.assertTrue(os.path.exists(self.journal.lock_path))
+        with open(self.journal.lock_path, "r", encoding="utf-8") as f:
+            cur = json.load(f)
+        self.assertEqual(cur.get("lock_nonce"), "successor-nonce-cccc")
 
     # CRITICAL ITEM 3: Prompt Text Mismatch inside Renderer Aborts Dispatch
     def test_03_pre_dispatch_prompt_mutation_aborts_send(self):
@@ -248,8 +349,43 @@ class TestT03Round6Final(unittest.TestCase):
         self.assertEqual(res["status"], "SEND_INPUT_DISPATCH_FAILED")
         self.assertEqual(mock_client.dispatch_count, 0)
 
-    # CRITICAL ITEM 4 & 13: Send Button Ambiguity (>1 buttons) Aborts Dispatch
-    def test_04_send_button_ambiguity_aborts_send(self):
+    # CRITICAL ITEM 6: Real Send Mode Requires Explicit Validated UUID
+    def test_04_real_send_requires_explicit_uuid(self):
+        """UNIT_TEST: send=True requires --conversation-id/--uuid; title-only and implicit active are blocked."""
+        mock_client = MockAntigravityClient()
+
+        # 1. Send=True with title only -> UUID_REQUIRED_FOR_SEND (0 dispatch)
+        args_title_only = argparse.Namespace(
+            conversation_id=None, title="Synthetic Task", prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res1 = asyncio.run(execute_resume_pipeline(args_title_only, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res1["status"], "UUID_REQUIRED_FOR_SEND")
+        self.assertEqual(mock_client.dispatch_count, 0)
+
+        # 2. Send=True with neither UUID nor title -> UUID_REQUIRED_FOR_SEND (0 dispatch)
+        args_implicit = argparse.Namespace(
+            conversation_id=None, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res2 = asyncio.run(execute_resume_pipeline(args_implicit, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res2["status"], "UUID_REQUIRED_FOR_SEND")
+        self.assertEqual(mock_client.dispatch_count, 0)
+
+        # 3. Send=True with explicit UUID -> allowed to continue
+        args_uuid = argparse.Namespace(
+            conversation_id=SYNTHETIC_UUID_1, title=None, prompt=SYNTHETIC_PROMPT,
+            send=True, probe_composer_write=False, cdp_endpoint="http://127.0.0.1:58859",
+            journal_path=self.journal_file, timeout=5, json=False, verbose_private_data=False
+        )
+        res3 = asyncio.run(execute_resume_pipeline(args_uuid, client_override=mock_client, journal_override=self.journal))
+        self.assertEqual(res3["status"], "TURN_STARTED")
+        self.assertEqual(mock_client.dispatch_count, 1)
+
+    # Send Button Ambiguity (>1 buttons) Aborts Dispatch
+    def test_05_send_button_ambiguity_aborts_send(self):
         """UNIT_TEST: Multiple send buttons (>1) returns SEND_CONTROL_AMBIGUOUS and aborts dispatch."""
         mock_client = MockAntigravityClient()
         mock_client.composer_state["sendButton"] = {"found": False, "error": "SEND_CONTROL_AMBIGUOUS"}

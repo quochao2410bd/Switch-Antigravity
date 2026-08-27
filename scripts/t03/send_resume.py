@@ -731,7 +731,13 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
             convos = await client.list_conversations()
 
             target = None
-            if getattr(args, "conversation_id", None):
+            is_send_mode = getattr(args, "send", False)
+
+            if is_send_mode:
+                if not getattr(args, "conversation_id", None):
+                    result["status"] = "UUID_REQUIRED_FOR_SEND"
+                    result["errors"].append("Real send mode requires an explicit, verified conversation UUID (--conversation-id/--uuid). Title-only and implicit active conversation selection are strictly forbidden for send.")
+                    return result
                 val_target_uuid = validate_uuid(args.conversation_id)
                 matches = [c for c in convos if c.get("uuid") and c.get("uuid") == val_target_uuid]
                 if not matches:
@@ -739,29 +745,38 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
                     result["errors"].append(f"Conversation UUID '{args.conversation_id}' not found in active UI.")
                     return result
                 target = matches[0]
-            elif getattr(args, "title", None):
-                matches = [c for c in convos if (c.get("title") or "").strip() == args.title.strip()]
-                if len(matches) == 0:
-                    result["status"] = "CONVERSATION_NOT_FOUND"
-                    result["errors"].append(f"No conversation matching exact title '{args.title}' found.")
-                    return result
-                elif len(matches) > 1:
-                    result["status"] = "CONVERSATION_AMBIGUOUS"
-                    result["errors"].append(f"Multiple conversations share exact title '{args.title}'")
-                    return result
-                target = matches[0]
             else:
-                active_matches = [c for c in convos if c.get("isActive")]
-                if len(active_matches) == 1:
-                    target = active_matches[0]
-                elif convos:
-                    result["status"] = "CONVERSATION_AMBIGUOUS"
-                    result["errors"].append("Multiple conversations present; explicit --uuid required.")
-                    return result
+                if getattr(args, "conversation_id", None):
+                    val_target_uuid = validate_uuid(args.conversation_id)
+                    matches = [c for c in convos if c.get("uuid") and c.get("uuid") == val_target_uuid]
+                    if not matches:
+                        result["status"] = "CONVERSATION_NOT_FOUND"
+                        result["errors"].append(f"Conversation UUID '{args.conversation_id}' not found in active UI.")
+                        return result
+                    target = matches[0]
+                elif getattr(args, "title", None):
+                    matches = [c for c in convos if (c.get("title") or "").strip() == args.title.strip()]
+                    if len(matches) == 0:
+                        result["status"] = "CONVERSATION_NOT_FOUND"
+                        result["errors"].append(f"No conversation matching exact title '{args.title}' found.")
+                        return result
+                    elif len(matches) > 1:
+                        result["status"] = "CONVERSATION_AMBIGUOUS"
+                        result["errors"].append(f"Multiple conversations share exact title '{args.title}'")
+                        return result
+                    target = matches[0]
                 else:
-                    result["status"] = "CONVERSATION_NOT_FOUND"
-                    result["errors"].append("No conversations available in UI.")
-                    return result
+                    active_matches = [c for c in convos if c.get("isActive")]
+                    if len(active_matches) == 1:
+                        target = active_matches[0]
+                    elif convos:
+                        result["status"] = "CONVERSATION_AMBIGUOUS"
+                        result["errors"].append("Multiple conversations present; explicit --uuid required.")
+                        return result
+                    else:
+                        result["status"] = "CONVERSATION_NOT_FOUND"
+                        result["errors"].append("No conversations available in UI.")
+                        return result
 
             target_display = {
                 "uuid": target.get("uuid"),
@@ -929,13 +944,22 @@ async def execute_resume_pipeline(args, client_override=None, journal_override=N
                 journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_SUBMISSION_ATTEMPTED)
 
                 # 8. Atomic renderer-side dispatch with pre-dispatch revalidation
-                dispatch_res = await client.dispatch_submission_input(target["uuid"], prompt_text)
-                if not dispatch_res.get("dispatched"):
-                    journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail=f"Dispatch failed: {dispatch_res.get('error')}")
-                    result["status"] = "SEND_INPUT_DISPATCH_FAILED"
-                    result["errors"].append(f"Pre-dispatch validation failed: {dispatch_res.get('error')}")
+                try:
+                    dispatch_res = await client.dispatch_submission_input(target["uuid"], prompt_text)
+                    if not dispatch_res.get("dispatched"):
+                        journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_FAILED, failure_stage="PRE_IRREVERSIBLE", detail=f"Dispatch failed pre-irreversible: {dispatch_res.get('error')}")
+                        result["status"] = "SEND_INPUT_DISPATCH_FAILED"
+                        result["errors"].append(f"Pre-dispatch validation failed: {dispatch_res.get('error')}")
+                        return result
+                    result["phases"]["4_send_input_dispatched"] = True
+                except Exception as de:
+                    # CDP disconnect, renderer crash, or exception during dispatch:
+                    # State remains SUBMISSION_ATTEMPTED or transitions to FAILED with POST_IRREVERSIBLE_UNKNOWN
+                    # to strictly forbid blind resend.
+                    journal._transition_state_unlocked(target["uuid"], attempt_id, STATE_FAILED, failure_stage="POST_IRREVERSIBLE_UNKNOWN", detail=f"Dispatch exception: {str(de)}")
+                    result["status"] = "SEND_INPUT_DISPATCH_EXCEPTION"
+                    result["errors"].append(f"Exception during send dispatch: {str(de)}")
                     return result
-                result["phases"]["4_send_input_dispatched"] = True
 
             # Outside lock: Observe post-dispatch turns with public locked transitions
             turn_res = await client.wait_for_user_and_assistant_turn(
